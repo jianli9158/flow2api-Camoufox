@@ -9,9 +9,16 @@ from http.cookiejar import CookieJar
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlencode, urlparse, urljoin
 
-from curl_cffi import CurlInfo, CurlOpt
-from curl_cffi.requests import AsyncSession, Cookies
-from curl_cffi.requests.cookies import CurlMorsel
+try:
+    from curl_cffi import CurlInfo, CurlOpt
+    from curl_cffi.requests import AsyncSession, Cookies
+    from curl_cffi.requests.cookies import CurlMorsel
+except ImportError:
+    CurlInfo = None
+    CurlOpt = None
+    AsyncSession = None
+    Cookies = None
+    CurlMorsel = None
 
 from ..core.logger import debug_logger
 from .browser_cookie_utils import serialize_cookie_header_for_url
@@ -281,7 +288,15 @@ class FlowFrontendMixin:
     def _find_flow_content_url(cls, value: Any, media_kind: str) -> str:
         if isinstance(value, str):
             marker = f"/{media_kind}/"
-            return value if value.startswith("https://") and marker in value else ""
+            if value.startswith("https://") and marker in value:
+                return value
+            stripped = value.strip()
+            if stripped.startswith(("[", "{")) and marker in stripped:
+                try:
+                    return cls._find_flow_content_url(json.loads(stripped), media_kind)
+                except Exception:
+                    pass
+            return ""
         if isinstance(value, list):
             for item in value:
                 url = cls._find_flow_content_url(item, media_kind)

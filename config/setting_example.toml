@@ -54,6 +54,8 @@ base_url = ""   # 缓存文件访问的基础URL, 留空则使用服务器地址
 
 [captcha]
 captcha_method = "yescaptcha"  # 打码方式: yescaptcha/flow2api_team(内置团队打码，地址与密钥固定)/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
+browser_engine = "camoufox"  # browser 模式内核: camoufox (AIStudio2API 风格 Camoufox + WebDriver BiDi 1fps 无头内核) / playwright
+browser_in_page_rpc = true   # camoufox 模式下直接在页面内通过 XHR + ProtectedSend (bidiChannel) 执行 batchexecute RPC，100% 复用页面 TLS/Cookie/XSRF/WIZ_global_data
 browser_recaptcha_settle_seconds = 3.0  # 自定义站点分数测试在 reload/clr 就绪后的额外稳态等待
 browser_flow_page_warmup_seconds = 6.0  # browser harvest 打开 Flow 页面后的稳定等待
 browser_count = 1  # browser 模式的有头浏览器实例数量

@@ -15,8 +15,13 @@ from urllib.parse import quote, urljoin, urlparse
 import urllib.error
 import urllib.request
 from http.cookiejar import CookieJar
-from curl_cffi import CurlInfo, CurlOpt
-from curl_cffi.requests import AsyncSession
+try:
+    from curl_cffi import CurlInfo, CurlOpt
+    from curl_cffi.requests import AsyncSession
+except ImportError:
+    CurlInfo = None
+    CurlOpt = None
+    AsyncSession = None
 from ..core.logger import debug_logger
 from ..core.config import (
     config,
@@ -119,14 +124,17 @@ class _FlowClientBase(FlowFrontendMixin):
         seed = int(hashlib.md5(account_id.encode()).hexdigest()[:8], 16)
         rng = random.Random(seed)
         
-        # fallback 仅在没有 runtime fingerprint 时兜底，直接与当前上游 Windows Chrome 风格对齐
-        chrome_versions = ["136.0.0.0"]
-        ch_version = rng.choice(chrome_versions)
-        user_agent = (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            f"(KHTML, like Gecko) Chrome/{ch_version} Safari/537.36"
-        )
-        
+        captcha_method = str(getattr(config, "captcha_method", "") or "").strip().lower()
+        if captcha_method in {"browser", "camoufox"}:
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
+        else:
+            # fallback 仅在没有 runtime fingerprint 时兜底，直接与当前上游 Windows Chrome 风格对齐
+            chrome_versions = ["136.0.0.0"]
+            ch_version = rng.choice(chrome_versions)
+            user_agent = (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                f"(KHTML, like Gecko) Chrome/{ch_version} Safari/537.36"
+            )
         # 缓存结果
         self._user_agent_cache[account_id] = user_agent
         
@@ -196,6 +204,8 @@ class _FlowClientBase(FlowFrontendMixin):
         ua = str(user_agent or "").strip()
         if not ua:
             return ""
+        if "firefox/" in ua.lower():
+            return ""
         import re
 
         match = re.search(r"(?:Chrome|Chromium)/(\d+)", ua, re.IGNORECASE)
@@ -230,6 +240,7 @@ class _FlowClientBase(FlowFrontendMixin):
         if not ua:
             return {}
         ua_lower = ua.lower()
+        is_firefox = "firefox/" in ua_lower
         platform = '"Windows"'
         mobile = "?0"
         if "android" in ua_lower:
@@ -244,9 +255,9 @@ class _FlowClientBase(FlowFrontendMixin):
             platform = '"Linux"'
         fingerprint: Dict[str, Any] = {
             "user_agent": ua,
-            "sec_ch_ua": self._infer_sec_ch_ua_from_user_agent(ua),
-            "sec_ch_ua_mobile": mobile,
-            "sec_ch_ua_platform": platform,
+            "sec_ch_ua": "" if is_firefox else self._infer_sec_ch_ua_from_user_agent(ua),
+            "sec_ch_ua_mobile": "" if is_firefox else mobile,
+            "sec_ch_ua_platform": "" if is_firefox else platform,
         }
         normalized_accept_language = self._normalize_accept_language_header(
             accept_language
@@ -1142,8 +1153,10 @@ class _FlowClientBase(FlowFrontendMixin):
         )
 
     def _resolve_runtime_impersonate(self, fallback: str = "chrome") -> str:
-        resolved = self._resolve_impersonate_from_fingerprint(fallback=fallback)
-        return resolved or fallback
+        captcha_method = str(getattr(config, "captcha_method", "") or "").strip().lower()
+        effective_fallback = "firefox" if captcha_method in {"browser", "camoufox"} else fallback
+        resolved = self._resolve_impersonate_from_fingerprint(fallback=effective_fallback)
+        return resolved or effective_fallback
 
     def _resolve_impersonate_from_fingerprint(self, fallback: str = "chrome") -> str:
         """根据当前请求链路绑定的浏览器指纹，选择最接近的 curl_cffi impersonate。"""
@@ -1156,6 +1169,8 @@ class _FlowClientBase(FlowFrontendMixin):
         if not ua_lower:
             return fallback
 
+        if "firefox/" in ua_lower:
+            return "firefox"
         if "android" in ua_lower:
             return "chrome_android"
         if "edg/" in ua_lower or " edge/" in ua_lower:

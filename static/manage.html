@@ -126,6 +126,12 @@
                             </svg>
                             <span class="text-sm font-medium"><span data-i18n="导入">导入</span></span>
                         </button>
+                        <button onclick="openBrowserLoginModal()" class="inline-flex items-center justify-center rounded-md bg-indigo-600 text-white hover:bg-indigo-700 h-8 px-3" title="启动 Camoufox 浏览器直接登录 Google Flow 并自动拉取 Cookie 与浏览器缓存">
+                            <svg class="h-4 w-4 mr-1.5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+                            </svg>
+                            <span class="text-sm font-medium"><span data-i18n="浏览器登录">浏览器登录</span></span>
+                        </button>
                         <button onclick="openAddModal()" class="inline-flex items-center justify-center rounded-md bg-primary text-primary-foreground hover:bg-primary/90 h-8 px-3">
                             <svg class="h-4 w-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                 <line x1="12" y1="5" x2="12" y2="19"/>
@@ -708,6 +714,15 @@
             </div>
             <div class="p-5 space-y-4 max-h-[calc(100vh-200px)] overflow-y-auto">
                 <!-- Current Flow credentials -->
+                <div class="rounded-md border border-indigo-200 bg-indigo-50/70 p-3 flex flex-wrap items-center justify-between gap-2">
+                    <div class="text-xs text-indigo-900">
+                        <div class="font-semibold">Camoufox 浏览器直接登录（AIStudio2API 模式）</div>
+                        <div class="text-indigo-700 mt-0.5">无需手动抓包复制 Cookie，直接打开隔离 Camoufox 登录 Google Flow，自动拉取 Cookie、StorageState 与启动缓存。</div>
+                    </div>
+                    <button type="button" onclick="openBrowserLoginModal({fromModal:'add'})" class="inline-flex items-center justify-center rounded-md bg-indigo-600 text-white hover:bg-indigo-700 h-8 px-3 text-xs font-medium shrink-0">
+                        启动浏览器登录拉取
+                    </button>
+                </div>
                 <div class="space-y-2">
                     <label class="text-sm font-medium">Google Cookies <span class="text-red-500">*</span></label>
                     <textarea id="addTokenGoogleCookies" rows="5" class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono resize-y" placeholder="支持 JSON 导出或 name=value; name2=value2" required data-i18n-placeholder="支持 JSON 导出或 name=value; name2=value2"></textarea>
@@ -818,6 +833,15 @@
                 <input type="hidden" id="editTokenId">
 
                 <!-- Current Flow credentials -->
+                <div class="rounded-md border border-indigo-200 bg-indigo-50/70 p-3 flex flex-wrap items-center justify-between gap-2">
+                    <div class="text-xs text-indigo-900">
+                        <div class="font-semibold">Camoufox 浏览器重新登录更新缓存</div>
+                        <div class="text-indigo-700 mt-0.5">复用当前账号固定的 Windows 指纹启动 Camoufox 重新登录并刷新 Cookie 与浏览器缓存。</div>
+                    </div>
+                    <button type="button" onclick="openBrowserLoginModal({fromModal:'edit', tokenId: parseInt($('editTokenId').value)||null})" class="inline-flex items-center justify-center rounded-md bg-indigo-600 text-white hover:bg-indigo-700 h-8 px-3 text-xs font-medium shrink-0">
+                        浏览器重新登录
+                    </button>
+                </div>
                 <div class="space-y-2">
                     <label class="text-sm font-medium">Google Cookies <span class="text-red-500">*</span></label>
                     <textarea id="editTokenGoogleCookies" rows="5" class="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm font-mono resize-y" placeholder="支持 JSON 导出或 name=value; name2=value2" required data-i18n-placeholder="支持 JSON 导出或 name=value; name2=value2"></textarea>
@@ -949,6 +973,83 @@
         </div>
     </div>
 
+    <!-- Camoufox 浏览器直接登录模态框 (AIStudio2API 风格) -->
+    <div id="browserLoginModal" class="hidden fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4 overflow-y-auto">
+        <div class="bg-background rounded-lg border border-border w-full max-w-5xl shadow-xl my-auto flex flex-col max-h-[94vh]">
+            <div class="flex items-center justify-between p-4 border-b border-border">
+                <div>
+                    <h3 class="text-base font-semibold flex items-center gap-2">
+                        <span>Camoufox 浏览器登录 & 自动拉取缓存</span>
+                        <span id="browserLoginStatusBadge" class="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-blue-50 text-blue-700">准备就绪</span>
+                    </h3>
+                    <p id="browserLoginStatusText" class="text-xs text-muted-foreground mt-0.5">启动隔离 Camoufox 浏览器登录 Google Flow，登录成功后将自动提取全套 Cookie、localStorage、Windows 指纹与 Firefox 启动缓存。</p>
+                </div>
+                <button onclick="closeBrowserLoginModal()" class="text-muted-foreground hover:text-foreground">
+                    <svg class="h-4 w-4" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+
+            <div class="p-4 space-y-3 overflow-y-auto flex-1">
+                <!-- 控制栏 -->
+                <div class="grid grid-cols-1 md:grid-cols-12 gap-3 items-end bg-muted/30 p-3 rounded-md border border-border">
+                    <div class="md:col-span-4 space-y-1">
+                        <label class="text-xs font-medium">登录显示模式</label>
+                        <select id="browserLoginMode" class="flex h-8 w-full rounded-md border border-input bg-background px-2 py-1 text-xs">
+                            <option value="auto">自动 (本机弹出 Camoufox 窗口 + 网页同步画面)</option>
+                            <option value="window">本机弹出可见 Camoufox 窗口</option>
+                            <option value="liveview">无头网页内嵌远程登录 (适合 Docker / 无桌面服务器)</option>
+                        </select>
+                    </div>
+                    <div class="md:col-span-4 space-y-1">
+                        <label class="text-xs font-medium">代理地址 (可选，留空自动使用打码/全局代理)</label>
+                        <input id="browserLoginProxyUrl" class="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs font-mono" placeholder="http://user:pass@host:port 或 socks5://...">
+                    </div>
+                    <div class="md:col-span-2 space-y-1">
+                        <label class="text-xs font-medium">备注 (可选)</label>
+                        <input id="browserLoginRemark" class="flex h-8 w-full rounded-md border border-input bg-background px-2.5 py-1 text-xs" placeholder="账号备注">
+                    </div>
+                    <div class="md:col-span-2 flex gap-2">
+                        <button id="browserLoginStartBtn" onclick="startBrowserLoginSession()" class="inline-flex items-center justify-center rounded-md bg-indigo-600 text-white hover:bg-indigo-700 h-8 px-3 text-xs font-medium w-full">
+                            启动登录浏览器
+                        </button>
+                    </div>
+                </div>
+
+                <!-- 快捷文本粘贴栏 (用于向远程画面快速输入邮箱/密码/验证码) -->
+                <div class="flex flex-wrap items-center gap-2 bg-muted/20 px-3 py-2 rounded-md border border-border text-xs">
+                    <span class="text-muted-foreground font-medium">远程画面快捷输入:</span>
+                    <input id="browserLoginQuickText" type="text" class="flex h-7 flex-1 min-w-[200px] rounded border border-input bg-background px-2 py-1 text-xs font-mono" placeholder="在此输入邮箱 / 密码 / 验证码，点击右侧按钮直接键入浏览器当前焦点输入框" onkeydown="if(event.key==='Enter'){event.preventDefault();sendBrowserLoginQuickText(true);}">
+                    <button type="button" onclick="sendBrowserLoginQuickText(false)" class="inline-flex items-center justify-center rounded border border-input bg-background hover:bg-accent h-7 px-2.5 text-xs">发送文本</button>
+                    <button type="button" onclick="sendBrowserLoginQuickText(true)" class="inline-flex items-center justify-center rounded bg-primary text-primary-foreground hover:bg-primary/90 h-7 px-2.5 text-xs">发送并回车</button>
+                    <span id="browserLoginPageUrl" class="text-[11px] text-muted-foreground font-mono truncate max-w-xs ml-auto"></span>
+                </div>
+
+                <!-- 实时浏览器画面 (LiveView) -->
+                <div id="browserLoginViewport" tabindex="0" class="relative w-full bg-slate-950 rounded-md border border-border overflow-hidden flex items-center justify-center min-h-[420px] max-h-[62vh] select-none outline-none focus:ring-2 focus:ring-indigo-500">
+                    <div id="browserLoginPlaceholder" class="text-center p-8 text-slate-400 space-y-2">
+                        <div class="text-sm font-medium text-slate-200">点击上方「启动登录浏览器」开始</div>
+                        <div class="text-xs text-slate-400 max-w-lg mx-auto">
+                            如果运行在本机桌面环境，会自动弹出 Camoufox 独立指纹窗口，同时在此处实时同步浏览器画面；如果运行在无桌面服务器/Docker，可直接在下方画面中点击和输入完成 Google 登录。
+                        </div>
+                    </div>
+                    <img id="browserLoginFrameImg" class="hidden w-full h-auto max-h-[62vh] object-contain cursor-pointer" draggable="false" alt="Camoufox LiveView">
+                </div>
+            </div>
+
+            <div class="flex items-center justify-between p-4 border-t border-border bg-background">
+                <div class="text-xs text-muted-foreground">
+                    提示：在 Google 登录页输入账号密码并跳转到 <code class="font-mono text-foreground">flow.google.com</code> 后，系统将在 1~2 秒内自动完成抓取并入库，无需手动点击保存。
+                </div>
+                <div class="flex items-center gap-2">
+                    <button onclick="closeBrowserLoginModal()" class="inline-flex items-center justify-center rounded-md border border-input bg-background hover:bg-accent h-8 px-4 text-xs">关闭 / 取消</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
     I18n.ready.then(() => {
 
@@ -966,7 +1067,7 @@
         formatAccountType=(tier)=>{if(tier==='PAYGATE_TIER_NOT_PAID'||!tier){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-700">Free</span>`}if(tier==='PAYGATE_TIER_ONE'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-blue-50 text-blue-700">Pro</span>`}if(tier==='PAYGATE_TIER_TWO'){return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-purple-50 text-purple-700">Ult</span>`}return`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-amber-50 text-amber-700" title="${tier}">${tier}</span>`},
         formatProjectNameDisplay=name=>{if(!name)return'<span class="text-muted-foreground">-</span>';const text=String(name);const match=text.match(/^(.*?)(?:\s+(P\d+))$/);if(match){return`<div class="flex flex-col items-center justify-center gap-1 leading-none"><span class="text-xs font-medium text-foreground whitespace-nowrap">${escapeLogHtml(match[1])}</span><span class="inline-flex items-center rounded-full border border-slate-200 bg-slate-100 px-2 py-0.5 text-[11px] font-medium text-slate-700">${escapeLogHtml(match[2])}</span></div>`}return`<div class="text-center text-xs font-medium text-foreground whitespace-nowrap">${escapeLogHtml(text)}</div>`},
         formatProjectIdDisplay=projectId=>{if(!projectId)return'<span class="text-muted-foreground">-</span>';const text=String(projectId);const short=text.length>8?`${text.substring(0,8)}...`:text;return`<button onclick="copyProjectId('${projectId}')" class="inline-flex items-center justify-center rounded-full border border-blue-200 bg-blue-50 px-2 py-0.5 text-[10px] font-mono font-medium text-blue-700 transition-colors hover:bg-blue-100 hover:text-blue-800" title="${I18n.escapeHtml(I18n.t('点击复制项目ID'))}&#10;${escapeLogHtml(text)}">${escapeLogHtml(short)}</button>`},
-        renderTokenActions=t=>{const toggleLabel=t.is_active?I18n.t("禁用"):I18n.t("启用");return`<div class="inline-flex flex-nowrap items-center justify-end gap-1"><button onclick="refreshTokenAT(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-blue-50 hover:text-blue-700"><span data-i18n="刷新凭证">刷新凭证</span></button><button onclick="openEditModal(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-green-50 hover:text-green-700"><span data-i18n="详情">详情</span></button><button onclick="toggleToken(${t.id},${t.is_active})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-accent">${toggleLabel}</button><button onclick="deleteToken(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-destructive/10 hover:text-destructive"><span data-i18n="删除">删除</span></button></div>`},
+        renderTokenActions=t=>{const toggleLabel=t.is_active?I18n.t("禁用"):I18n.t("启用");return`<div class="inline-flex flex-nowrap items-center justify-end gap-1"><button onclick="openBrowserLoginModal({tokenId:${t.id}})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium text-indigo-700 hover:bg-indigo-50" title="使用 Camoufox 浏览器重新登录并更新缓存">重登</button><button onclick="refreshTokenAT(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-blue-50 hover:text-blue-700"><span data-i18n="刷新凭证">刷新凭证</span></button><button onclick="openEditModal(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-green-50 hover:text-green-700"><span data-i18n="详情">详情</span></button><button onclick="toggleToken(${t.id},${t.is_active})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-accent">${toggleLabel}</button><button onclick="deleteToken(${t.id})" class="inline-flex h-7 items-center justify-center rounded-md px-2 text-xs font-medium hover:bg-destructive/10 hover:text-destructive"><span data-i18n="删除">删除</span></button></div>`},
         renderTokens=()=>{const tb=$('tokenTableBody');tb.innerHTML=allTokens.map(t=>{const imageDisplay=t.image_enabled?`${t.image_count||0}`:'-';const videoDisplay=t.video_enabled?`${t.video_count||0}`:'-';const creditsDisplay=t.credits!==undefined?`${t.credits}`:'-';const accountTypeDisplay=formatAccountType(t.user_paygate_tier);const projectIdDisplay=formatProjectIdDisplay(t.current_project_id);const expiryDisplay=formatExpiry(t.at_expires);const protocolDisplay=t.protocol_mode==='protocol'?`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-indigo-50 text-indigo-700" title="${escapeLogHtml(t.last_st_refresh_result||'')}"><span data-i18n="协议">协议</span></span>`:`<span class="inline-flex items-center rounded px-2 py-0.5 text-xs bg-gray-100 text-gray-700">ST</span>`;const tokenActions=renderTokenActions(t);return`<tr class="hover:bg-muted/20 transition-colors"><td class="py-3 px-2.5 align-middle"><div class="max-w-[180px] overflow-hidden text-ellipsis whitespace-nowrap text-sm font-medium text-foreground" title="${escapeLogHtml(t.email||'')}">${escapeLogHtml(t.email||'-')}</div></td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap"><span class="inline-flex items-center rounded px-2 py-0.5 text-xs ${t.is_active?'bg-green-50 text-green-700':'bg-gray-100 text-gray-700'}">${t.is_active?I18n.t("已启用"):I18n.t("已禁用")}</span></td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap">${protocolDisplay}</td><td class="py-3 px-2.5 text-center text-xs align-middle whitespace-nowrap">${expiryDisplay}</td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap"><button onclick="refreshTokenCredits(${t.id})" class="inline-flex items-center justify-center gap-1 rounded-full bg-blue-50 px-2 py-0.5 text-sm font-medium text-blue-700 transition-colors hover:bg-blue-100 hover:text-blue-800" title="点击刷新余额" data-i18n-title="点击刷新余额"><span>${creditsDisplay}</span><svg class="h-3 w-3" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 11-6.219-8.56"/><path d="M15 4.5l3.5 3.5L22 4.5"/></svg></button></td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap">${accountTypeDisplay}</td><td class="py-3 px-2.5 text-center text-xs align-middle whitespace-nowrap">${projectIdDisplay}</td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap"><span class="text-sm font-medium">${imageDisplay}</span></td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap"><span class="text-sm font-medium">${videoDisplay}</span></td><td class="py-3 px-2.5 text-center align-middle whitespace-nowrap"><span class="text-sm font-medium ${Number(t.error_count||0)>0?'text-red-600':'text-foreground'}">${t.error_count||0}</span></td><td class="py-3 px-2.5 text-right align-middle whitespace-nowrap">${tokenActions}</td></tr>`}).join('')},
         refreshTokenCredits=async(id)=>{try{showToast(I18n.t("正在刷新余额..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-credits`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("余额刷新成功: {0}", {"0": (d.credits)}),'success');await refreshTokens()}else{showToast(I18n.t("刷新余额失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("刷新余额失败: {error}", {error: (e.message)}),'error')}},
         refreshTokenAT=async(id)=>{try{showToast(I18n.t("正在更新AT..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-at`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){const expiresDate=d.token.at_expires?new Date(d.token.at_expires):null;const expiresStr=expiresDate?expiresDate.toLocaleString(I18n.locale, {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).replace(/\//g,'-'):I18n.t("未知");showToast(I18n.t("AT更新成功! 新过期时间: {0}", {"0": (expiresStr)}),'success');await refreshTokens()}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error')}},
@@ -1353,6 +1454,273 @@
             const detailContent=$('logDetailContent');detailContent.dataset.logId=String(log.id??'');detailContent.innerHTML=detailHtml;I18n.apply(detailContent);syncLogDetailViewState();
         }
 
+        // ========== Camoufox Direct Browser Login & LiveView Controller ==========
+        let browserLoginState = {
+            sessionId: null,
+            ws: null,
+            pollTimer: null,
+            tokenId: null,
+            fromModal: null,
+            frameMeta: { width: 1280, height: 800, context: '' },
+            boundEvents: false
+        };
+
+        function updateBrowserLoginBadge(status, text) {
+            const badge = $('browserLoginStatusBadge');
+            const msg = $('browserLoginStatusText');
+            if (msg && text) msg.textContent = text;
+            if (!badge) return;
+            const map = {
+                idle: ['准备就绪', 'bg-blue-50 text-blue-700'],
+                starting: ['正在启动浏览器...', 'bg-amber-50 text-amber-700'],
+                waiting: ['等待 Google Flow 登录...', 'bg-indigo-50 text-indigo-700'],
+                saving: ['登录成功，正在拉取缓存...', 'bg-purple-50 text-purple-700'],
+                completed: ['拉取并入库完成', 'bg-green-50 text-green-700'],
+                failed: ['登录失败', 'bg-red-50 text-red-700'],
+                cancelled: ['已取消', 'bg-gray-100 text-gray-700']
+            };
+            const [label, cls] = map[status] || [status, 'bg-gray-100 text-gray-700'];
+            badge.textContent = label;
+            badge.className = `inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${cls}`;
+        }
+
+        function bindBrowserLoginViewportEvents() {
+            if (browserLoginState.boundEvents) return;
+            const img = $('browserLoginFrameImg');
+            const vp = $('browserLoginViewport');
+            if (!img || !vp) return;
+            browserLoginState.boundEvents = true;
+
+            const toRemoteCoords = (e) => {
+                const rect = img.getBoundingClientRect();
+                if (!rect.width || !rect.height) return { x: 0, y: 0 };
+                const metaW = (browserLoginState.frameMeta && browserLoginState.frameMeta.width) || 1280;
+                const metaH = (browserLoginState.frameMeta && browserLoginState.frameMeta.height) || 800;
+                const x = Math.round(((e.clientX - rect.left) / rect.width) * metaW);
+                const y = Math.round(((e.clientY - rect.top) / rect.height) * metaH);
+                return { x: Math.max(0, Math.min(metaW - 1, x)), y: Math.max(0, Math.min(metaH - 1, y)) };
+            };
+
+            img.addEventListener('mousedown', (e) => {
+                vp.focus();
+                const pt = toRemoteCoords(e);
+                sendBrowserLoginInput({ type: 'pointer', action: 'down', x: pt.x, y: pt.y, button: e.button || 0 });
+            });
+            img.addEventListener('mouseup', (e) => {
+                const pt = toRemoteCoords(e);
+                sendBrowserLoginInput({ type: 'pointer', action: 'up', x: pt.x, y: pt.y, button: e.button || 0 });
+            });
+            let lastMoveAt = 0;
+            img.addEventListener('mousemove', (e) => {
+                const now = Date.now();
+                if (now - lastMoveAt < 65) return;
+                lastMoveAt = now;
+                const pt = toRemoteCoords(e);
+                sendBrowserLoginInput({ type: 'pointer', action: 'move', x: pt.x, y: pt.y, button: 0 });
+            });
+            img.addEventListener('wheel', (e) => {
+                e.preventDefault();
+                const pt = toRemoteCoords(e);
+                sendBrowserLoginInput({ type: 'wheel', x: pt.x, y: pt.y, dx: e.deltaX || 0, dy: e.deltaY || 0 });
+            }, { passive: false });
+
+            vp.addEventListener('keydown', (e) => {
+                if (document.activeElement === $('browserLoginQuickText')) return;
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
+                e.preventDefault();
+                sendBrowserLoginInput({ type: 'key', action: 'down', key: e.key });
+            });
+            vp.addEventListener('keyup', (e) => {
+                if (document.activeElement === $('browserLoginQuickText')) return;
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'v') return;
+                e.preventDefault();
+                sendBrowserLoginInput({ type: 'key', action: 'up', key: e.key });
+            });
+            vp.addEventListener('paste', (e) => {
+                if (document.activeElement === $('browserLoginQuickText')) return;
+                const text = (e.clipboardData || window.clipboardData)?.getData('text') || '';
+                if (text) {
+                    e.preventDefault();
+                    sendBrowserLoginInput({ type: 'text', text });
+                }
+            });
+        }
+
+        function sendBrowserLoginInput(payload) {
+            if (!browserLoginState.sessionId) return;
+            if (browserLoginState.ws && browserLoginState.ws.readyState === WebSocket.OPEN) {
+                browserLoginState.ws.send(JSON.stringify(payload));
+                return;
+            }
+            apiRequest(`/api/tokens/browser-login/input/${browserLoginState.sessionId}`, {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            }).catch(() => {});
+        }
+
+        function sendBrowserLoginQuickText(withEnter = false) {
+            const input = $('browserLoginQuickText');
+            if (!input || !input.value) return;
+            const text = withEnter ? (input.value + '\n') : input.value;
+            sendBrowserLoginInput({ type: 'text', text });
+            input.value = '';
+        }
+
+        function handleBrowserLoginFrame(meta, imageB64) {
+            if (!imageB64) return;
+            if (meta && typeof meta === 'object') {
+                browserLoginState.frameMeta = meta;
+                if ($('browserLoginPageUrl')) {
+                    $('browserLoginPageUrl').textContent = meta.url || '';
+                }
+            }
+            const img = $('browserLoginFrameImg');
+            const ph = $('browserLoginPlaceholder');
+            if (img) {
+                img.src = `data:image/jpeg;base64,${imageB64}`;
+                img.classList.remove('hidden');
+            }
+            if (ph) ph.classList.add('hidden');
+        }
+
+        async function handleBrowserLoginStatusUpdate(data) {
+            if (!data) return;
+            updateBrowserLoginBadge(data.status, data.message || data.error || '');
+            if (data.status === 'completed' && data.result) {
+                stopBrowserLoginStreams();
+                const res = data.result;
+                if (browserLoginState.fromModal === 'add') {
+                    if ($('addTokenGoogleCookies') && res.google_cookies) $('addTokenGoogleCookies').value = res.google_cookies;
+                    if ($('addTokenLoginAccount') && res.email) $('addTokenLoginAccount').value = res.email;
+                    if ($('addTokenProjectId') && res.project_id && !$('addTokenProjectId').value) $('addTokenProjectId').value = res.project_id;
+                } else if (browserLoginState.fromModal === 'edit') {
+                    if ($('editTokenGoogleCookies') && res.google_cookies) $('editTokenGoogleCookies').value = res.google_cookies;
+                    if ($('editTokenLoginAccount') && res.email) $('editTokenLoginAccount').value = res.email;
+                }
+                await refreshTokens();
+                showToast(`浏览器登录成功！账号: ${res.email || '已同步'} (积分: ${res.credits ?? '-'})`, 'success');
+                setTimeout(() => {
+                    closeBrowserLoginModal(true);
+                    if (browserLoginState.fromModal === 'add') closeAddModal();
+                    if (browserLoginState.fromModal === 'edit') closeEditModal();
+                }, 1000);
+            } else if (data.status === 'failed') {
+                stopBrowserLoginStreams();
+                showToast(`浏览器登录失败: ${data.error || data.message || '未知错误'}`, 'error');
+                const btn = $('browserLoginStartBtn');
+                if (btn) { btn.disabled = false; btn.textContent = '重新启动登录'; }
+            }
+        }
+
+        function stopBrowserLoginStreams() {
+            if (browserLoginState.ws) {
+                try { browserLoginState.ws.close(); } catch (e) {}
+                browserLoginState.ws = null;
+            }
+            if (browserLoginState.pollTimer) {
+                clearInterval(browserLoginState.pollTimer);
+                browserLoginState.pollTimer = null;
+            }
+        }
+
+        async function openBrowserLoginModal(opts = {}) {
+            bindBrowserLoginViewportEvents();
+            browserLoginState.tokenId = opts.tokenId || null;
+            browserLoginState.fromModal = opts.fromModal || null;
+            if (opts.fromModal === 'add') {
+                $('browserLoginProxyUrl').value = ($('addTokenCaptchaProxyUrl')?.value || $('addTokenProxyUrl')?.value || '').trim();
+                $('browserLoginRemark').value = ($('addTokenRemark')?.value || '').trim();
+            } else if (opts.fromModal === 'edit' || opts.tokenId) {
+                const tok = allTokens.find(t => t.id === opts.tokenId);
+                $('browserLoginProxyUrl').value = ($('editTokenCaptchaProxyUrl')?.value || tok?.captcha_proxy_url || tok?.proxy_url || '').trim();
+                $('browserLoginRemark').value = ($('editTokenRemark')?.value || tok?.remark || '').trim();
+            }
+            $('browserLoginModal').classList.remove('hidden');
+            // Start immediately on open for 1-click convenience
+            await startBrowserLoginSession();
+        }
+
+        async function startBrowserLoginSession() {
+            stopBrowserLoginStreams();
+            const btn = $('browserLoginStartBtn');
+            if (btn) { btn.disabled = true; btn.textContent = '运行中...'; }
+            updateBrowserLoginBadge('starting', '正在启动隔离 Camoufox 浏览器...');
+            try {
+                const payload = {
+                    mode: $('browserLoginMode')?.value || 'auto',
+                    token_id: browserLoginState.tokenId,
+                    auto_save_token: true,
+                    captcha_proxy_url: ($('browserLoginProxyUrl')?.value || '').trim() || null,
+                    remark: ($('browserLoginRemark')?.value || '').trim() || null,
+                    timeout_seconds: 300
+                };
+                const r = await apiRequest('/api/tokens/browser-login/start', {
+                    method: 'POST',
+                    body: JSON.stringify(payload)
+                });
+                if (!r) return;
+                const d = await r.json();
+                if (!d.success || !d.session_id) {
+                    throw new Error(d.detail || d.message || '启动登录会话失败');
+                }
+                browserLoginState.sessionId = d.session_id;
+                updateBrowserLoginBadge(d.status || 'waiting', d.message || '等待登录...');
+
+                // Connect WebSocket LiveView stream + fallback HTTP status polling
+                const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${proto}//${location.host}/api/tokens/browser-login/ws/${d.session_id}`;
+                try {
+                    const ws = new WebSocket(wsUrl);
+                    browserLoginState.ws = ws;
+                    ws.onmessage = (ev) => {
+                        try {
+                            const msg = JSON.parse(ev.data);
+                            if (msg.type === 'frame') {
+                                handleBrowserLoginFrame(msg.meta, msg.image_b64);
+                            } else if (msg.type === 'status') {
+                                handleBrowserLoginStatusUpdate(msg);
+                            }
+                        } catch (e) {}
+                    };
+                } catch (e) {}
+
+                browserLoginState.pollTimer = setInterval(async () => {
+                    if (!browserLoginState.sessionId) return;
+                    try {
+                        const sr = await apiRequest(`/api/tokens/browser-login/status/${browserLoginState.sessionId}?include_frame=true`);
+                        if (!sr) return;
+                        const sd = await sr.json();
+                        if (sd.frame_b64) {
+                            handleBrowserLoginFrame(sd.frame_meta, sd.frame_b64);
+                        }
+                        await handleBrowserLoginStatusUpdate(sd);
+                    } catch (e) {}
+                }, 1200);
+            } catch (e) {
+                updateBrowserLoginBadge('failed', e.message || String(e));
+                showToast(`启动浏览器登录失败: ${e.message || e}`, 'error');
+                if (btn) { btn.disabled = false; btn.textContent = '启动登录浏览器'; }
+            }
+        }
+
+        async function closeBrowserLoginModal(skipCancel = false) {
+            const sid = browserLoginState.sessionId;
+            stopBrowserLoginStreams();
+            browserLoginState.sessionId = null;
+            $('browserLoginModal').classList.add('hidden');
+            const img = $('browserLoginFrameImg');
+            const ph = $('browserLoginPlaceholder');
+            if (img) { img.src = ''; img.classList.add('hidden'); }
+            if (ph) ph.classList.remove('hidden');
+            const btn = $('browserLoginStartBtn');
+            if (btn) { btn.disabled = false; btn.textContent = '启动登录浏览器'; }
+            if (!skipCancel && sid) {
+                try {
+                    await apiRequest(`/api/tokens/browser-login/cancel/${sid}`, { method: 'POST' });
+                } catch (e) {}
+            }
+        }
+
         (()=>{refreshTokens();loadATAutoRefreshConfig()})();
 
 
@@ -1361,7 +1729,7 @@
             if(Array.isArray(window.allLogs)) renderLogs(window.allLogs);
             renderProxyTestResult();
         });
-        Object.assign(window, {$, apiRequest, loadStats, loadTokens, formatExpiry, formatPlanType, formatSora2, formatPlanTypeWithTooltip, formatSora2Remaining, formatAccountType, formatProjectNameDisplay, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copySora2Code, copyProjectId, openSora2Modal, closeSora2Modal, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, submitSora2Activate, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, togglePersonalProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, escapeLogHtml, parseLogJson, truncateLogText, extractLogErrorSummary, extractLogPrimaryUrl, extractLogSuccessSummary, formatLogPayload, resetLogMediaCache, getLogDetailToggleState, setLogDetailToggleState, syncLogDetailViewState, cacheLogMediaUrl, normalizeLogMediaUrl, renderLogLink, isVideoUrl, isImageUrl, renderMediaPreview, handleLogMediaPreviewError, loadLogMediaPreview, renderLogDetail});
+        Object.assign(window, {$, apiRequest, loadStats, loadTokens, formatExpiry, formatPlanType, formatSora2, formatPlanTypeWithTooltip, formatSora2Remaining, formatAccountType, formatProjectNameDisplay, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copySora2Code, copyProjectId, openSora2Modal, closeSora2Modal, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, submitSora2Activate, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, togglePersonalProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, escapeLogHtml, parseLogJson, truncateLogText, extractLogErrorSummary, extractLogPrimaryUrl, extractLogSuccessSummary, formatLogPayload, resetLogMediaCache, getLogDetailToggleState, setLogDetailToggleState, syncLogDetailViewState, cacheLogMediaUrl, normalizeLogMediaUrl, renderLogLink, isVideoUrl, isImageUrl, renderMediaPreview, handleLogMediaPreviewError, loadLogMediaPreview, renderLogDetail, openBrowserLoginModal, startBrowserLoginSession, closeBrowserLoginModal, sendBrowserLoginInput, sendBrowserLoginQuickText});
     });
     </script>
 </body>

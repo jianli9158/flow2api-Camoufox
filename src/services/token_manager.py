@@ -46,10 +46,19 @@ class TokenManager:
     def _get_project_pool_size(self) -> int:
         """读取当前生效的单 Token 项目池大小配置。"""
         try:
+            from .browser_captcha import BrowserCaptchaService
+            if (
+                BrowserCaptchaService._instance is not None
+                and str(getattr(config, "captcha_method", "") or "").strip().lower()
+                in {"browser", "camoufox"}
+            ):
+                return 1
+        except Exception:
+            pass
+        try:
             return max(1, min(50, int(config.personal_project_pool_size or 4)))
         except Exception:
             return 4
-
     def _sort_projects(self, projects: List[Project]) -> List[Project]:
         """Sort projects in a stable order for round-robin selection."""
         return sorted(
@@ -275,6 +284,7 @@ class TokenManager:
             token.st,
             project_name,
             google_cookies=token.google_cookies,
+            token_id=token.id,
         )
         debug_logger.log_info(
             f"[PROJECT] Created pooled project for token {token.id}: {project_name} ({project_id})"
@@ -391,6 +401,9 @@ class TokenManager:
         proxy_url: Optional[str] = None,
         auto_refresh_enabled: bool = True,
         refresh_interval_minutes: int = 30,
+        preverified_credits: Optional[int] = None,
+        preverified_tier: Optional[str] = None,
+        skip_remote_verify: bool = False,
     ) -> Token:
         """Add a new token and prepare its pooled projects."""
         if not st and google_cookies:
@@ -402,60 +415,76 @@ class TokenManager:
         if existing_token:
             raise ValueError(f"Token 已存在：{existing_token.email}")
 
-        debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
-        try:
-            result = await self.flow_client.st_to_at(
-                st,
-                google_cookies=google_cookies,
-            )
-            google_cookies = result.get("google_cookies") or google_cookies
-            at = result["access_token"]
-            expires = result.get("expires")
-            user_info = result.get("user", {})
-            email = user_info.get("email", "") or str(login_account or "").strip()
-            if not email and google_cookies:
-                # 新版 Flow 的会话接口不返回账号信息，直接从 Cookie 读取真实登录邮箱。
-                try:
-                    identity = await self.detect_account_identity(
-                        google_cookies, proxy_url=proxy_url
-                    )
-                    email = identity["email"]
-                    google_cookies = identity["google_cookies"]
-                    st = identity["st"]
-                except Exception as e:
-                    debug_logger.log_warning(
-                        f"[ADD_TOKEN] 自动获取账号邮箱失败，使用占位邮箱: {e}"
-                    )
-                    account_hash = hashlib.sha256(
-                        google_cookies.encode("utf-8")
-                    ).hexdigest()[:16]
-                    email = f"account-{account_hash}@flow.local"
+        if skip_remote_verify:
+            at = "flow-frontend-cookie"
+            at_expires = datetime.now(timezone.utc) + timedelta(minutes=55)
+            email = str(login_account or "").strip()
+            if not email:
+                account_hash = hashlib.sha256(
+                    (google_cookies or st).encode("utf-8")
+                ).hexdigest()[:16]
+                email = f"account-{account_hash}@flow.local"
             login_account = login_account or email
             existing_identity = await self.db.get_token_by_email(email) if email else None
             if existing_identity:
                 raise ValueError(f"账号已存在: {email}")
-            name = user_info.get("name", email.split("@")[0] if email else "")
-            at_expires = None
-            if expires:
-                try:
-                    at_expires = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-                except Exception:
-                    pass
-        except ValueError:
-            raise
-        except Exception as e:
-            raise ValueError(f"Google Cookie 验证失败：{str(e)}")
+            name = email.split("@")[0] if email else ""
+            credits = int(preverified_credits or 0)
+            user_paygate_tier = preverified_tier or None
+        else:
+            debug_logger.log_info(f"[ADD_TOKEN] Converting ST to AT...")
+            try:
+                result = await self.flow_client.st_to_at(
+                    st,
+                    google_cookies=google_cookies,
+                )
+                google_cookies = result.get("google_cookies") or google_cookies
+                at = result["access_token"]
+                expires = result.get("expires")
+                user_info = result.get("user", {})
+                email = user_info.get("email", "") or str(login_account or "").strip()
+                if not email and google_cookies:
+                    try:
+                        identity = await self.detect_account_identity(
+                            google_cookies, proxy_url=proxy_url
+                        )
+                        email = identity["email"]
+                        google_cookies = identity["google_cookies"]
+                        st = identity["st"]
+                    except Exception as e:
+                        debug_logger.log_warning(
+                            f"[ADD_TOKEN] 自动获取账号邮箱失败，使用占位邮箱: {e}"
+                        )
+                        account_hash = hashlib.sha256(
+                            google_cookies.encode("utf-8")
+                        ).hexdigest()[:16]
+                        email = f"account-{account_hash}@flow.local"
+                login_account = login_account or email
+                existing_identity = await self.db.get_token_by_email(email) if email else None
+                if existing_identity:
+                    raise ValueError(f"账号已存在: {email}")
+                name = user_info.get("name", email.split("@")[0] if email else "")
+                at_expires = None
+                if expires:
+                    try:
+                        at_expires = datetime.fromisoformat(expires.replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+            except ValueError:
+                raise
+            except Exception as e:
+                raise ValueError(f"Google Cookie 验证失败：{str(e)}")
 
-        try:
-            credits_result = await self.flow_client.get_credits(
-                at,
-                google_cookies=google_cookies,
-            )
-            credits = credits_result.get("credits", 0)
-            user_paygate_tier = credits_result.get("userPaygateTier")
-        except Exception:
-            credits = 0
-            user_paygate_tier = None
+            try:
+                credits_result = await self.flow_client.get_credits(
+                    at,
+                    google_cookies=google_cookies,
+                )
+                credits = credits_result.get("credits", 0)
+                user_paygate_tier = credits_result.get("userPaygateTier")
+            except Exception:
+                credits = 0
+                user_paygate_tier = None
 
         base_project_name = self._normalize_project_name_base(project_name)
         project_pool_size = self._get_project_pool_size()
@@ -539,7 +568,7 @@ class TokenManager:
         pooled_projects[0].token_id = token_id
         pooled_projects[0].id = await self.db.add_project(pooled_projects[0])
 
-        while len(pooled_projects) < project_pool_size:
+        while not skip_remote_verify and len(pooled_projects) < project_pool_size:
             new_project = await self._create_project_for_token(
                 token, len(pooled_projects) + 1, base_project_name
             )
@@ -736,11 +765,27 @@ class TokenManager:
         if not token:
             return None
 
+        try:
+            from .browser_captcha import BrowserCaptchaService
+            use_camoufox = (
+                BrowserCaptchaService._instance is not None
+                and str(getattr(config, "captcha_method", "") or "").strip().lower()
+                in {"browser", "camoufox"}
+                and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox")
+                .strip()
+                .lower()
+                == "camoufox"
+            )
+        except Exception:
+            use_camoufox = False
+        if use_camoufox and self._is_cookie_driven(token):
+            self._mark_at_valid(token.id)
+            return token
+
         needs_refresh = self._should_refresh_at(token)
         if not needs_refresh and self._has_recent_at_validation(token.id):
             # 刚校验通过的登录态直接复用，避免每个请求都打上游。
             return token
-
         if not needs_refresh:
             try:
                 credits_result = await self._get_credits_for_token(token, token.at)
@@ -1189,7 +1234,6 @@ class TokenManager:
             await self._record_cookie_refresh_failure(token, error)
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}")
             return None
-
     async def refresh_cookies(self, token_id: int) -> bool:
         """Explicitly renew current-Flow Cookies even when the AT marker is valid."""
         refresh_lock = await self._get_token_lock(
@@ -1232,7 +1276,6 @@ class TokenManager:
 
         if not refresh_config or not refresh_config.enabled:
             return
-
         tokens = await self.db.get_active_tokens()
         now = datetime.now(timezone.utc)
         for token in tokens:
@@ -1264,6 +1307,15 @@ class TokenManager:
         while True:
             await asyncio.sleep(60)
             try:
+                if (
+                    str(getattr(config, "captcha_method", "") or "").strip().lower()
+                    in {"browser", "camoufox"}
+                    and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox")
+                    .strip()
+                    .lower()
+                    == "camoufox"
+                ):
+                    continue
                 await self.run_protocol_refresh_once()
             except asyncio.CancelledError:
                 raise

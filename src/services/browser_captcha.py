@@ -247,38 +247,41 @@ def _ensure_browser_installed() -> bool:
     return False
 
 
-# 尝试导入 playwright
+# 尝试导入 playwright（仅在 browser_engine == "playwright" 时才强制安装/检查）
 async_playwright = None
 Route = None
 BrowserContext = None
 PLAYWRIGHT_AVAILABLE = False
 
-if DOCKER_HEADED_BLOCKED:
-    debug_logger.log_warning(
-        "[BrowserCaptcha] 检测到 Docker 环境，默认禁用有头浏览器打码。"
-        "如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb。"
-    )
-    print("[BrowserCaptcha] ⚠️ 检测到 Docker 环境，默认禁用有头浏览器打码")
-    print(
-        "[BrowserCaptcha] 如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb"
-    )
-else:
-    if IS_DOCKER and ALLOW_DOCKER_HEADED:
+from .camoufox_bidi import CamoufoxWorker, find_camoufox_executable
+
+if getattr(config, "browser_engine", "camoufox") == "playwright":
+    if DOCKER_HEADED_BLOCKED:
         debug_logger.log_warning(
-            "[BrowserCaptcha] Docker 有头浏览器打码白名单已启用，请确保 DISPLAY/Xvfb 可用"
+            "[BrowserCaptcha] 检测到 Docker 环境，默认禁用有头浏览器打码。"
+            "如需启用请设置 ALLOW_DOCKER_HEADED_CAPTCHA=true，并提供 DISPLAY/Xvfb。"
         )
-        print("[BrowserCaptcha] ✅ Docker 有头浏览器打码白名单已启用")
-    if _ensure_playwright_installed():
-        try:
-            from playwright.async_api import async_playwright, Route, BrowserContext
+    else:
+        if _ensure_playwright_installed():
+            try:
+                from playwright.async_api import async_playwright, Route, BrowserContext
 
-            PLAYWRIGHT_AVAILABLE = True
-            # 检查并安装浏览器
-            _ensure_browser_installed()
-        except ImportError as e:
-            debug_logger.log_error(f"[BrowserCaptcha] playwright 导入失败: {e}")
-            print(f"[BrowserCaptcha] ❌ playwright 导入失败: {e}")
+                PLAYWRIGHT_AVAILABLE = True
+                _ensure_browser_installed()
+            except ImportError as e:
+                debug_logger.log_error(f"[BrowserCaptcha] playwright 导入失败: {e}")
+else:
+    try:
+        from playwright.async_api import async_playwright, Route, BrowserContext
 
+        PLAYWRIGHT_AVAILABLE = True
+    except ImportError:
+        pass
+    camoufox_bin = find_camoufox_executable()
+    if camoufox_bin:
+        finish_runtime_prepare(
+            "browser", f"检测到 Camoufox (BiDi) 内核就绪: {camoufox_bin}"
+        )
 
 # 配置
 LABS_URL = "https://flow.google.com"
@@ -3400,8 +3403,14 @@ class BrowserCaptchaService:
             cls._instance = instance
             return instance
     
+    def _use_camoufox_engine(self) -> bool:
+        return getattr(config, "browser_engine", "camoufox") == "camoufox"
+
     def _check_available(self):
         """检查服务是否可用"""
+        if self._use_camoufox_engine():
+            # Camoufox 使用无头 1fps + renderLayers=false + WebDriver BiDi，无需 Xvfb 或 Playwright
+            return
         if DOCKER_HEADED_BLOCKED:
             raise RuntimeError(
                 "检测到 Docker 环境，默认禁用有头浏览器打码。"
@@ -3895,8 +3904,8 @@ class BrowserCaptchaService:
                 except asyncio.TimeoutError:
                     pass
 
-    async def _get_or_create_browser(self, browser_id: int) -> TokenBrowser:
-        """获取或创建指定 ID 的浏览器实例"""
+    async def _get_or_create_browser(self, browser_id: int) -> Union[TokenBrowser, CamoufoxWorker]:
+        """获取或创建指定 ID 的浏览器实例（默认优先使用 AIStudio2API 风格 CamoufoxWorker）"""
         async with self._browsers_lock:
             if self._closed:
                 raise RuntimeError("Browser captcha service is closed")
@@ -3904,9 +3913,17 @@ class BrowserCaptchaService:
                 user_data_dir = os.path.join(
                     self.base_user_data_dir, f"browser_{browser_id}"
                 )
-                browser = TokenBrowser(browser_id, user_data_dir, db=self.db)
+                if self._use_camoufox_engine():
+                    browser = CamoufoxWorker(browser_id, user_data_dir, db=self.db)
+                    debug_logger.log_info(
+                        f"[BrowserCaptcha] 创建 Camoufox+BiDi 浏览器实例 {browser_id}"
+                    )
+                else:
+                    browser = TokenBrowser(browser_id, user_data_dir, db=self.db)
+                    debug_logger.log_info(
+                        f"[BrowserCaptcha] 创建 Playwright 浏览器实例 {browser_id}"
+                    )
                 self._browsers[browser_id] = browser
-                debug_logger.log_info(f"[BrowserCaptcha] 创建浏览器实例 {browser_id}")
             return self._browsers[browser_id]
     
     def _get_next_browser_id(self) -> int:
@@ -4142,6 +4159,164 @@ class BrowserCaptchaService:
                 )
             return response, request.ref, deepcopy(request.fingerprint)
 
+    async def execute_flow_frontend_rpc(
+        self,
+        *,
+        rpc_id: str,
+        argument: List[Any],
+        project_id: Optional[str] = None,
+        source_path: Optional[str] = None,
+        timeout: int = 90,
+        token_id: Optional[int] = None,
+        browser_ref: Optional[Union[int, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """在已借用或绑定的 Camoufox 页面内直接执行 batchexecute RPC（ProtectedSend 通道）。"""
+        if not self._use_camoufox_engine() or not getattr(
+            config, "browser_in_page_rpc", True
+        ):
+            return None
+        self._check_available()
+        deadline = time.monotonic() + max(5.0, float(timeout or 90))
+        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        async with self._borrow_browser(
+            project_id,
+            token_id,
+            browser_ref=browser_ref,
+            wait_timeout=min(
+                self.QUEUE_WAIT_SECONDS, max(0.0, deadline - time.monotonic())
+            ),
+        ) as request:
+            executor = getattr(
+                request.browser, "execute_flow_frontend_rpc", None
+            )
+            if not callable(executor):
+                return None
+            remaining = max(5.0, deadline - time.monotonic())
+            response = await asyncio.wait_for(
+                executor(
+                    rpc_id=rpc_id,
+                    argument=argument,
+                    project_id=project_id,
+                    source_path=source_path,
+                    timeout=int(remaining),
+                    token_id=token_id,
+                    token_proxy_url=token_proxy_url,
+                ),
+                timeout=remaining + 10.0,
+            )
+            request.generation = getattr(
+                request.browser, "_runtime_generation", 0
+            )
+            request.fingerprint = deepcopy(
+                request.browser.get_last_fingerprint()
+            )
+            if isinstance(response, dict) and int(response.get("status") or 0) >= 400:
+                request.failed = True
+                await self.report_error(
+                    request.ref, error_reason=response.get("text") or ""
+                )
+            return response
+
+    async def generate_native_image(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        aspect_ratio: str = "IMAGE_ASPECT_RATIO_LANDSCAPE",
+        model_name: str = "BELUGA",
+        image_inputs: Optional[List[Dict[str, Any]]] = None,
+        timeout: int = 120,
+        token_id: Optional[int] = None,
+        browser_ref: Optional[Union[int, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """在已借用或绑定的无头 Camoufox 页面内直接执行原生 UI + StreamChat 生图并解析图片 URL。"""
+        if not self._use_camoufox_engine():
+            return None
+        self._check_available()
+        deadline = time.monotonic() + max(30.0, float(timeout or 120))
+        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        async with self._borrow_browser(
+            project_id,
+            token_id,
+            browser_ref=browser_ref,
+            wait_timeout=min(
+                self.QUEUE_WAIT_SECONDS, max(0.0, deadline - time.monotonic())
+            ),
+        ) as request:
+            executor = getattr(request.browser, "generate_native_image", None)
+            if not callable(executor):
+                return None
+            remaining = max(30.0, deadline - time.monotonic())
+            response = await asyncio.wait_for(
+                executor(
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    model_name=model_name,
+                    image_inputs=image_inputs,
+                    timeout=int(remaining),
+                    token_id=token_id,
+                    token_proxy_url=token_proxy_url,
+                ),
+                timeout=remaining + 15.0,
+            )
+            request.generation = getattr(
+                request.browser, "_runtime_generation", 0
+            )
+            request.fingerprint = deepcopy(
+                request.browser.get_last_fingerprint()
+            )
+            return response
+
+    async def generate_native_video(
+        self,
+        *,
+        project_id: str,
+        prompt: str,
+        aspect_ratio: str = "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        model_key: str = "",
+        timeout: int = 180,
+        token_id: Optional[int] = None,
+        browser_ref: Optional[Union[int, str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """在已借用或绑定的无头 Camoufox 页面内直接执行原生 UI + StreamChat 生成视频任务。"""
+        if not self._use_camoufox_engine():
+            return None
+        self._check_available()
+        deadline = time.monotonic() + max(45.0, float(timeout or 180))
+        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        async with self._borrow_browser(
+            project_id,
+            token_id,
+            browser_ref=browser_ref,
+            wait_timeout=min(
+                self.QUEUE_WAIT_SECONDS, max(0.0, deadline - time.monotonic())
+            ),
+        ) as request:
+            executor = getattr(request.browser, "generate_native_video", None)
+            if not callable(executor):
+                return None
+            remaining = max(45.0, deadline - time.monotonic())
+            response = await asyncio.wait_for(
+                executor(
+                    project_id=project_id,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                    model_key=model_key,
+                    timeout=int(remaining),
+                    token_id=token_id,
+                    token_proxy_url=token_proxy_url,
+                ),
+                timeout=remaining + 15.0,
+            )
+            request.generation = getattr(
+                request.browser, "_runtime_generation", 0
+            )
+            request.fingerprint = deepcopy(
+                request.browser.get_last_fingerprint()
+            )
+            return response
+
     async def report_error(self, browser_ref=None, error_reason: Optional[str] = None):
         """Isolate only the runtime that produced this request's failed token."""
         slot_id, handle = self._parse_browser_ref(browser_ref)
@@ -4177,6 +4352,16 @@ class BrowserCaptchaService:
             if not state.needs_recycle or state.retiring:
                 state.failure_streak += 1
                 self._stats["api_403"] += 1
+            if hasattr(browser, "note_recaptcha_rejected"):
+                try:
+                    browser.note_recaptcha_rejected()
+                except Exception:
+                    pass
+            if state.failure_streak < 3 and hasattr(browser, "note_recaptcha_rejected"):
+                debug_logger.log_warning(
+                    f"[BrowserCaptcha] slot={slot_id} 收到风控拒绝 (streak={state.failure_streak}/3)，保持常驻页面热态并追加真机轨迹预热后重试"
+                )
+                return
             state.needs_recycle = True
             state.reason = "recaptcha_rejected"
             state.phase = "draining"
@@ -4184,7 +4369,7 @@ class BrowserCaptchaService:
             self._resume_recovery_locked(slot_id)
             self._slot_condition.notify_all()
             debug_logger.log_warning(
-                f"[BrowserCaptcha] slot={slot_id} 已隔离，等待请求释放后恢复"
+                f"[BrowserCaptcha] slot={slot_id} 连续 {state.failure_streak} 次风控拒绝，已隔离等待回收"
             )
 
     async def report_request_finished(
@@ -4246,12 +4431,21 @@ class BrowserCaptchaService:
             if type(self)._instance is self:
                 type(self)._instance = None
             
+    async def release_token_browsers(
+        self, token_id: Optional[int], reason: str = "token_relogin"
+    ) -> None:
+        for browser in list(self._browsers.values()):
+            if token_id is None or getattr(browser, "_shared_bound_token_id", None) == int(token_id):
+                try:
+                    await browser.recycle_browser(reason=reason, rotate_profile=False)
+                except Exception:
+                    pass
+
     async def open_login_browser(self):
         return {"success": False, "error": "Not implemented"}
 
     async def create_browser_for_token(self, t, s=None):
         pass
-
     def get_stats(self):
         now = time.monotonic()
         states = []

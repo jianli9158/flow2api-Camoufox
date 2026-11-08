@@ -62,8 +62,32 @@ TRUSTED_RECAPTCHA_HOOK_SOURCE = r"""
 RECAPTCHA_EXECUTE_SOURCE = r"""(async (siteKey, requestedAction, timeoutMs) => {
             const storageKey = '__flow2apiTrustedRecaptchaExecute';
             for (let attempt = 0; attempt < 40; attempt += 1) {
-                if (window[storageKey]) break;
+                if (
+                    window[storageKey] ||
+                    (window.grecaptcha &&
+                        window.grecaptcha.enterprise &&
+                        typeof window.grecaptcha.enterprise.execute === 'function')
+                ) {
+                    break;
+                }
                 await new Promise(resolve => setTimeout(resolve, 250));
+            }
+
+            if (
+                !window[storageKey] &&
+                window.grecaptcha &&
+                window.grecaptcha.enterprise &&
+                typeof window.grecaptcha.enterprise.ready === 'function'
+            ) {
+                try {
+                    await new Promise((resolve) => {
+                        const timer = setTimeout(resolve, 2500);
+                        window.grecaptcha.enterprise.ready(() => {
+                            clearTimeout(timer);
+                            setTimeout(resolve, 60);
+                        });
+                    });
+                } catch (error) {}
             }
 
             const capturedExecute = !!window[storageKey];
@@ -76,85 +100,100 @@ RECAPTCHA_EXECUTE_SOURCE = r"""(async (siteKey, requestedAction, timeoutMs) => {
             if (!execute) {
                 const enterprise = window.grecaptcha && window.grecaptcha.enterprise;
                 execute = enterprise && enterprise.execute;
-                try {
-                    executeSource = String(execute || '');
-                } catch (error) {}
-                if (
-                    executeSource.includes('extension_hijack_detected') &&
-                    !window.__flow2apiRecaptchaActionGuardInstalled
-                ) {
-                    return {
-                        ok: false,
-                        error: 'trusted reCAPTCHA action guard is unavailable',
-                        debug: {
-                            hookInstalled: !!window.__flow2apiTrustedRecaptchaHookInstalled,
-                            actionGuard: !!window.__flow2apiRecaptchaActionGuardInstalled,
-                            captured: !!window.__flow2apiTrustedRecaptchaExecute,
-                            url: location.href
-                        }
-                    };
-                }
             }
 
             if (typeof execute !== 'function') {
                 return { ok: false, error: 'reCAPTCHA execute is unavailable' };
             }
 
-            let executeTarget = siteKey;
-            try {
-                if (
-                    !capturedExecute &&
-                    window.grecaptcha &&
-                    window.grecaptcha.enterprise &&
-                    typeof window.grecaptcha.enterprise.render === 'function' &&
-                    window.__flow2apiRecaptchaClientId === undefined
-                ) {
-                    window.__flow2apiRecaptchaClientId =
-                        window.grecaptcha.enterprise.render(
-                            document.documentElement,
-                            { sitekey: siteKey, action: requestedAction }
-                        );
-                }
-                if (window.__flow2apiRecaptchaClientId !== undefined) {
-                    executeTarget = window.__flow2apiRecaptchaClientId;
-                }
-            } catch (renderError) {
-                return {
-                    ok: false,
-                    error: renderError && renderError.message
-                        ? renderError.message
-                        : String(renderError)
+            const runExecute = (target) => new Promise((resolve, reject) => {
+                let settled = false;
+                const finish = (handler, value) => {
+                    if (settled) return;
+                    settled = true;
+                    handler(value);
                 };
-            }
+                const timer = setTimeout(() => {
+                    finish(reject, new Error('execute timeout'));
+                }, timeoutMs);
+                const originalAssign = Object.assign;
+                Object.assign = function(assignTarget, ...sources) {
+                    let nextSources = sources;
+                    if (sources.length >= 2) {
+                        const previous = sources[sources.length - 2];
+                        const last = sources[sources.length - 1];
+                        if (
+                            previous &&
+                            typeof previous.action === 'string' &&
+                            previous.action &&
+                            last &&
+                            last.action === 'extension_hijack_detected'
+                        ) {
+                            nextSources = sources.slice(0, -1);
+                        }
+                    }
+                    return originalAssign.call(this, assignTarget, ...nextSources);
+                };
+                try {
+                    Promise.resolve(execute(target, { action: requestedAction }))
+                        .then(value => {
+                            Object.assign = originalAssign;
+                            clearTimeout(timer);
+                            finish(resolve, value);
+                        })
+                        .catch(error => {
+                            Object.assign = originalAssign;
+                            clearTimeout(timer);
+                            finish(reject, error);
+                        });
+                } catch (error) {
+                    Object.assign = originalAssign;
+                    clearTimeout(timer);
+                    finish(reject, error);
+                }
+            });
+
+            let executeTarget = window.__flow2apiRecaptchaClientId !== undefined
+                ? window.__flow2apiRecaptchaClientId
+                : siteKey;
 
             try {
-                const token = await new Promise((resolve, reject) => {
-                    let settled = false;
-                    const finish = (handler, value) => {
-                        if (settled) return;
-                        settled = true;
-                        handler(value);
-                    };
-                    const timer = setTimeout(() => {
-                        finish(reject, new Error('execute timeout'));
-                    }, timeoutMs);
-                    try {
-                        Promise.resolve(execute(executeTarget, { action: requestedAction }))
-                            .then(value => {
-                                clearTimeout(timer);
-                                finish(resolve, value);
-                            })
-                            .catch(error => {
-                                clearTimeout(timer);
-                                finish(reject, error);
-                            });
-                    } catch (error) {
-                        clearTimeout(timer);
-                        finish(reject, error);
-                    }
-                });
+                const token = await runExecute(executeTarget);
                 return { ok: true, token };
-            } catch (error) {
+            } catch (firstError) {
+                // Fallback: if siteKey was not auto-rendered, render into an empty detached/hidden div
+                try {
+                    if (
+                        !capturedExecute &&
+                        window.grecaptcha &&
+                        window.grecaptcha.enterprise &&
+                        typeof window.grecaptcha.enterprise.render === 'function' &&
+                        window.__flow2apiRecaptchaClientId === undefined
+                    ) {
+                        let container = null;
+                        if (typeof document !== 'undefined' && document && typeof document.createElement === 'function') {
+                            container = document.createElement('div');
+                            container.style.display = 'none';
+                            if (document.body) {
+                                document.body.appendChild(container);
+                            }
+                        } else if (typeof document !== 'undefined' && document && document.documentElement) {
+                            container = document.documentElement;
+                        }
+                        if (container) {
+                            window.__flow2apiRecaptchaClientId =
+                                window.grecaptcha.enterprise.render(
+                                    container,
+                                    { sitekey: siteKey, action: requestedAction, size: 'invisible' }
+                                );
+                            executeTarget = window.__flow2apiRecaptchaClientId;
+                            const token = await runExecute(executeTarget);
+                            return { ok: true, token };
+                        }
+                    }
+                } catch (_) {}
+
+                const error = firstError;
                 const debug = {
                     captured: capturedExecute,
                     actionGuard: !!window.__flow2apiRecaptchaActionGuardInstalled,

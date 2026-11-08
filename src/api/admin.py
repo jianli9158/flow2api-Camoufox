@@ -5,8 +5,8 @@ import hashlib
 import importlib
 import sys
 import json
-from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response
+from datetime import datetime, timedelta, timezone
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from typing import Optional, List, Dict, Any, Literal
@@ -1482,6 +1482,342 @@ async def import_tokens(
         + (f", {len(errors)} 个失败" if errors else ""),
     }
 
+
+
+# ========== Camoufox Direct Browser Login (AIStudio2API Style) ==========
+
+
+class BrowserLoginStartRequest(BaseModel):
+    mode: Literal["auto", "window", "liveview"] = "auto"
+    token_id: Optional[int] = None
+    auto_save_token: bool = True
+    proxy_url: Optional[str] = None
+    captcha_proxy_url: Optional[str] = None
+    remark: Optional[str] = None
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    timeout_seconds: int = 300
+
+
+async def _resolve_browser_login_proxy(
+    explicit_proxy: Optional[str], token_id: Optional[int]
+) -> Optional[str]:
+    if explicit_proxy and explicit_proxy.strip():
+        return explicit_proxy.strip()
+    if token_id and token_manager:
+        tok = await token_manager.get_token(token_id)
+        if tok:
+            if getattr(tok, "captcha_proxy_url", None):
+                return str(tok.captcha_proxy_url).strip()
+            if getattr(tok, "proxy_url", None):
+                return str(tok.proxy_url).strip()
+    if db:
+        try:
+            cap_cfg = await db.get_captcha_config()
+            if cap_cfg and cap_cfg.browser_proxy_enabled and cap_cfg.browser_proxy_url:
+                return str(cap_cfg.browser_proxy_url).strip()
+        except Exception:
+            pass
+    if proxy_manager:
+        try:
+            p_cfg = await proxy_manager.get_proxy_config()
+            if p_cfg and p_cfg.enabled and p_cfg.proxy_url:
+                return str(p_cfg.proxy_url).strip()
+        except Exception:
+            pass
+    return None
+
+
+@router.post("/api/tokens/browser-login/start")
+async def start_browser_login(
+    request: BrowserLoginStartRequest, _admin_token: str = Depends(verify_admin_token)
+):
+    """启动隔离的 Camoufox 浏览器进行 Google Flow 登录，登录完成后自动导出 Cookie、StorageState 与启动缓存。"""
+    from ..services.camoufox_bidi import CamoufoxLoginManager, CamoufoxLoginSession
+
+    effective_proxy = await _resolve_browser_login_proxy(
+        request.captcha_proxy_url or request.proxy_url, request.token_id
+    )
+
+    async def _on_login_complete(
+        sess: CamoufoxLoginSession, exported: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if not sess.auto_save_token or not token_manager:
+            return {"action": "extracted_only"}
+
+        google_cookies = str(exported.get("google_cookies") or "").strip()
+        email = str(exported.get("email") or "").strip().lower()
+        detected_project_id = (
+            str(sess.project_id or exported.get("project_id") or "").strip() or None
+        )
+
+        if not email:
+            identity = await token_manager.detect_account_identity(
+                google_cookies, proxy_url=request.proxy_url or effective_proxy
+            )
+            google_cookies = identity["google_cookies"]
+            email = str(identity.get("email") or "").strip().lower()
+
+        target_token: Optional[Token] = None
+        if sess.token_id:
+            target_token = await token_manager.get_token(sess.token_id)
+        if target_token is None and email:
+            for item in await token_manager.get_all_tokens():
+                if email in {
+                    str(item.email or "").strip().lower(),
+                    str(item.login_account or "").strip().lower(),
+                }:
+                    target_token = item
+                    break
+
+        cookie_hash = hashlib.sha256(google_cookies.encode("utf-8")).hexdigest()
+        st_val = f"frontend-{cookie_hash[:32]}"
+
+        if target_token is not None:
+            from ..services.camoufox_bidi import persist_account_login_artifacts
+
+            mod = sys.modules.get("src.services.browser_captcha")
+            svc = getattr(mod, "BrowserCaptchaService", None) if mod else None
+            svc_inst = getattr(svc, "_instance", None) if svc else None
+            if svc_inst is not None and hasattr(svc_inst, "release_token_browsers"):
+                await svc_inst.release_token_browsers(
+                    target_token.id, reason="browser_relogin_updated"
+                )
+            if sess._temp_account_dir and sess._temp_account_dir.exists():
+                persist_account_login_artifacts(
+                    sess._temp_account_dir,
+                    sess.user_data_root / f"token_{target_token.id}",
+                )
+            at_val = "flow-frontend-cookie"
+            at_expires = datetime.now() + timedelta(minutes=55)
+            await token_manager.update_token(
+                token_id=target_token.id,
+                st=st_val,
+                at=at_val,
+                at_expires=at_expires,
+                email=email or target_token.email,
+                project_id=detected_project_id or target_token.current_project_id,
+                project_name=sess.project_name or target_token.current_project_name,
+                remark=sess.remark if sess.remark is not None else target_token.remark,
+                captcha_proxy_url=(
+                    request.captcha_proxy_url.strip()
+                    if request.captcha_proxy_url is not None
+                    else target_token.captcha_proxy_url
+                ),
+                proxy_url=(
+                    request.proxy_url.strip()
+                    if request.proxy_url is not None
+                    else target_token.proxy_url
+                ),
+                protocol_mode="protocol",
+                google_cookies=google_cookies,
+                login_account=email or target_token.login_account,
+            )
+            if exported.get("credits") is not None:
+                try:
+                    await token_manager.db.update_token(
+                        target_token.id,
+                        credits=int(exported["credits"]),
+                        user_paygate_tier=exported.get("user_paygate_tier") or None,
+                    )
+                except Exception:
+                    pass
+            else:
+                try:
+                    await token_manager.refresh_credits(target_token.id)
+                except Exception:
+                    pass
+            await token_manager.mark_cookie_validated(
+                target_token.id, email or target_token.email
+            )
+            refreshed = await token_manager.get_token(target_token.id)
+            return {
+                "action": "updated",
+                "token_id": target_token.id,
+                "email": (refreshed.email if refreshed else email),
+                "credits": (refreshed.credits if refreshed else 0),
+                "project_id": (
+                    refreshed.current_project_id if refreshed else detected_project_id
+                ),
+            }
+
+        new_tok = await token_manager.add_token(
+            st=st_val,
+            project_id=detected_project_id,
+            project_name=sess.project_name,
+            remark=sess.remark,
+            captcha_proxy_url=(
+                request.captcha_proxy_url.strip()
+                if request.captcha_proxy_url
+                else None
+            ),
+            proxy_url=request.proxy_url.strip() if request.proxy_url else None,
+            protocol_mode="protocol",
+            google_cookies=google_cookies,
+            login_account=email or None,
+            preverified_credits=exported.get("credits"),
+            preverified_tier=exported.get("user_paygate_tier"),
+            skip_remote_verify=True,
+        )
+        if concurrency_manager:
+            await concurrency_manager.reset_token(
+                new_tok.id,
+                image_concurrency=new_tok.image_concurrency,
+                video_concurrency=new_tok.video_concurrency,
+            )
+        return {
+            "action": "added",
+            "token_id": new_tok.id,
+            "email": new_tok.email,
+            "credits": new_tok.credits,
+            "project_id": new_tok.current_project_id,
+        }
+
+    manager = CamoufoxLoginManager.get_instance()
+    session = await manager.start_session(
+        mode=request.mode,
+        proxy_url=effective_proxy,
+        token_id=request.token_id,
+        auto_save_token=request.auto_save_token,
+        remark=request.remark,
+        project_id=request.project_id,
+        project_name=request.project_name,
+        timeout_seconds=float(request.timeout_seconds or 300),
+        on_complete=_on_login_complete,
+    )
+    return {"success": True, **session.to_dict()}
+
+
+@router.get("/api/tokens/browser-login/status/{session_id}")
+async def get_browser_login_status(
+    session_id: str,
+    include_frame: bool = True,
+    _admin_token: str = Depends(verify_admin_token),
+):
+    """查询 Camoufox 登录会话状态及最新画面帧。"""
+    from ..services.camoufox_bidi import CamoufoxLoginManager
+
+    session = CamoufoxLoginManager.get_instance().get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在或已过期")
+    payload = {"success": True, **session.to_dict()}
+    if include_frame and session.live_view.frame_b64:
+        payload["frame_b64"] = session.live_view.frame_b64
+        payload["frame_meta"] = session.live_view.frame_meta
+    return payload
+
+
+@router.post("/api/tokens/browser-login/input/{session_id}")
+async def send_browser_login_input(
+    session_id: str,
+    request: Dict[str, Any],
+    _admin_token: str = Depends(verify_admin_token),
+):
+    """向 Camoufox 登录页面发送鼠标/键盘/文本/滚轮操作。"""
+    from ..services.camoufox_bidi import CamoufoxLoginManager
+
+    session = CamoufoxLoginManager.get_instance().get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="登录会话不存在或已结束")
+    session.live_view.enqueue_input(request)
+    return {"success": True}
+
+
+@router.post("/api/tokens/browser-login/cancel/{session_id}")
+async def cancel_browser_login(
+    session_id: str, _admin_token: str = Depends(verify_admin_token)
+):
+    """取消并关闭正在进行的 Camoufox 浏览器登录会话。"""
+    from ..services.camoufox_bidi import CamoufoxLoginManager
+
+    await CamoufoxLoginManager.get_instance().cancel_session(session_id)
+    return {"success": True}
+
+
+@router.websocket("/api/tokens/browser-login/ws/{session_id}")
+async def browser_login_liveview_ws(websocket: WebSocket, session_id: str):
+    """WebSocket 实时画面流与键鼠转发 (对齐 AIStudio2API LiveView)。"""
+    from ..services.camoufox_bidi import CamoufoxLoginManager
+
+    query_token = (websocket.query_params.get("token") or "").strip()
+    cookie_token = (websocket.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
+    if not (
+        is_admin_session_token_valid(query_token)
+        or is_admin_session_token_valid(cookie_token)
+    ):
+        await websocket.close(code=4401)
+        return
+
+    session = CamoufoxLoginManager.get_instance().get_session(session_id)
+    if session is None:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    last_status = ""
+    last_frame_seq = -1
+    last_dialog_seq = -1
+
+    async def _receiver() -> None:
+        try:
+            while True:
+                msg = await websocket.receive_json()
+                if isinstance(msg, dict):
+                    session.live_view.enqueue_input(msg)
+        except (WebSocketDisconnect, Exception):
+            pass
+
+    recv_task = asyncio.create_task(_receiver())
+    try:
+        while True:
+            if (
+                session.status != last_status
+                or session.live_view.frame_seq != last_frame_seq
+                or session.live_view.dialog_seq != last_dialog_seq
+            ):
+                if session.status != last_status:
+                    last_status = session.status
+                    await websocket.send_json(
+                        {
+                            "type": "status",
+                            "status": session.status,
+                            "message": session.message,
+                            "error": session.error,
+                            "result": session.result,
+                        }
+                    )
+                if session.live_view.dialog_seq != last_dialog_seq:
+                    last_dialog_seq = session.live_view.dialog_seq
+                    await websocket.send_json(
+                        {"type": "dialog", "dialog": session.live_view.dialog}
+                    )
+                if (
+                    session.live_view.frame_seq != last_frame_seq
+                    and session.live_view.frame_b64
+                ):
+                    last_frame_seq = session.live_view.frame_seq
+                    await websocket.send_json(
+                        {
+                            "type": "frame",
+                            "meta": session.live_view.frame_meta,
+                            "image_b64": session.live_view.frame_b64,
+                        }
+                    )
+                if session.status in ("completed", "failed", "cancelled"):
+                    break
+            session.live_view._wake_event.clear()
+            try:
+                await asyncio.wait_for(session.live_view._wake_event.wait(), timeout=0.5)
+            except asyncio.TimeoutError:
+                pass
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        recv_task.cancel()
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 # ========== Config Management ==========
 

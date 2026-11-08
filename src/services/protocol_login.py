@@ -22,7 +22,7 @@ from .browser_cookie_utils import (
 
 FLOW_BASE = "https://flow.google.com"
 IMPERSONATE = "chrome"
-
+CAMOUFOX_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"
 
 def extract_flow_account_email(html: str) -> str:
     """Read the signed-in identity from the current Flow bootstrap data."""
@@ -142,8 +142,14 @@ class ProtocolLogin:
                 "error": str(exc),
             }
 
+        from ..core.config import config
+
+        use_camoufox = (
+            str(getattr(config, "captcha_method", "") or "").lower() == "browser"
+            and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox").lower() == "camoufox"
+        )
         session_kwargs: Dict[str, Any] = {
-            "impersonate": IMPERSONATE,
+            "impersonate": "firefox" if use_camoufox else IMPERSONATE,
             "trust_env": False,
             "cookies": cookie_jar,
             "timeout": 30,
@@ -155,13 +161,18 @@ class ProtocolLogin:
                 normalized_proxy = f"http://{normalized_proxy}"
             session_kwargs["proxy"] = normalized_proxy
 
+        req_headers: Dict[str, str] = {
+            "Referer": f"{FLOW_BASE}/",
+        }
+        if use_camoufox:
+            req_headers["User-Agent"] = CAMOUFOX_USER_AGENT
+            req_headers["Accept-Language"] = "en-US,en;q=0.9"
+
         try:
             async with AsyncSession(**session_kwargs) as session:
                 response = await session.get(
                     f"{FLOW_BASE}/projects",
-                    headers={
-                        "Referer": f"{FLOW_BASE}/",
-                    },
+                    headers=req_headers,
                 )
                 # The Python session jar only merges updates; a fresh snapshot also
                 # honors cookies deleted by Set-Cookie, including during redirects.

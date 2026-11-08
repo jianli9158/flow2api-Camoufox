@@ -1,7 +1,10 @@
 """Configuration management for Flow2API"""
 
 import os
-import tomli
+try:
+    import tomllib as tomli
+except ImportError:
+    import tomli
 from pathlib import Path
 from typing import Dict, Any, Optional
 
@@ -421,6 +424,36 @@ class Config:
         if "captcha" not in self._config:
             self._config["captcha"] = {}
         self._config["captcha"]["captcha_method"] = method
+
+    @property
+    def browser_engine(self) -> str:
+        """浏览器模式内核: camoufox (AIStudio2API 风格 Camoufox+BiDi) 或 playwright。"""
+        env_val = os.getenv("FLOW2API_BROWSER_ENGINE")
+        raw = (
+            env_val
+            if env_val is not None
+            else self._config.get("captcha", {}).get("browser_engine", "camoufox")
+        )
+        normalized = str(raw or "camoufox").strip().lower()
+        return normalized if normalized in {"camoufox", "playwright"} else "camoufox"
+
+    def set_browser_engine(self, engine: str):
+        normalized = str(engine or "camoufox").strip().lower()
+        if normalized not in {"camoufox", "playwright"}:
+            normalized = "camoufox"
+        if "captcha" not in self._config:
+            self._config["captcha"] = {}
+        self._config["captcha"]["browser_engine"] = normalized
+
+    @property
+    def browser_in_page_rpc(self) -> bool:
+        """Camoufox 模式下是否直接在页面内通过 XHR/ProtectedSend 执行 Flow batchexecute RPC。"""
+        env_val = os.getenv("FLOW2API_BROWSER_IN_PAGE_RPC")
+        if env_val is not None:
+            return str(env_val).strip().lower() in {"1", "true", "yes", "on"}
+        return bool(
+            self._config.get("captcha", {}).get("browser_in_page_rpc", True)
+        )
 
     @property
     def browser_launch_background(self) -> bool:
