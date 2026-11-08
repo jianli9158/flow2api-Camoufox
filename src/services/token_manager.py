@@ -1340,21 +1340,11 @@ class TokenManager:
         while True:
             await asyncio.sleep(60)
             try:
-                if (
-                    str(getattr(config, "captcha_method", "") or "").strip().lower()
-                    in {"browser", "camoufox"}
-                    and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox")
-                    .strip()
-                    .lower()
-                    == "camoufox"
-                ):
-                    continue
                 await self.run_protocol_refresh_once()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
                 debug_logger.log_error(f"[PROTOCOL_REFRESH] 后台任务异常 - {e}")
-
     def start_protocol_refresher(self) -> None:
         if self._protocol_refresher_task and not self._protocol_refresher_task.done():
             return
