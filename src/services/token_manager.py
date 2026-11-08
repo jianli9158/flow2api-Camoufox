@@ -1209,6 +1209,38 @@ class TokenManager:
 
     async def _try_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
         """Refresh full current-Flow Cookies, with an account-bound browser fallback."""
+        try:
+            from .browser_captcha import BrowserCaptchaService as _CamoufoxCaptchaService
+            use_camoufox = (
+                _CamoufoxCaptchaService._instance is not None
+                and str(getattr(config, "captcha_method", "") or "").strip().lower()
+                in {"browser", "camoufox"}
+                and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox")
+                .strip()
+                .lower()
+                == "camoufox"
+            )
+        except Exception:
+            use_camoufox = False
+
+        if use_camoufox:
+            try:
+                service = await _CamoufoxCaptchaService.get_instance(self.db)
+                result = await asyncio.wait_for(
+                    service.refresh_google_cookies(
+                        token.current_project_id, token_id=token_id
+                    ),
+                    timeout=45.0,
+                )
+                return await self._save_refreshed_cookies(token_id, token, result)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+                await self._record_cookie_refresh_failure(token, error)
+                debug_logger.log_warning(
+                    f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}"
+                )
+                return None
+
         refreshed = await self._try_protocol_refresh_st(token_id, token)
         if refreshed:
             return refreshed
@@ -1234,6 +1266,7 @@ class TokenManager:
             await self._record_cookie_refresh_failure(token, error)
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}")
             return None
+
     async def refresh_cookies(self, token_id: int) -> bool:
         """Explicitly renew current-Flow Cookies even when the AT marker is valid."""
         refresh_lock = await self._get_token_lock(

@@ -2987,7 +2987,7 @@ class CamoufoxWorker:
                         "fSid": str(res.get("fSid") or ""),
                         "at": str(res.get("at") or ""),
                     }
-                await self._sync_live_cookies_to_db(token_id)
+                await self._sync_live_cookies_to_db(token_id, update_db=False)
                 return {
                     "status": int(res.get("status") or 0),
                     "text": str(res.get("text") or ""),
@@ -3682,7 +3682,6 @@ class CamoufoxWorker:
                     token_proxy_url=token_proxy_url, token_id=token_id
                 )
                 async with self._boost_frames():
-                    await self._set_tab_render_layers(True)
                     await bidi.command(
                         "browsingContext.navigate",
                         {
@@ -3692,25 +3691,32 @@ class CamoufoxWorker:
                         },
                         timeout=35.0,
                     )
-                    current_url = str(
-                        await bidi.evaluate(
-                            context_id, "location.href", await_promise=False
-                        )
-                        or ""
+                    page_meta = await bidi.evaluate(
+                        context_id,
+                        r"""(() => {
+                            const wiz = window.WIZ_global_data || {};
+                            return {
+                                url: String(location.href || ''),
+                                email: String(wiz.oPEP7c || ''),
+                                bl: String(wiz.cfb2h || ''),
+                                fSid: String(wiz.FdrFJe || ''),
+                                at: String(wiz.SNlM0e || '')
+                            };
+                        })()""",
+                        await_promise=False,
                     )
+                    current_url = str((page_meta or {}).get("url") or "")
                     if urlparse(current_url).hostname != "flow.google.com":
                         raise RuntimeError(
                             "Flow 登录已失效，请重新同步 Google Cookies"
                         )
-                    email = str(
-                        await bidi.evaluate(
-                            context_id,
-                            "(window.WIZ_global_data || {}).oPEP7c || ''",
-                            await_promise=False,
-                        )
-                        or ""
-                    )
-                await self._set_tab_render_layers(False)
+                    email = str((page_meta or {}).get("email") or "")
+                    if (page_meta or {}).get("bl") and (page_meta or {}).get("fSid"):
+                        self._cached_wiz = {
+                            "bl": str(page_meta.get("bl") or ""),
+                            "fSid": str(page_meta.get("fSid") or ""),
+                            "at": str(page_meta.get("at") or ""),
+                        }
                 serialized = await self._sync_live_cookies_to_db(
                     token_id, update_db=False
                 )
