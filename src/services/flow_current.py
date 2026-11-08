@@ -124,8 +124,11 @@ class CurrentFlowClientMixin:
         browser_ref_fn = getattr(self, "_current_browser_ref", None)
         browser_ref = browser_ref_fn(token_id) if callable(browser_ref_fn) else None
         runtime_cfg = self._get_runtime_config()
+        from .browser_captcha import BrowserCaptchaService
+
         use_camoufox_rpc = bool(browser_ref) or (
             token_id is not None
+            and BrowserCaptchaService._instance is not None
             and str(getattr(runtime_cfg, "captcha_method", "") or "").strip().lower()
             in {"browser", "camoufox"}
             and bool(getattr(runtime_cfg, "browser_in_page_rpc", True))
@@ -685,9 +688,13 @@ class CurrentFlowClientMixin:
                     .strip()
                     .lower()
                 )
-                if captcha_method in {"browser", "camoufox"} and mode in {"text", "t2v"}:
-                    from .browser_captcha import BrowserCaptchaService
+                from .browser_captcha import BrowserCaptchaService
 
+                if (
+                    captcha_method in {"browser", "camoufox"}
+                    and mode in {"text", "t2v"}
+                    and (token_id is not None or BrowserCaptchaService._instance is not None)
+                ):
                     service = await BrowserCaptchaService.get_instance(self.db)
                     native_video_fn = getattr(service, "generate_native_video", None)
                     if callable(native_video_fn):

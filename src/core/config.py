@@ -8,47 +8,12 @@ except ImportError:
 from pathlib import Path
 from typing import Dict, Any, Optional
 
-DEFAULT_YESCAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
-YESCAPTCHA_TASK_TYPE_OPTIONS = {
-    "RecaptchaV3TaskProxyless": None,
-    "RecaptchaV3TaskProxylessM1": None,
-    "RecaptchaV3TaskProxylessM1S7": 0.7,
-    "RecaptchaV3TaskProxylessM1S9": 0.9,
-}
-
-# Flow2API 团队打码：内置服务，地址与密钥写死在代码里，不随配置/数据库改变。
-FLOW2API_TEAM_CAPTCHA_METHOD = "flow2api_team"
-FLOW2API_TEAM_CAPTCHA_BASE_URL = "https://captcha.haqimi.uk"
-FLOW2API_TEAM_CAPTCHA_CLIENT_KEY = "sk-flow-mint-2f9a7c1e4b8d6350"
-FLOW2API_TEAM_CAPTCHA_TASK_TYPE = "RecaptchaV3TaskProxylessM1S9"
-
-
 def normalize_captcha_method(method: Optional[str]) -> str:
-    """把打码方式收敛到内置支持的取值（未知值原样转小写返回）。"""
+    """把浏览器运行方式收敛到内置支持的取值。"""
     normalized = (method or "").strip().lower()
-    if normalized in {FLOW2API_TEAM_CAPTCHA_METHOD, "flow2api-team", "flow2apiteam"}:
-        return FLOW2API_TEAM_CAPTCHA_METHOD
-    return normalized or "yescaptcha"
-
-
-def is_yes_style_captcha_method(method: Optional[str]) -> bool:
-    """Flow2API 团队打码与 YesCaptcha 共用 createTask/getTaskResult 协议。"""
-    return normalize_captcha_method(method) in {
-        "yescaptcha",
-        FLOW2API_TEAM_CAPTCHA_METHOD,
-    }
-
-
-def normalize_yescaptcha_task_type(task_type: Optional[str]) -> str:
-    normalized = (task_type or "").strip()
-    if normalized in YESCAPTCHA_TASK_TYPE_OPTIONS:
+    if normalized in {"browser", "camoufox"}:
         return normalized
-    return DEFAULT_YESCAPTCHA_TASK_TYPE
-
-
-def get_yescaptcha_min_score(task_type: Optional[str]) -> Optional[float]:
-    return YESCAPTCHA_TASK_TYPE_OPTIONS.get(normalize_yescaptcha_task_type(task_type))
-
+    return "camoufox"
 
 class Config:
     """Application configuration"""
@@ -417,13 +382,13 @@ class Config:
     @property
     def captcha_method(self) -> str:
         """Get captcha method"""
-        return self._config.get("captcha", {}).get("captcha_method", "yescaptcha")
+        return self._config.get("captcha", {}).get("captcha_method", "camoufox")
 
     def set_captcha_method(self, method: str):
         """Set captcha method"""
         if "captcha" not in self._config:
             self._config["captcha"] = {}
-        self._config["captcha"]["captcha_method"] = method
+        self._config["captcha"]["captcha_method"] = normalize_captcha_method(method)
 
     @property
     def browser_engine(self) -> str:
@@ -540,32 +505,6 @@ class Config:
             return 6
 
     @property
-    def personal_solve_strategy(self) -> str:
-        """personal 打码策略：direct 用 trusted JS，harvest 原生截获，auto 自动降级。"""
-        value = str(
-            self._config.get("captcha", {}).get("personal_solve_strategy", "auto")
-        ).strip().lower()
-        return value if value in {"direct", "harvest", "auto"} else "auto"
-
-    def set_personal_solve_strategy(self, value: str):
-        """设置 personal 打码策略。"""
-        normalized = str(value or "").strip().lower()
-        if normalized not in {"direct", "harvest", "auto"}:
-            normalized = "auto"
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["personal_solve_strategy"] = normalized
-
-    @property
-    def personal_max_resident_tabs(self) -> int:
-        """内置浏览器打码单实例共享标签页上限"""
-        value = self._config.get("captcha", {}).get("personal_max_resident_tabs", 5)
-        try:
-            return max(1, min(50, int(value)))  # 限制在1-50之间
-        except Exception:
-            return 5
-
-    @property
     def personal_project_pool_size(self) -> int:
         """单个 Token 默认维护的项目池数量，仅影响项目轮换。"""
         value = self._config.get("captcha", {}).get("personal_project_pool_size", 4)
@@ -574,33 +513,6 @@ class Config:
         except Exception:
             return 4
 
-    @property
-    def personal_idle_tab_ttl_seconds(self) -> int:
-        """内置浏览器打码标签页空闲超时(秒)"""
-        value = self._config.get("captcha", {}).get(
-            "personal_idle_tab_ttl_seconds", 600
-        )
-        try:
-            return max(60, int(value))
-        except Exception:
-            return 600
-
-    @property
-    def personal_headless(self) -> bool:
-        """personal 内置浏览器是否强制无头；默认按有头模式运行。"""
-        env_value = os.getenv("PERSONAL_BROWSER_HEADLESS")
-        if env_value is not None:
-            return str(env_value).strip().lower() in {"1", "true", "yes", "on"}
-        return bool(self._config.get("captcha", {}).get("personal_headless", False))
-
-    def set_personal_max_resident_tabs(self, value: int):
-        """设置内置浏览器打码单实例共享标签页上限"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["personal_max_resident_tabs"] = max(
-            1, min(50, int(value))
-        )
-
     def set_personal_project_pool_size(self, value: int):
         """设置单个 Token 默认维护的项目池数量，仅影响项目轮换"""
         if "captcha" not in self._config:
@@ -608,12 +520,6 @@ class Config:
         self._config["captcha"]["personal_project_pool_size"] = max(
             1, min(50, int(value))
         )
-
-    def set_personal_idle_tab_ttl_seconds(self, value: int):
-        """设置内置浏览器打码标签页空闲超时(秒)"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["personal_idle_tab_ttl_seconds"] = max(60, int(value))
 
     @property
     def browser_personal_fresh_restart_every_n_solves(self) -> int:
@@ -633,198 +539,6 @@ class Config:
         self._config["captcha"]["browser_personal_fresh_restart_every_n_solves"] = max(
             0, int(value)
         )
-
-    @property
-    def yescaptcha_api_key(self) -> str:
-        """Get YesCaptcha API key"""
-        return self._config.get("captcha", {}).get("yescaptcha_api_key", "")
-
-    def set_yescaptcha_api_key(self, api_key: str):
-        """Set YesCaptcha API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_api_key"] = api_key
-
-    @property
-    def yescaptcha_base_url(self) -> str:
-        """Get YesCaptcha base URL"""
-        return self._config.get("captcha", {}).get(
-            "yescaptcha_base_url", "https://api.yescaptcha.com"
-        )
-
-    def set_yescaptcha_base_url(self, base_url: str):
-        """Set YesCaptcha base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_base_url"] = base_url
-
-    @property
-    def yescaptcha_task_type(self) -> str:
-        """Get YesCaptcha reCAPTCHA V3 task type"""
-        return normalize_yescaptcha_task_type(
-            self._config.get("captcha", {}).get(
-                "yescaptcha_task_type",
-                DEFAULT_YESCAPTCHA_TASK_TYPE,
-            )
-        )
-
-    def set_yescaptcha_task_type(self, task_type: str):
-        """Set YesCaptcha reCAPTCHA V3 task type"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["yescaptcha_task_type"] = (
-            normalize_yescaptcha_task_type(task_type)
-        )
-
-    @property
-    def capmonster_api_key(self) -> str:
-        """Get CapMonster API key"""
-        return self._config.get("captcha", {}).get("capmonster_api_key", "")
-
-    def set_capmonster_api_key(self, api_key: str):
-        """Set CapMonster API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capmonster_api_key"] = api_key
-
-    @property
-    def capmonster_base_url(self) -> str:
-        """Get CapMonster base URL"""
-        return self._config.get("captcha", {}).get(
-            "capmonster_base_url", "https://api.capmonster.cloud"
-        )
-
-    def set_capmonster_base_url(self, base_url: str):
-        """Set CapMonster base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capmonster_base_url"] = base_url
-
-    @property
-    def ezcaptcha_api_key(self) -> str:
-        """Get EzCaptcha API key"""
-        return self._config.get("captcha", {}).get("ezcaptcha_api_key", "")
-
-    def set_ezcaptcha_api_key(self, api_key: str):
-        """Set EzCaptcha API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["ezcaptcha_api_key"] = api_key
-
-    @property
-    def ezcaptcha_base_url(self) -> str:
-        """Get EzCaptcha base URL"""
-        return self._config.get("captcha", {}).get(
-            "ezcaptcha_base_url", "https://api.ez-captcha.com"
-        )
-
-    def set_ezcaptcha_base_url(self, base_url: str):
-        """Set EzCaptcha base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["ezcaptcha_base_url"] = base_url
-
-    @property
-    def capsolver_api_key(self) -> str:
-        """Get CapSolver API key"""
-        return self._config.get("captcha", {}).get("capsolver_api_key", "")
-
-    def set_capsolver_api_key(self, api_key: str):
-        """Set CapSolver API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capsolver_api_key"] = api_key
-
-    @property
-    def capsolver_base_url(self) -> str:
-        """Get CapSolver base URL"""
-        return self._config.get("captcha", {}).get(
-            "capsolver_base_url", "https://api.capsolver.com"
-        )
-
-    def set_capsolver_base_url(self, base_url: str):
-        """Set CapSolver base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["capsolver_base_url"] = base_url
-
-    @property
-    def captcharun_api_key(self) -> str:
-        return self._config.get("captcha", {}).get("captcharun_api_key", "")
-
-    def set_captcharun_api_key(self, api_key: str):
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["captcharun_api_key"] = api_key
-
-    @property
-    def captcharun_base_url(self) -> str:
-        return self._config.get("captcha", {}).get(
-            "captcharun_base_url", "https://api.captcha-run.com"
-        )
-
-    def set_captcharun_base_url(self, base_url: str):
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["captcharun_base_url"] = base_url
-
-    @property
-    def twocaptcha_api_key(self) -> str:
-        return self._config.get("captcha", {}).get("twocaptcha_api_key", "")
-
-    def set_twocaptcha_api_key(self, api_key: str):
-        self._config.setdefault("captcha", {})["twocaptcha_api_key"] = api_key
-
-    @property
-    def twocaptcha_base_url(self) -> str:
-        return (
-            self._config.get("captcha", {}).get("twocaptcha_base_url")
-            or "https://api.2captcha.com"
-        )
-
-    def set_twocaptcha_base_url(self, base_url: str):
-        self._config.setdefault("captcha", {})["twocaptcha_base_url"] = base_url
-
-    @property
-    def remote_browser_base_url(self) -> str:
-        """Get remote browser captcha service base URL"""
-        return self._config.get("captcha", {}).get("remote_browser_base_url", "")
-
-    def set_remote_browser_base_url(self, base_url: str):
-        """Set remote browser captcha service base URL"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["remote_browser_base_url"] = (base_url or "").strip()
-
-    @property
-    def remote_browser_api_key(self) -> str:
-        """Get remote browser captcha service API key"""
-        return self._config.get("captcha", {}).get("remote_browser_api_key", "")
-
-    def set_remote_browser_api_key(self, api_key: str):
-        """Set remote browser captcha service API key"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["remote_browser_api_key"] = (api_key or "").strip()
-
-    @property
-    def remote_browser_timeout(self) -> int:
-        """Get remote browser captcha request timeout (seconds)"""
-        timeout = self._config.get("captcha", {}).get("remote_browser_timeout", 60)
-        try:
-            return max(5, int(timeout))
-        except Exception:
-            return 60
-
-    def set_remote_browser_timeout(self, timeout: int):
-        """Set remote browser captcha request timeout (seconds)"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        try:
-            normalized = max(5, int(timeout))
-        except Exception:
-            normalized = 60
-        self._config["captcha"]["remote_browser_timeout"] = normalized
 
 
 # Global config instance

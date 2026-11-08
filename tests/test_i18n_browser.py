@@ -117,7 +117,7 @@ def browser_page(ui_server):
                     "response_body": '{"message":"保存"}',
                 }
             elif path == "/api/captcha/config":
-                data = {"captcha_method": "yescaptcha"}
+                data = {"captcha_method": "camoufox"}
             elif path == "/api/token-refresh/config":
                 data = {"enabled": True, "refresh_interval_minutes": 120}
             route.fulfill(

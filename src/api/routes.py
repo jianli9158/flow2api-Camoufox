@@ -30,7 +30,6 @@ from ..core.models import (
     GeminiGenerateContentRequest,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
-from ..services.browser_captcha_extension import ExtensionCaptchaService
 
 router = APIRouter()
 
@@ -1005,32 +1004,3 @@ async def stream_generate_content(
         )
 
 
-@router.websocket("/captcha_ws")
-async def captcha_websocket_endpoint(websocket: WebSocket):
-    from ..core.logger import debug_logger
-
-    api_key = (
-        websocket.query_params.get("key")
-        or websocket.query_params.get("api_key")
-        or websocket.headers.get("x-goog-api-key")
-        or ""
-    ).strip()
-    authorization = (websocket.headers.get("authorization") or "").strip()
-    if authorization.lower().startswith("bearer "):
-        api_key = authorization[7:].strip()
-
-    if not api_key or not AuthManager.verify_api_key(api_key):
-        await websocket.close(code=1008)
-        return
-
-    service = await ExtensionCaptchaService.get_instance()
-    await service.connect(websocket)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            await service.handle_message(websocket, data)
-    except WebSocketDisconnect:
-        service.disconnect(websocket)
-    except Exception as e:
-        debug_logger.log_error(f"WebSocket error: {e}")
-        service.disconnect(websocket)

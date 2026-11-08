@@ -7,39 +7,72 @@
     <script src="/static/i18n.js"></script>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        @keyframes slide-up{from{transform:translateY(100%);opacity:0}to{transform:translateY(0);opacity:1}}
-        .animate-slide-up{animation:slide-up .3s ease-out}
+        :root {
+            --bg-canvas: #F8FAFC;
+            --bg-surface: #FFFFFF;
+            --border-subtle: #E2E8F0;
+            --ink-primary: #0F172A;
+            --ink-secondary: #475569;
+            --ink-muted: #64748B;
+            --accent: #2563EB;
+        }
+        body {
+            background-color: var(--bg-canvas);
+            color: var(--ink-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+            background-image: radial-gradient(#E2E8F0 1px, transparent 1px);
+            background-size: 24px 24px;
+        }
+        @keyframes slide-up {
+            from { transform: translateY(100%); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .animate-slide-up { animation: slide-up .25s cubic-bezier(0.16, 1, 0.3, 1); }
+        .login-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border-subtle);
+            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04), 0 8px 24px -4px rgba(15, 23, 42, 0.05);
+        }
     </style>
     <script>
-        tailwind.config={theme:{extend:{colors:{border:"hsl(0 0% 89%)",input:"hsl(0 0% 89%)",ring:"hsl(0 0% 3.9%)",background:"hsl(0 0% 100%)",foreground:"hsl(0 0% 3.9%)",primary:{DEFAULT:"hsl(0 0% 9%)",foreground:"hsl(0 0% 98%)"},secondary:{DEFAULT:"hsl(0 0% 96.1%)",foreground:"hsl(0 0% 9%)"},muted:{DEFAULT:"hsl(0 0% 96.1%)",foreground:"hsl(0 0% 45.1%)"},destructive:{DEFAULT:"hsl(0 84.2% 60.2%)",foreground:"hsl(0 0% 98%)"}}}}}
+        tailwind.config={theme:{extend:{colors:{border:"hsl(214 32% 91%)",input:"hsl(214 32% 91%)",ring:"hsl(222 47% 11%)",background:"hsl(0 0% 100%)",foreground:"hsl(222 47% 11%)",primary:{DEFAULT:"hsl(222 47% 11%)",foreground:"hsl(210 40% 98%)"},secondary:{DEFAULT:"hsl(210 40% 96.1%)",foreground:"hsl(222 47% 11%)"},muted:{DEFAULT:"hsl(210 40% 96.1%)",foreground:"hsl(215 16% 47%)"},destructive:{DEFAULT:"hsl(0 84.2% 60.2%)",foreground:"hsl(210 40% 98%)"}}}}}
     </script>
 </head>
-<body class="h-full bg-background text-foreground antialiased">
-    <div class="fixed top-4 right-4"><select data-language-select aria-label="Language" class="h-8 rounded-md border border-input bg-background px-2 text-xs"><option value="zh-CN">中文</option><option value="en">English</option></select></div>
-    <div class="flex min-h-full flex-col justify-center py-12 px-4 sm:px-6 lg:px-8">
-        <div class="sm:mx-auto sm:w-full sm:max-w-md">
-            <div class="text-center">
-                <h1 class="text-4xl font-bold">Flow2API</h1>
-                <p class="mt-2 text-sm text-muted-foreground"><span data-i18n="管理员控制台">管理员控制台</span></p>
-            </div>
-        </div>
+<body class="h-full antialiased selection:bg-slate-900 selection:text-white">
+    <div class="fixed top-5 right-6 z-20">
+        <select data-language-select aria-label="Language" class="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-900/10">
+            <option value="zh-CN">中文</option>
+            <option value="en">English</option>
+        </select>
+    </div>
 
-        <div class="sm:mx-auto sm:w-full sm:max-w-md">
-            <div class="bg-background py-8 px-4 sm:px-10 rounded-lg">
-                <form id="loginForm" method="post" action="/api/login" class="space-y-6">
-                    <div class="space-y-2">
-                        <label for="username" class="text-sm font-medium"><span data-i18n="账户">账户</span></label>
-                        <input type="text" id="username" name="username" required class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50" placeholder="请输入账户" data-i18n-placeholder="请输入账户">
+    <div class="flex min-h-full flex-col justify-center py-12 px-4 sm:px-6 lg:px-8">
+        <div class="sm:mx-auto sm:w-full sm:max-w-[400px]">
+            <div class="login-card rounded-xl p-8 sm:p-9">
+                <div class="mb-7">
+                    <div class="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-600 mb-4">
+                        <span class="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                        <span>Camoufox + WebDriver BiDi</span>
                     </div>
-                    <div class="space-y-2">
-                        <label for="password" class="text-sm font-medium"><span data-i18n="密码">密码</span></label>
-                        <input type="password" id="password" name="password" required class="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50" placeholder="请输入密码" data-i18n-placeholder="请输入密码">
+                    <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Flow2API</h1>
+                    <p class="mt-1 text-sm text-slate-500"><span data-i18n="管理员控制台">管理员控制台</span></p>
+                </div>
+
+                <form id="loginForm" method="post" action="/api/login" class="space-y-5">
+                    <div class="space-y-1.5">
+                        <label for="username" class="block text-xs font-medium uppercase tracking-wider text-slate-600"><span data-i18n="账户">账户</span></label>
+                        <input type="text" id="username" name="username" required autocomplete="username" class="flex h-10 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors focus:border-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900/10 disabled:opacity-50" placeholder="请输入账户" data-i18n-placeholder="请输入账户">
                     </div>
-                    <button type="submit" id="loginButton" class="inline-flex items-center justify-center rounded-md font-medium transition-colors bg-primary text-primary-foreground hover:bg-primary/90 h-10 w-full disabled:opacity-50"><span data-i18n="登录">登录</span></button>
+                    <div class="space-y-1.5">
+                        <label for="password" class="block text-xs font-medium uppercase tracking-wider text-slate-600"><span data-i18n="密码">密码</span></label>
+                        <input type="password" id="password" name="password" required autocomplete="current-password" class="flex h-10 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors focus:border-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900/10 disabled:opacity-50" placeholder="请输入密码" data-i18n-placeholder="请输入密码">
+                    </div>
+                    <button type="submit" id="loginButton" class="inline-flex items-center justify-center rounded-lg text-sm font-medium transition-all bg-slate-900 text-white hover:bg-slate-800 active:scale-[0.99] h-10 w-full shadow-sm disabled:opacity-50"><span data-i18n="登录">登录</span></button>
                 </form>
 
-                <div class="mt-6 text-center text-xs text-muted-foreground">
-                    <p>Flow2API © 2025</p>
+                <div class="mt-7 pt-5 border-t border-slate-100 flex items-center justify-between text-xs text-slate-400">
+                    <span>Flow2API Gateway</span>
+                    <span class="font-mono">v2.0</span>
                 </div>
             </div>
         </div>
@@ -48,9 +81,8 @@
     <script>
         const form=document.getElementById('loginForm'),btn=document.getElementById('loginButton');
         form.addEventListener('submit',async(e)=>{e.preventDefault();btn.disabled=true;I18n.setMessage(btn, I18n.t("登录中..."));try{const fd=new FormData(form),r=await fetch('/api/login',{method:'POST',credentials:'include',headers:{...I18n.headers(),'Content-Type':'application/json'},body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});const d=await r.json();if(d.success){location.href='/manage'}else showToast(d.message||d.detail||I18n.t("登录失败"),'error')}catch(e){showToast(I18n.t("网络错误,请稍后重试"),'error')}finally{btn.disabled=false;I18n.setMessage(btn, I18n.t("登录"))}});
-        function showToast(m,t='error'){const d=document.createElement('div'),bc={success:'bg-green-600',error:'bg-destructive',info:'bg-primary'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.error} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;I18n.setMessage(d, m);document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)}
+        function showToast(m,t='error'){const d=document.createElement('div'),bc={success:'bg-emerald-600',error:'bg-red-600',info:'bg-slate-900'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.error} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;I18n.setMessage(d, m);document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)}
         (()=>{fetch('/api/stats',{credentials:'include',headers:I18n.headers()}).then(r=>{if(r.ok)location.href='/manage'}).catch(()=>{})})();
-
     </script>
 </body>
 </html>

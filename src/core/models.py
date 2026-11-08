@@ -186,44 +186,21 @@ class DebugConfig(BaseModel):
 
 
 class CaptchaConfig(BaseModel):
-    """Captcha configuration"""
+    """Camoufox browser runtime configuration"""
+
+    model_config = ConfigDict(extra="ignore")
 
     id: int = 1
-    captcha_method: str = (
-        "yescaptcha"  # yescaptcha/flow2api_team/captcharun/twocaptcha/capsolver/ezcaptcha/browser/personal/remote_browser
-    )
-    yescaptcha_api_key: str = ""
-    yescaptcha_base_url: str = "https://api.yescaptcha.com"
-    yescaptcha_task_type: str = "RecaptchaV3TaskProxylessM1S9"
-    capmonster_api_key: str = ""
-    capmonster_base_url: str = "https://api.capmonster.cloud"
-    ezcaptcha_api_key: str = ""
-    ezcaptcha_base_url: str = "https://api.ez-captcha.com"
-    capsolver_api_key: str = ""
-    capsolver_base_url: str = "https://api.capsolver.com"
-    captcharun_api_key: str = ""
-    captcharun_base_url: str = "https://api.captcha-run.com"
-    twocaptcha_api_key: str = ""
-    twocaptcha_base_url: str = "https://api.2captcha.com"
-    remote_browser_base_url: str = ""
-    remote_browser_api_key: str = ""
-    remote_browser_timeout: int = 60
+    captcha_method: str = "camoufox"
     website_key: str = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
     page_action: str = "IMAGE_GENERATION"
-    browser_proxy_enabled: bool = False  # 浏览器打码是否启用代理
-    browser_proxy_url: Optional[str] = None  # 浏览器打码代理URL
-    browser_count: int = 1  # 浏览器打码实例数量
-    personal_project_pool_size: int = (
-        4  # 单个 Token 默认维护的项目池数量（仅影响项目轮换）
-    )
-    personal_max_resident_tabs: int = 5  # 内置浏览器单实例共享打码标签页数量上限
-    browser_personal_fresh_restart_every_n_solves: int = (
-        10  # 成功打码多少次后清理并重启浏览器，0表示禁用
-    )
-    personal_idle_tab_ttl_seconds: int = 600  # 内置浏览器标签页空闲超时(秒)
+    browser_proxy_enabled: bool = False
+    browser_proxy_url: Optional[str] = None
+    browser_count: int = 1
+    personal_project_pool_size: int = 4
+    browser_personal_fresh_restart_every_n_solves: int = 10
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-
 
 class PluginConfig(BaseModel):
     """Plugin connection configuration"""

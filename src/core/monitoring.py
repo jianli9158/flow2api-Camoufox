@@ -87,49 +87,6 @@ def _to_timestamp(value: Any) -> float:
     return float(dt.timestamp())
 
 
-async def _probe_remote_browser_health(
-    base_url: str, timeout_seconds: float = 3.0
-) -> tuple[bool, float]:
-    normalized = (base_url or "").strip().rstrip("/")
-    if not normalized:
-        return False, 0.0
-
-    url = f"{normalized}/api/v1/health"
-    started_at = time.perf_counter()
-
-    def do_request() -> tuple[int, str]:
-        request = urllib.request.Request(
-            url,
-            headers={"Accept": "application/json"},
-            method="GET",
-        )
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(request, timeout=max(0.5, float(timeout_seconds))) as response:
-            status_code = int(getattr(response, "status", 0) or response.getcode() or 0)
-            body = response.read()
-            charset = response.headers.get_content_charset() or "utf-8"
-            return status_code, body.decode(charset, errors="replace")
-
-    try:
-        status_code, body_text = await asyncio.to_thread(do_request)
-        ok = 200 <= status_code < 300
-        if ok and body_text:
-            try:
-                payload = json.loads(body_text)
-            except Exception:
-                payload = None
-            if isinstance(payload, dict) and payload.get("ok") is False:
-                ok = False
-        latency = time.perf_counter() - started_at
-        return ok, latency
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError):
-        latency = time.perf_counter() - started_at
-        return False, latency
-    except Exception:
-        latency = time.perf_counter() - started_at
-        return False, latency
-
-
 MAIN_REGISTRY = CollectorRegistry(auto_describe=True)
 
 MAIN_UP = Gauge(
@@ -254,21 +211,6 @@ DASHBOARD_TODAY_VIDEOS = Gauge(
 DASHBOARD_TODAY_ERRORS = Gauge(
     "flow2api_dashboard_today_errors",
     "Dashboard today error count from persisted token statistics.",
-    registry=MAIN_REGISTRY,
-)
-REMOTE_BROWSER_CONFIGURED = Gauge(
-    "flow2api_remote_browser_configured",
-    "Whether remote_browser mode has a target base URL configured.",
-    registry=MAIN_REGISTRY,
-)
-REMOTE_BROWSER_TARGET_UP = Gauge(
-    "flow2api_remote_browser_target_up",
-    "Whether the configured remote_browser target responded successfully.",
-    registry=MAIN_REGISTRY,
-)
-REMOTE_BROWSER_TARGET_LATENCY_SECONDS = Gauge(
-    "flow2api_remote_browser_target_latency_seconds",
-    "Probe latency of the configured remote_browser target in seconds.",
     registry=MAIN_REGISTRY,
 )
 TOKEN_ACTIVE = Gauge(
@@ -519,22 +461,6 @@ async def update_main_runtime_metrics(
     DASHBOARD_TODAY_VIDEOS.set(float(dashboard_stats.get("today_videos") or 0))
     DASHBOARD_TODAY_ERRORS.set(float(dashboard_stats.get("today_errors") or 0))
 
-    remote_browser_base_url = (config.remote_browser_base_url or "").strip()
-    remote_browser_configured = config.captcha_method == "remote_browser" and bool(
-        remote_browser_base_url
-    )
-    REMOTE_BROWSER_CONFIGURED.set(1.0 if remote_browser_configured else 0.0)
-
-    if remote_browser_configured:
-        remote_browser_up, remote_browser_latency = await _probe_remote_browser_health(
-            remote_browser_base_url
-        )
-        REMOTE_BROWSER_TARGET_UP.set(1.0 if remote_browser_up else 0.0)
-        REMOTE_BROWSER_TARGET_LATENCY_SECONDS.set(float(remote_browser_latency))
-    else:
-        REMOTE_BROWSER_TARGET_UP.set(0.0)
-        REMOTE_BROWSER_TARGET_LATENCY_SECONDS.set(0.0)
-
 
 async def render_main_metrics(
     db: Any, concurrency_manager: Optional[Any] = None
@@ -580,9 +506,5 @@ async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
         "tokens_expired": expired_tokens,
         "tokens_expiring_within_1h": expiring_soon_tokens,
         "banned_429_tokens": banned_429_tokens,
-        "captcha_method": config.captcha_method,
-        "remote_browser_configured": (
-            config.captcha_method == "remote_browser"
-            and bool((config.remote_browser_base_url or "").strip())
-        ),
+        "captcha_method": "camoufox",
     }

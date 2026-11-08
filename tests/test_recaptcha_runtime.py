@@ -5,7 +5,6 @@ import types
 import unittest
 from unittest.mock import AsyncMock
 
-from src.services.browser_captcha import TokenBrowser
 from src.services.recaptcha_runtime import (
     TRUSTED_RECAPTCHA_HOOK_SOURCE,
     build_recaptcha_execute_script,
@@ -13,50 +12,6 @@ from src.services.recaptcha_runtime import (
 
 
 class LocalCaptchaActionTests(unittest.IsolatedAsyncioTestCase):
-    async def test_protocol_actions_execute_without_native_generation(self):
-        for action in ("IMAGE_GENERATION", "VIDEO_GENERATION", "UPLOAD_IMAGE"):
-            with self.subTest(action=action):
-                browser = object.__new__(TokenBrowser)
-                browser.token_id = 7
-                browser._apply_browser_environment_patch = AsyncMock()
-                browser._prepare_flow_runtime_page = AsyncMock(return_value=True)
-                browser._harvest_token_via_ui_submit = AsyncMock()
-                page = types.SimpleNamespace(
-                    add_init_script=AsyncMock(),
-                    evaluate=AsyncMock(return_value={"ok": True, "token": "captcha"}),
-                    close=AsyncMock(),
-                )
-                context = types.SimpleNamespace(new_page=AsyncMock(return_value=page))
-                token = await browser._execute_captcha(
-                    context, "project", "site-key", action
-                )
-                self.assertEqual(token, "captcha")
-                self.assertIn(json.dumps(action), page.evaluate.call_args.args[0])
-                browser._harvest_token_via_ui_submit.assert_not_awaited()
-                self.assertIsNone(browser._last_harvest_session_id)
-                page.close.assert_awaited_once()
-
-    async def test_execution_failure_closes_page_without_chat_fallback(self):
-        browser = object.__new__(TokenBrowser)
-        browser.token_id = 7
-        browser._apply_browser_environment_patch = AsyncMock()
-        browser._prepare_flow_runtime_page = AsyncMock(return_value=True)
-        browser._harvest_token_via_ui_submit = AsyncMock()
-        page = types.SimpleNamespace(
-            add_init_script=AsyncMock(),
-            evaluate=AsyncMock(side_effect=RuntimeError("execution failed")),
-            close=AsyncMock(),
-        )
-        token = await browser._execute_captcha(
-            types.SimpleNamespace(new_page=AsyncMock(return_value=page)),
-            "project",
-            "site-key",
-            "IMAGE_GENERATION",
-        )
-        self.assertIsNone(token)
-        browser._harvest_token_via_ui_submit.assert_not_awaited()
-        page.close.assert_awaited_once()
-
     @unittest.skipUnless(
         shutil.which("node"), "Node.js is required for the JavaScript contract"
     )

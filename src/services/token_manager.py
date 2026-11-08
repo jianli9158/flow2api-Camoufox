@@ -230,51 +230,6 @@ class TokenManager:
             ),
         )
 
-    async def get_personal_warmup_project_ids(
-        self,
-        tokens: Optional[List[Token]] = None,
-        limit: Optional[int] = None,
-    ) -> List[str]:
-        """返回 personal 模式启动时建议预热的项目 ID 列表。"""
-        token_list = tokens if tokens is not None else await self.get_all_tokens()
-        pool_size = self._get_project_pool_size()
-        warmup_ids: List[str] = []
-        seen_projects: set[str] = set()
-
-        try:
-            warmup_limit = None if limit is None else max(1, int(limit))
-        except Exception:
-            warmup_limit = None
-
-        for token in token_list:
-            if not token or not token.is_active:
-                continue
-
-            candidate_ids: List[str] = []
-            current_project_id = str(token.current_project_id or "").strip()
-            if current_project_id:
-                candidate_ids.append(current_project_id)
-
-            projects = [
-                project
-                for project in await self.db.get_projects_by_token(token.id)
-                if project.is_active
-            ]
-            for project in self._sort_projects(projects):
-                project_id = str(project.project_id or "").strip()
-                if project_id and project_id not in candidate_ids:
-                    candidate_ids.append(project_id)
-
-            for project_id in candidate_ids[:pool_size]:
-                if project_id in seen_projects:
-                    continue
-                seen_projects.add(project_id)
-                warmup_ids.append(project_id)
-                if warmup_limit is not None and len(warmup_ids) >= warmup_limit:
-                    return warmup_ids
-
-        return warmup_ids
-
     async def _create_project_for_token(
         self, token: Token, pool_index: int, base_name: Optional[str] = None
     ) -> Project:
@@ -355,18 +310,15 @@ class TokenManager:
         self._refresh_locks.pop(token_id, None)
         self._project_locks.pop(token_id, None)
 
-        if config.captcha_method == "personal" and project_ids:
-            try:
-                from .browser_captcha_personal import BrowserCaptchaService
+        try:
+            from .browser_captcha import BrowserCaptchaService
 
-                service = await BrowserCaptchaService.get_instance(self.db)
-                for project_id in project_ids:
-                    await service.stop_resident_mode(project_id)
-            except Exception as e:
-                debug_logger.log_warning(
-                    f"[DELETE_TOKEN] 清理 personal 浏览器状态失败: {e}"
+            if BrowserCaptchaService._instance is not None:
+                await BrowserCaptchaService._instance.release_token_browsers(
+                    token_id, reason="token_deleted"
                 )
-
+        except Exception:
+            pass
     async def enable_token(self, token_id: int):
         """Enable a token and reset error count"""
         # Enable the token
@@ -1248,13 +1200,11 @@ class TokenManager:
         if not latest or latest.google_cookies != token.google_cookies:
             # A plugin or another request has supplied a newer Cookie jar.
             return None
-        if config.captcha_method not in {"personal", "browser"}:
+        if config.captcha_method not in {"browser", "camoufox"}:
             return None
         try:
-            if config.captcha_method == "personal":
-                from .browser_captcha_personal import BrowserCaptchaService
-            else:
-                from .browser_captcha import BrowserCaptchaService
+            from .browser_captcha import BrowserCaptchaService
+
             service = await BrowserCaptchaService.get_instance(self.db)
             result = await asyncio.wait_for(
                 service.refresh_google_cookies(token.current_project_id, token_id=token_id),

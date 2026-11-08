@@ -260,7 +260,7 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
             ("IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE", 4),
             ("IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR", 5),
         )
-        for mode in ("browser", "personal"):
+        for mode in ("browser", "camoufox"):
             for model in ("BELUGA", "HARBOR_SEAL", "GEM_PIX_2"):
                 for aspect, aspect_enum in aspects:
                     for references in (None, [{"name": "reference"}]):
@@ -271,10 +271,6 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
                             references=bool(references),
                         ):
                             self.setUp()
-                            native = AsyncMock()
-                            self.client._personal_browser_service = (
-                                types.SimpleNamespace(generate_native_image=native)
-                            )
                             with patch.object(
                                 type(config),
                                 "captcha_method",
@@ -290,7 +286,7 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
                                     image_inputs=references,
                                 )
                             self.assertEqual(result["media"], ["media"])
-                            native.assert_not_awaited()
+                            pass
                             self.client._call_flow_stream_chat.assert_not_awaited()
                             self.client._current_rpc.assert_awaited_once()
                             self.assertEqual(
@@ -320,7 +316,7 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
                             )
 
     async def test_image_auxiliary_rpcs_preserve_selected_captcha_provider(self):
-        for mode in ("browser", "personal"):
+        for mode in ("browser", "camoufox"):
             with self.subTest(mode=mode):
                 self.setUp()
                 self.client._get_recaptcha_token.side_effect = None

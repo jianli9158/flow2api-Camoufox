@@ -143,28 +143,6 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
-    async def _check_extension_route(self, token: Token) -> tuple[bool, str]:
-        """Ensure extension captcha requests are routed to the selected account."""
-        if config.captcha_method != "extension":
-            return True, ""
-
-        try:
-            from .browser_captcha_extension import ExtensionCaptchaService
-
-            service = await ExtensionCaptchaService.get_instance(
-                getattr(self.token_manager, "db", None)
-            )
-            has_connection, route_key = await service.has_connection_for_token(token.id)
-            if has_connection:
-                return True, ""
-
-            available = service.describe_routes() or "none"
-            if route_key:
-                return False, f"扩展路由 {route_key} 未连接（可用路由: {available}）"
-            return False, f"扩展路由未配置或匿名插件未连接（可用路由: {available}）"
-        except Exception as exc:
-            return False, f"扩展路由检查失败: {exc}"
-
     async def select_token(
         self,
         for_image_generation: bool = False,

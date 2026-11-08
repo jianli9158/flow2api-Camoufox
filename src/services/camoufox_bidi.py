@@ -2210,7 +2210,6 @@ class CamoufoxWorker:
                     except Exception:
                         pass
                 account_dir = getattr(self, "_account_dir", None)
-                # If persistent firefox-profile already has valid session cookies on disk, verify before overwriting
                 has_native_session_cookies = False
                 if self._is_persistent_profile:
                     try:
@@ -2236,7 +2235,7 @@ class CamoufoxWorker:
                                     ss_cookies_loaded = True
                             except Exception:
                                 pass
-                    if not ss_cookies_loaded:
+                    if not ss_cookies_loaded and browser_cookies:
                         await self._install_cookies_via_bidi(browser_cookies)
             self._shared_bound_token_id = token_key
             self._shared_bound_cookie_signature = cookie_signature
@@ -3681,6 +3680,21 @@ class CamoufoxWorker:
                 _, bidi, context_id = await self._get_or_create_shared_browser(
                     token_proxy_url=token_proxy_url, token_id=token_id
                 )
+                eval_meta_js = r"""(() => {
+                    const wiz = window.WIZ_global_data || {};
+                    let email = String(wiz.oPEP7c || '');
+                    if (!email && document.documentElement) {
+                        const m = document.documentElement.innerHTML.match(/"oPEP7c"\s*:\s*"([^"@]+@[^"\\]+)"/);
+                        if (m) email = m[1];
+                    }
+                    return {
+                        url: String(location.href || ''),
+                        email: email,
+                        bl: String(wiz.cfb2h || ''),
+                        fSid: String(wiz.FdrFJe || ''),
+                        at: String(wiz.SNlM0e || '')
+                    };
+                })()"""
                 async with self._boost_frames():
                     await bidi.command(
                         "browsingContext.navigate",
@@ -3692,25 +3706,38 @@ class CamoufoxWorker:
                         timeout=35.0,
                     )
                     page_meta = await bidi.evaluate(
-                        context_id,
-                        r"""(() => {
-                            const wiz = window.WIZ_global_data || {};
-                            return {
-                                url: String(location.href || ''),
-                                email: String(wiz.oPEP7c || ''),
-                                bl: String(wiz.cfb2h || ''),
-                                fSid: String(wiz.FdrFJe || ''),
-                                at: String(wiz.SNlM0e || '')
-                            };
-                        })()""",
-                        await_promise=False,
+                        context_id, eval_meta_js, await_promise=False
                     )
                     current_url = str((page_meta or {}).get("url") or "")
+                    email = str((page_meta or {}).get("email") or "")
+                    if not email and "accounts.google.com" not in current_url:
+                        passive_url = (
+                            "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
+                            f"&continue={quote(FLOW_PROJECTS_URL, safe='')}"
+                            f"&followup={quote(FLOW_PROJECTS_URL, safe='')}"
+                        )
+                        try:
+                            await bidi.command(
+                                "browsingContext.navigate",
+                                {
+                                    "context": context_id,
+                                    "url": passive_url,
+                                    "wait": "complete",
+                                },
+                                timeout=25.0,
+                            )
+                            await asyncio.sleep(0.8)
+                            page_meta = await bidi.evaluate(
+                                context_id, eval_meta_js, await_promise=False
+                            )
+                            current_url = str((page_meta or {}).get("url") or "")
+                            email = str((page_meta or {}).get("email") or "")
+                        except Exception:
+                            pass
                     if urlparse(current_url).hostname != "flow.google.com":
                         raise RuntimeError(
                             "Flow 登录已失效，请重新同步 Google Cookies"
                         )
-                    email = str((page_meta or {}).get("email") or "")
                     if (page_meta or {}).get("bl") and (page_meta or {}).get("fSid"):
                         self._cached_wiz = {
                             "bl": str(page_meta.get("bl") or ""),

@@ -4,117 +4,237 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title data-i18n="Flow2API 模型测试">Flow2API 模型测试</title>
-    <script src="/static/i18n.js"></script>
+<script src="/static/i18n.js"></script>
 <style>
+:root {
+  --bg-canvas: #F8FAFC;
+  --bg-surface: #FFFFFF;
+  --bg-subtle: #F1F5F9;
+  --bg-terminal: #0F172A;
+  --border: #E2E8F0;
+  --border-strong: #CBD5E1;
+  --ink-primary: #0F172A;
+  --ink-secondary: #475569;
+  --ink-muted: #64748B;
+  --accent: #2563EB;
+  --accent-hover: #1D4ED8;
+  --accent-soft: #EFF6FF;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e1e1e6; min-height: 100vh; }
-.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
-.subtitle { text-align: center; color: #666; margin-bottom: 24px; font-size: 14px; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: var(--bg-canvas);
+  color: var(--ink-primary);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+.top-nav {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.top-nav-inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  height: 56px;
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.brand-group {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.brand-title {
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--ink-primary);
+  text-decoration: none;
+}
+.brand-badge {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 9999px;
+  background: var(--bg-subtle);
+  color: var(--ink-secondary);
+  border: 1px solid var(--border);
+}
+.nav-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.nav-link {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink-secondary);
+  text-decoration: none;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  transition: all 0.15s ease;
+}
+.nav-link:hover {
+  color: var(--ink-primary);
+  border-color: var(--border-strong);
+  background: var(--bg-subtle);
+}
+.lang-select {
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-surface);
+  color: var(--ink-primary);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.container { max-width: 1280px; margin: 0 auto; padding: 24px; }
+.page-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink-primary); }
+.subtitle { color: var(--ink-muted); font-size: 13px; }
 
 .config-bar {
-  display: flex; gap: 12px; margin-bottom: 20px; align-items: center;
-  background: #1a1b26; padding: 12px 16px; border-radius: 10px; border: 1px solid #2a2b3a;
+  display: flex; gap: 12px; margin-bottom: 8px; align-items: center;
+  background: var(--bg-surface); padding: 12px 16px; border-radius: 10px; border: 1px solid var(--border);
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
-.config-bar label { font-size: 13px; color: #888; white-space: nowrap; }
-.config-bar input { flex: 1; background: #0f1117; border: 1px solid #2a2b3a; color: #e1e1e6; padding: 8px 12px; border-radius: 6px; font-size: 14px; }
-.config-note { margin-bottom: 20px; font-size: 12px; color: #7f8498; }
+.config-bar label { font-size: 12px; font-weight: 600; color: var(--ink-secondary); white-space: nowrap; text-transform: uppercase; letter-spacing: 0.03em; }
+.config-bar input {
+  flex: 1; background: var(--bg-canvas); border: 1px solid var(--border); color: var(--ink-primary);
+  padding: 8px 12px; border-radius: 6px; font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  transition: border-color 0.15s ease;
+}
+.config-bar input:focus { outline: none; border-color: var(--ink-primary); background: var(--bg-surface); }
+.config-note { margin-bottom: 20px; font-size: 12px; color: var(--ink-muted); }
 
-.main-layout { display: flex; gap: 20px; }
-.sidebar { width: 280px; flex-shrink: 0; }
+.main-layout { display: flex; gap: 20px; align-items: flex-start; }
+.sidebar { width: 300px; flex-shrink: 0; }
 .content { flex: 1; min-width: 0; }
 
-.model-section { margin-bottom: 16px; }
+.model-section { margin-bottom: 10px; background: var(--bg-surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.02); }
 .section-title {
-  font-size: 13px; font-weight: 600; color: #7c8aff; padding: 8px 12px;
-  background: #1a1b26; border-radius: 8px 8px 0 0; border: 1px solid #2a2b3a; border-bottom: none;
+  font-size: 12px; font-weight: 600; color: var(--ink-primary); padding: 10px 14px;
+  background: var(--bg-surface);
   cursor: pointer; user-select: none; display: flex; justify-content: space-between; align-items: center;
+  transition: background 0.15s ease;
 }
-.section-title:hover { background: #1e1f2e; }
-.section-title .arrow { transition: transform 0.2s; }
+.section-title:hover { background: var(--bg-canvas); }
+.section-title .arrow { font-size: 10px; color: var(--ink-muted); transition: transform 0.2s; }
 .section-title.collapsed .arrow { transform: rotate(-90deg); }
 .model-list {
-  background: #1a1b26; border: 1px solid #2a2b3a; border-radius: 0 0 8px 8px;
-  max-height: 300px; overflow-y: auto;
+  border-top: 1px solid var(--border);
+  max-height: 280px; overflow-y: auto;
 }
 .model-list.hidden { display: none; }
 .model-item {
-  padding: 8px 12px; font-size: 13px; cursor: pointer; border-bottom: 1px solid #1e1f2e;
-  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 14px; font-size: 12.5px; cursor: pointer; border-bottom: 1px solid #F1F5F9;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  color: var(--ink-secondary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  transition: all 0.12s ease;
 }
 .model-item:last-child { border-bottom: none; }
-.model-item:hover { background: #1e1f2e; }
-.model-item.active { background: #2a2b5a; color: #7c8aff; }
+.model-item:hover { background: var(--bg-canvas); color: var(--ink-primary); }
+.model-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
 .model-tag {
-  font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500;
+  font-family: -apple-system, BlinkMacSystemFont, "Inter", sans-serif;
+  font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 600; flex-shrink: 0;
 }
-.tag-image { background: #1a3a2a; color: #4ade80; }
-.tag-video { background: #3a2a1a; color: #fb923c; }
+.tag-image { background: #ECFDF5; color: #047857; border: 1px solid #A7F3D0; }
+.tag-video { background: #EFF6FF; color: #1D4ED8; border: 1px solid #BFDBFE; }
 
 .gen-panel {
-  background: #1a1b26; border: 1px solid #2a2b3a; border-radius: 10px; padding: 20px;
+  background: var(--bg-surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
-.gen-panel h3 { font-size: 16px; margin-bottom: 4px; }
-.gen-panel .model-info { font-size: 12px; color: #666; margin-bottom: 16px; }
+.gen-panel h3 {
+  font-size: 15px; font-weight: 600; margin-bottom: 4px; color: var(--ink-primary);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+.gen-panel .model-info { font-size: 12px; color: var(--ink-muted); margin-bottom: 18px; }
 
-.form-group { margin-bottom: 14px; }
-.form-group label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; }
+.form-group { margin-bottom: 16px; }
+.form-group label { display: block; font-size: 12px; font-weight: 600; color: var(--ink-secondary); margin-bottom: 6px; }
 .form-group textarea, .form-group input[type="text"] {
-  width: 100%; background: #0f1117; border: 1px solid #2a2b3a; color: #e1e1e6;
-  padding: 10px 12px; border-radius: 8px; font-size: 14px;
-  font-family: inherit;
+  width: 100%; background: var(--bg-canvas); border: 1px solid var(--border); color: var(--ink-primary);
+  padding: 10px 12px; border-radius: 8px; font-size: 13.5px; line-height: 1.5;
+  font-family: inherit; transition: border-color 0.15s ease, background 0.15s ease;
 }
-.form-group textarea { resize: vertical; min-height: 80px; }
-.form-group textarea:focus, .form-group input[type="text"]:focus { outline: none; border-color: #7c8aff; }
+.form-group textarea { resize: vertical; min-height: 88px; }
+.form-group textarea:focus, .form-group input[type="text"]:focus {
+  outline: none; border-color: var(--ink-primary); background: var(--bg-surface);
+}
 
 .image-upload-area {
-  border: 2px dashed #2a2b3a; border-radius: 8px; padding: 20px; text-align: center;
-  cursor: pointer; transition: border-color 0.2s; position: relative;
+  border: 1.5px dashed var(--border-strong); border-radius: 8px; padding: 20px; text-align: center;
+  background: var(--bg-canvas);
+  cursor: pointer; transition: border-color 0.2s, background 0.2s; position: relative;
 }
-.image-upload-area:hover { border-color: #7c8aff; }
+.image-upload-area:hover { border-color: var(--accent); background: var(--accent-soft); }
 .image-upload-area.has-images { padding: 10px; }
-.image-upload-hint { color: #555; font-size: 13px; }
+.image-upload-hint { color: var(--ink-muted); font-size: 13px; }
 .image-preview-list { display: flex; gap: 8px; flex-wrap: wrap; }
 .image-preview-item {
-  position: relative; width: 80px; height: 80px; border-radius: 6px; overflow: hidden;
+  position: relative; width: 80px; height: 80px; border-radius: 6px; overflow: hidden; border: 1px solid var(--border);
 }
 .image-preview-item img { width: 100%; height: 100%; object-fit: cover; }
 .image-preview-item .remove-btn {
-  position: absolute; top: 2px; right: 2px; width: 20px; height: 20px;
-  background: rgba(0,0,0,0.7); color: #fff; border: none; border-radius: 50%;
+  position: absolute; top: 3px; right: 3px; width: 20px; height: 20px;
+  background: rgba(15, 23, 42, 0.78); color: #fff; border: none; border-radius: 50%;
   cursor: pointer; font-size: 12px; display: flex; align-items: center; justify-content: center;
 }
 
 .btn-generate {
-  width: 100%; padding: 12px; background: #7c8aff; color: #fff; border: none;
-  border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer;
-  transition: background 0.2s;
+  width: 100%; padding: 11px 16px; background: var(--ink-primary); color: #fff; border: none;
+  border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: background 0.15s ease, transform 0.1s ease;
 }
-.btn-generate:hover { background: #6b79ee; }
-.btn-generate:disabled { background: #3a3b5a; cursor: not-allowed; }
+.btn-generate:hover { background: #1E293B; }
+.btn-generate:disabled { background: #CBD5E1; color: #64748B; cursor: not-allowed; }
 
 .output-panel {
-  background: #1a1b26; border: 1px solid #2a2b3a; border-radius: 10px; padding: 20px; margin-top: 16px;
+  background: var(--bg-surface); border: 1px solid var(--border); border-radius: 10px; padding: 22px; margin-top: 16px;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.03);
 }
-.output-panel h3 { font-size: 15px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+.output-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; color: var(--ink-primary); }
 .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-.status-idle { background: #555; }
-.status-running { background: #facc15; animation: pulse 1s infinite; }
-.status-done { background: #4ade80; }
-.status-error { background: #f87171; }
+.status-idle { background: #94A3B8; }
+.status-running { background: #F59E0B; animation: pulse 1s infinite; }
+.status-done { background: #10B981; }
+.status-error { background: #EF4444; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
 
 .output-log {
-  background: #0f1117; border-radius: 8px; padding: 12px; font-size: 13px;
-  line-height: 1.6; max-height: 200px; overflow-y: auto; white-space: pre-wrap;
-  word-break: break-all; color: #aaa;
+  background: var(--bg-terminal); border-radius: 8px; padding: 14px; font-size: 12.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  line-height: 1.65; max-height: 220px; overflow-y: auto; white-space: pre-wrap;
+  word-break: break-all; color: #E2E8F0;
+  font-variant-numeric: tabular-nums;
 }
-.output-result { margin-top: 12px; }
-.output-result img { max-width: 100%; border-radius: 8px; margin-top: 8px; }
-.output-result video { max-width: 100%; border-radius: 8px; margin-top: 8px; }
+.output-result { margin-top: 14px; }
+.output-result img { max-width: 100%; border-radius: 8px; margin-top: 8px; border: 1px solid var(--border); }
+.output-result video { max-width: 100%; border-radius: 8px; margin-top: 8px; border: 1px solid var(--border); }
 
-.model-list::-webkit-scrollbar, .output-log::-webkit-scrollbar { width: 4px; }
-.model-list::-webkit-scrollbar-thumb, .output-log::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+.model-list::-webkit-scrollbar, .output-log::-webkit-scrollbar { width: 5px; }
+.model-list::-webkit-scrollbar-thumb { background: #CBD5E1; border-radius: 3px; }
+.output-log::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
 
 @media (max-width: 768px) {
   .main-layout { flex-direction: column; }
@@ -124,10 +244,27 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
 </style>
 </head>
 <body>
+<header class="top-nav">
+  <div class="top-nav-inner">
+    <div class="brand-group">
+      <a href="/manage" class="brand-title">Flow2API</a>
+      <span class="brand-badge">Playground</span>
+    </div>
+    <div class="nav-actions">
+      <a href="/manage" class="nav-link"><span data-i18n="管理控制台 - Flow2API">返回控制台</span></a>
+      <select data-language-select aria-label="Language" class="lang-select">
+        <option value="zh-CN">中文</option>
+        <option value="en">English</option>
+      </select>
+    </div>
+  </div>
+</header>
+
 <div class="container">
-  <div style="display:flex;justify-content:flex-end;margin-bottom:12px;"><select data-language-select aria-label="Language" style="padding:6px 10px;border-radius:6px;border:1px solid #2a2b3a;background:#1a1b26;color:#e1e1e6;"><option value="zh-CN">中文</option><option value="en">English</option></select></div>
-  <h1><span data-i18n="🧪 Flow2API 模型测试">🧪 Flow2API 模型测试</span></h1>
-  <p class="subtitle"><span data-i18n="选择模型，输入提示词，测试生成效果">选择模型，输入提示词，测试生成效果</span></p>
+  <div class="page-header">
+    <h1><span data-i18n="🧪 Flow2API 模型测试">Flow2API 模型测试</span></h1>
+    <p class="subtitle"><span data-i18n="选择模型，输入提示词，测试生成效果">选择模型，输入提示词，测试生成效果</span></p>
+  </div>
 
   <div class="config-bar">
     <label>API Key:</label>
@@ -155,7 +292,7 @@ h1 { text-align: center; margin-bottom: 8px; font-size: 24px; color: #7c8aff; }
         </div>
 
         <div class="form-group" id="imageUploadGroup" style="display:none;">
-          <label><span data-i18n="上传图片">上传图片</span> <span id="imageLimit" style="color:#666;font-size:12px;"></span></label>
+          <label><span data-i18n="上传图片">上传图片</span> <span id="imageLimit" style="color:#64748B;font-size:12px;font-weight:400;"></span></label>
           <div class="image-upload-area" id="imageUploadArea">
             <div class="image-upload-hint" id="imageHint"><span data-i18n="点击或拖拽上传图片">点击或拖拽上传图片</span></div>
             <div class="image-preview-list" id="imagePreviewList"></div>
@@ -355,9 +492,7 @@ function getModelType(modelId) {
 }
 
 function getModelMeta(modelId) {
-  // Determine supports_images, min/max from the model family
   const family = getModelFamily(modelId);
-
   if (family === "image") return { type: "image", supportsImages: true, minImages: 0, maxImages: 5 };
   if (family === "i2v") return { type: "video", supportsImages: true, minImages: 1, maxImages: 2 };
   if (family === "r2v" || family === "omni") {
@@ -375,7 +510,7 @@ function renderSidebar() {
 
   const modelIds = Object.keys(ALL_MODELS).sort();
   if (modelIds.length === 0) {
-    sidebar.innerHTML = "<div class=\"model-section\"><div class=\"model-list\" style=\"border-radius:8px;\"><div class=\"model-item\" style=\"cursor:default;color:#888;\"><span data-i18n=\"未获取到可用模型，请检查 API Key 或稍后重试\">未获取到可用模型，请检查 API Key 或稍后重试</span></div></div></div>";
+    sidebar.innerHTML = "<div class=\"model-section\"><div class=\"model-list\" style=\"border-radius:8px;\"><div class=\"model-item\" style=\"cursor:default;color:#64748B;\"><span data-i18n=\"未获取到可用模型，请检查 API Key 或稍后重试\">未获取到可用模型，请检查 API Key 或稍后重试</span></div></div></div>";
     return;
   }
 
@@ -423,16 +558,13 @@ function selectModel(modelId) {
   STATE.modelConfig = getModelMeta(modelId);
   STATE.images = [];
 
-  // Update sidebar active state
   document.querySelectorAll(".model-item").forEach(el => {
     el.classList.toggle("active", el.dataset.model === modelId);
   });
 
-  // Update panel
   I18n.setRawText(document.getElementById("selectedModelName"), modelId);
   I18n.setMessage(document.getElementById("selectedModelInfo"), ALL_MODELS[modelId] || "");
 
-  // Show/hide image upload
   const uploadGroup = document.getElementById("imageUploadGroup");
   const meta = STATE.modelConfig;
   if (meta.supportsImages) {
@@ -446,17 +578,14 @@ function selectModel(modelId) {
   document.getElementById("videoSourceGroup").style.display = meta.requiresVideoSource ? "block" : "none";
   document.getElementById("videoMediaId").value = "";
 
-  // Reset image previews
   document.getElementById("imagePreviewList").innerHTML = "";
   document.getElementById("imageHint").style.display = "block";
 
-  // Enable button
   const btn = document.getElementById("btnGenerate");
   btn.disabled = false;
   I18n.setMessage(btn, meta.type === "image" ? I18n.t("🎨 生成图片") : I18n.t("🎬 生成视频"));
 }
 
-// Image upload handling
 const uploadArea = document.getElementById("imageUploadArea");
 const fileInput = document.getElementById("imageFileInput");
 
@@ -465,11 +594,11 @@ uploadArea.onclick = (e) => {
   fileInput.click();
 };
 
-uploadArea.ondragover = (e) => { e.preventDefault(); uploadArea.style.borderColor = "#7c8aff"; };
-uploadArea.ondragleave = () => { uploadArea.style.borderColor = "#2a2b3a"; };
+uploadArea.ondragover = (e) => { e.preventDefault(); uploadArea.style.borderColor = "#2563EB"; };
+uploadArea.ondragleave = () => { uploadArea.style.borderColor = "#CBD5E1"; };
 uploadArea.ondrop = (e) => {
   e.preventDefault();
-  uploadArea.style.borderColor = "#2a2b3a";
+  uploadArea.style.borderColor = "#CBD5E1";
   handleFiles(e.dataTransfer.files);
 };
 
@@ -509,7 +638,6 @@ function removeImage(idx) {
   renderImagePreviews();
 }
 
-// Generation
 document.getElementById("btnGenerate").onclick = generate;
 
 async function generate() {
@@ -542,7 +670,6 @@ async function generate() {
   const log = document.getElementById("outputLog");
   const appendLog = (text) => { log.textContent += text; log.scrollTop = log.scrollHeight; };
 
-  // Build messages
   const content = [];
   content.push({ type: "text", text: prompt });
   STATE.images.forEach(dataUrl => {
@@ -553,7 +680,6 @@ async function generate() {
   }
 
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
-
   const body = { model: STATE.selectedModel, messages, stream: true };
 
   const startTime = Date.now();
@@ -608,7 +734,6 @@ async function generate() {
             }
           }
         } catch (e) {
-          // skip unparseable chunks
         }
       }
     }
@@ -616,7 +741,6 @@ async function generate() {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
     appendLog(I18n.t("\n\n[{0}] 完成，耗时 {1}s\n", {"0": (new Date().toLocaleTimeString(I18n.locale)), "1": (elapsed)}));
 
-    // Render result
     renderResult(fullContent);
     dot.className = "status-dot status-done";
     I18n.setMessage(document.getElementById("statusText"), I18n.t("完成 ({0}s)", {"0": (elapsed)}));
@@ -637,7 +761,6 @@ function renderResult(content) {
   const resultDiv = document.getElementById("outputResult");
   resultDiv.innerHTML = "";
 
-  // Extract markdown images
   const imgRegex = /!\[.*?\]\((.*?)\)/g;
   let match;
   while ((match = imgRegex.exec(content)) !== null) {
@@ -648,7 +771,6 @@ function renderResult(content) {
     resultDiv.appendChild(img);
   }
 
-  // Extract video tags
   const videoRegex = /<video[^>]+src=['"]([^'"]+)['"]/gi;
   while ((match = videoRegex.exec(content)) !== null) {
     const video = document.createElement("video");
@@ -659,16 +781,14 @@ function renderResult(content) {
     resultDiv.appendChild(video);
   }
 
-  // If no media found, show raw text
   if (resultDiv.children.length === 0 && content.trim()) {
     const pre = document.createElement("pre");
-    pre.style.cssText = "color:#aaa;font-size:13px;white-space:pre-wrap;word-break:break-all;";
+    pre.style.cssText = "color:#334155;background:#F8FAFC;border:1px solid #E2E8F0;border-radius:8px;padding:12px;font-size:13px;white-space:pre-wrap;word-break:break-all;";
     I18n.setRawText(pre, content);
     resultDiv.appendChild(pre);
   }
 }
 
-// Auto-detect base URL
 (function() {
   const baseUrlInput = document.getElementById("baseUrl");
   const apiKeyInput = document.getElementById("apiKey");
@@ -677,7 +797,6 @@ function renderResult(content) {
   apiKeyInput.addEventListener("change", loadModels);
   loadModels();
 })();
-
 
 window.addEventListener('languagechange', () => {
   const collapsed = new Set(Array.from(document.querySelectorAll('.section-title.collapsed'), title => title.dataset.category));
@@ -699,6 +818,6 @@ window.addEventListener('languagechange', () => {
 });
         Object.assign(window, {applyFallbackModels, loadModels, renderSidebarFallback, getModelType, getModelMeta, renderSidebar, selectModel, handleFiles, renderImagePreviews, removeImage, generate, renderResult});
     });
-    </script>
+</script>
 </body>
 </html>

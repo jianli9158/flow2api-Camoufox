@@ -1778,14 +1778,6 @@ class GenerationHandler:
                 progress=22,
                 response_extra={"project_id": project_id},
             )
-            prefill_action = (
-                "IMAGE_GENERATION" if generation_type == "image" else "VIDEO_GENERATION"
-            )
-            await self.flow_client.prefill_remote_browser_pool(
-                project_id=project_id,
-                action=prefill_action,
-                token_id=token.id,
-            )
 
             # 5. 根据类型处理
             generation_pipeline_started_at = time.time()
@@ -2016,17 +2008,6 @@ class GenerationHandler:
             "recaptcha 错误",
             "public_error_unusual_activity",
             "too much traffic",
-            "error_no_slot_available",
-            "打码服务资源不足",
-            "打码服务资源阻塞",
-            "yescaptcha",
-            "flow2api_team",
-            "capsolver",
-            "captcharun",
-            "twocaptcha",
-            "2captcha",
-            "capmonster",
-            "ezcaptcha",
         )
         if any(marker in error_text for marker in non_token_fault_markers):
             return False

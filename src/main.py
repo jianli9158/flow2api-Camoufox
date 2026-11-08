@@ -128,77 +128,14 @@ async def lifespan(app: FastAPI):
     # 尽量在浏览器服务启动前就拿到 token 快照，后续并发管理和预热共用。
     tokens = await token_manager.get_all_tokens()
 
-    # Initialize browser captcha service if needed
-    browser_service = None
-    if captcha_config.captcha_method == "personal":
-        from .services.browser_captcha_personal import (
-            BrowserCaptchaService,
-            PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
-            resolve_effective_browser_count,
-            resolve_effective_personal_max_resident_tabs,
-        )
+    from .services.browser_captcha import BrowserCaptchaService
 
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        print("Browser captcha service initialized (nodriver mode)")
+    browser_service = await BrowserCaptchaService.get_instance(db)
+    await browser_service.warmup_browser_slots()
+    print("Browser captcha service initialized (Camoufox + WebDriver BiDi)")
 
-        warmup_limit = max(
-            1,
-            min(
-            PERSONAL_POOL_MAX_TOTAL_RESIDENT_TABS,
-            resolve_effective_browser_count(config.browser_count)
-                * resolve_effective_personal_max_resident_tabs(
-                    config.personal_max_resident_tabs
-                ),
-            ),
-        )
-        warmup_project_ids = await token_manager.get_personal_warmup_project_ids(
-            tokens=tokens,
-            limit=warmup_limit,
-        )
-
-        warmed_slots = []
-        warmup_error = None
-        try:
-            warmed_slots = await browser_service.warmup_resident_tabs(
-                warmup_project_ids,
-                limit=warmup_limit,
-            )
-        except Exception as e:
-            warmup_error = e
-            print(f"Browser captcha resident warmup failed: {type(e).__name__}: {e}")
-        if warmed_slots:
-            print(
-                f"Browser captcha shared resident tabs warmed "
-                f"({len(warmed_slots)} slot(s), limit={warmup_limit})"
-            )
-        elif warmup_error is not None:
-            print("Browser captcha resident warmup skipped for this startup")
-        elif tokens:
-            print("Browser captcha resident warmup skipped: no tab warmed successfully")
-        else:
-            # 没有任何可用 token 时，打开登录窗口供用户手动操作
-            await browser_service.open_login_window()
-            print("No active token found, opened login window for manual setup")
-    elif captcha_config.captcha_method in {"browser", "camoufox"}:
-        from .services.browser_captcha import BrowserCaptchaService
-
-        browser_service = await BrowserCaptchaService.get_instance(db)
-        await browser_service.warmup_browser_slots()
-        print(f"Browser captcha service initialized ({captcha_config.captcha_method} mode)")
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
-
-    if config.captcha_method == "remote_browser":
-        try:
-            warmed_projects = await flow_client.prefill_remote_browser_for_tokens(
-                tokens, action="IMAGE_GENERATION"
-            )
-            print(
-                f"Remote browser pool prefill started for {warmed_projects} project(s)"
-            )
-        except Exception as e:
-            print(f"Remote browser pool prefill failed: {e}")
-
     # Start 429 auto-unban task
     import asyncio
 

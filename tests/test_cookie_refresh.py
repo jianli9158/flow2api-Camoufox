@@ -14,10 +14,6 @@ from src.core.database import Database
 from src.services.protocol_login import ProtocolLogin, _cookie_jar, _export_cookie_jar
 from src.services.token_manager import TokenManager
 from src.services.browser_captcha import TokenBrowser, BrowserCaptchaService
-from src.services.browser_captcha_personal import (
-    BrowserCaptchaService as PersonalService,
-    _PersonalBrowserPoolService,
-)
 from src.services.browser_cookie_utils import (
     build_browser_cookie_targets,
     cookie_pairs_for_url,
@@ -57,16 +53,10 @@ NEW_COOKIES = COOKIES.replace("session-old", "session-new")
 PAGE = 'boq_labs-ai-sandbox-frontend_ "oPEP7c":"account@example.com"'
 
 
-def make_failing_personal_pool(error):
-    pool = _PersonalBrowserPoolService.__new__(_PersonalBrowserPoolService)
-    worker = MagicMock()
-    worker.refresh_google_cookies = AsyncMock(side_effect=error)
-    pool._workers = [worker]
-    pool._ensure_workers = AsyncMock()
-    pool._acquire_worker = AsyncMock(return_value=(0, worker))
-    pool._release_worker_reservation = AsyncMock()
-    return pool
-
+def make_failing_browser_service(error):
+    service = MagicMock()
+    service.refresh_google_cookies = AsyncMock(side_effect=error)
+    return service
 
 class ProtocolCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def call_login(
@@ -559,14 +549,14 @@ class TokenCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
             RuntimeError("proxy connection failed"),
         ):
             with self.subTest(error=type(error).__name__, message=str(error)):
-                pool = make_failing_personal_pool(error)
+                service = make_failing_browser_service(error)
                 with (
                     patch("src.services.token_manager.config") as config,
                     patch.object(
-                        PersonalService, "get_instance", AsyncMock(return_value=pool)
+                        BrowserCaptchaService, "get_instance", AsyncMock(return_value=service)
                     ),
                 ):
-                    config.captcha_method = "personal"
+                    config.captcha_method = "browser"
                     self.assertFalse(
                         await self.manager._refresh_at_inner(self.token_id)
                     )
@@ -575,8 +565,6 @@ class TokenCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(type(error).__name__, latest.last_st_refresh_result)
                 if str(error):
                     self.assertIn(str(error), latest.last_st_refresh_result)
-                pool._release_worker_reservation.assert_awaited_once_with(0)
-
     async def test_authentication_failure_is_not_classified_as_network_error(self):
         self.flow._is_proxy_connection_error.return_value = False
         self.flow._is_retryable_network_error.return_value = False
@@ -585,12 +573,12 @@ class TokenCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
             "success": False,
             "error": "rpc=nzlxg, code=401",
         }
-        pool = make_failing_personal_pool(RuntimeError("Flow 登录已失效"))
+        service = make_failing_browser_service(RuntimeError("Flow 登录已失效"))
         with (
             patch("src.services.token_manager.config") as config,
-            patch.object(PersonalService, "get_instance", AsyncMock(return_value=pool)),
+            patch.object(BrowserCaptchaService, "get_instance", AsyncMock(return_value=service)),
         ):
-            config.captcha_method = "personal"
+            config.captcha_method = "browser"
             self.assertFalse(await self.manager._refresh_at_inner(self.token_id))
         self.assertFalse((await self.db.get_token(self.token_id)).is_active)
 
@@ -835,210 +823,6 @@ class RefreshIntervalDefaultsTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(Exception):
             TokenRefreshConfigRequest(refresh_interval_minutes=0)
 
-
-class BrowserCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
-    async def test_personal_host_cookie_preserves_original_origin(self):
-        for scope in (
-            {"domain": "accounts.google.com"},
-            {"url": "https://accounts.google.com/signin"},
-            {"url": "http://accounts.google.com/signin"},
-        ):
-            with self.subTest(scope=scope):
-                cookie = {
-                    "name": "__Host-GAPS",
-                    "value": "account-cookie",
-                    "path": "/signin",
-                    "secure": False,
-                    "httpOnly": True,
-                    "expires": 2030000000,
-                    **scope,
-                }
-                for source in (cookie, types.SimpleNamespace(**cookie)):
-                    stored = PersonalService._serialize_browser_cookie_for_storage(
-                        source
-                    )
-                    self.assertEqual(stored["url"], "https://accounts.google.com/")
-                    self.assertNotIn("domain", stored)
-                    self.assertEqual(stored["path"], "/")
-                    self.assertTrue(stored["secure"])
-                    self.assertTrue(stored["httpOnly"])
-                    self.assertEqual(stored["expires"], 2030000000)
-                    self.assertEqual(
-                        cookie_pairs_for_url(
-                            [stored], "https://flow.google.com/projects"
-                        ),
-                        [],
-                    )
-                    self.assertEqual(
-                        cookie_pairs_for_url(
-                            [stored], "https://sub.accounts.google.com/"
-                        ),
-                        [],
-                    )
-                    self.assertEqual(
-                        cookie_pairs_for_url([stored], "https://accounts.google.com/"),
-                        [("__Host-GAPS", "account-cookie")],
-                    )
-
-    async def test_personal_pool_preserves_original_error_and_releases_worker(self):
-        error = TimeoutError("connection timed out")
-        pool = make_failing_personal_pool(error)
-        with self.assertRaises(TimeoutError) as caught:
-            await pool.refresh_google_cookies(None, token_id=9)
-        self.assertIs(caught.exception, error)
-        pool._release_worker_reservation.assert_awaited_once_with(0)
-
-    async def test_personal_export_rejects_partitioned_cdp_cookies(self):
-        for marker in (
-            {"partitionKey": "https://other.example"},
-            {"partition_key": object()},
-            {"partition_key_opaque": True},
-        ):
-            with self.subTest(marker=marker):
-                cookie = {**json.loads(COOKIES)[0], **marker}
-                self.assertIsNone(
-                    PersonalService._serialize_browser_cookie_for_storage(cookie)
-                )
-                cdp_cookie = types.SimpleNamespace(**cookie)
-                self.assertIsNone(
-                    PersonalService._serialize_browser_cookie_for_storage(cdp_cookie)
-                )
-
-    async def test_playwright_export_excludes_partitioned_cookies(self):
-        browser = TokenBrowser.__new__(TokenBrowser)
-        browser._semaphore = asyncio.Semaphore(1)
-        browser._solve_inflight = 0
-        browser.note_idle = MagicMock()
-        page = MagicMock(url="https://flow.google.com/projects")
-        page.goto = AsyncMock(return_value=types.SimpleNamespace(status=200))
-        page.evaluate = AsyncMock(return_value=EMAIL)
-        page.close = AsyncMock()
-        cookies = json.loads(COOKIES)
-        cookies.append(
-            {
-                **cookies[0],
-                "value": "partition-session",
-                "partitionKey": "https://other.example",
-            }
-        )
-        context = MagicMock()
-        context.new_page = AsyncMock(return_value=page)
-        context.cookies = AsyncMock(return_value=cookies)
-        browser._get_or_create_shared_browser = AsyncMock(
-            return_value=(None, None, context)
-        )
-        result = await browser.refresh_google_cookies(token_id=9)
-        sessions = [
-            cookie
-            for cookie in json.loads(result["google_cookies"])
-            if cookie["name"] == "OSID"
-        ]
-        self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0]["value"], "session-old")
-        page.close.assert_awaited_once()
-
-    async def test_playwright_refresh_closes_page_on_failure(self):
-        browser = TokenBrowser.__new__(TokenBrowser)
-        browser._semaphore = asyncio.Semaphore(1)
-        browser._solve_inflight = 0
-        browser.note_idle = MagicMock()
-        page = MagicMock(url="https://flow.google.com/projects")
-        page.goto = AsyncMock(side_effect=RuntimeError("timeout"))
-        page.close = AsyncMock()
-        context = MagicMock()
-        context.new_page = AsyncMock(return_value=page)
-        browser._get_or_create_shared_browser = AsyncMock(
-            return_value=(None, None, context)
-        )
-        with self.assertRaisesRegex(RuntimeError, "timeout"):
-            await browser.refresh_google_cookies(token_id=9)
-        page.close.assert_awaited_once()
-        self.assertEqual(browser._solve_inflight, 0)
-        self.assertEqual(browser._semaphore._value, 1)
-
-    async def test_personal_refresh_exports_bound_context_without_next_auth_cookie(
-        self,
-    ):
-        service = PersonalService.__new__(PersonalService)
-        resident = types.SimpleNamespace(
-            tab=MagicMock(),
-            solve_lock=asyncio.Lock(),
-            token_id=9,
-            browser_context_id="account-context",
-            recaptcha_ready=True,
-        )
-        service._mark_runtime_active = MagicMock()
-        service.initialize = AsyncMock()
-        service._ensure_resident_tab = AsyncMock(return_value=("slot", resident))
-        service._consume_resident_slot_reservation = AsyncMock()
-        service._release_resident_slot_reservation = AsyncMock()
-        service._apply_token_cookie_binding = AsyncMock(return_value=True)
-        service._tab_get = AsyncMock()
-        service._tab_evaluate = AsyncMock(
-            return_value={
-                "host": "flow.google.com",
-                "ready": "complete",
-                "email": EMAIL,
-            }
-        )
-        cookies = json.loads(NEW_COOKIES)
-        cookies.append(
-            {
-                "name": "__Host-GAPS",
-                "value": "account-cookie",
-                "domain": "accounts.google.com",
-                "path": "/",
-                "secure": True,
-                "httpOnly": True,
-            }
-        )
-        service._get_browser_cookies = AsyncMock(return_value=cookies)
-        result = await service.refresh_google_cookies(None, token_id=9)
-        self.assertEqual(result["email"], EMAIL)
-        self.assertIn("OSID", result["google_cookies"])
-        stored_cookies = json.loads(result["google_cookies"])
-        account_cookie = next(
-            cookie for cookie in stored_cookies if cookie["name"] == "__Host-GAPS"
-        )
-        self.assertEqual(account_cookie["url"], "https://accounts.google.com/")
-        self.assertNotIn(
-            "__Host-GAPS",
-            {name for name, _ in cookie_pairs_for_url(result["google_cookies"])},
-        )
-        self.assertIn(
-            "__Host-GAPS",
-            {
-                name
-                for name, _ in cookie_pairs_for_url(
-                    result["google_cookies"], "https://accounts.google.com/"
-                )
-            },
-        )
-        self.assertEqual(
-            service._get_browser_cookies.call_args.kwargs["browser_context_id"],
-            "account-context",
-        )
-        service._consume_resident_slot_reservation.assert_awaited_once()
-        service._release_resident_slot_reservation.assert_not_awaited()
-
-    async def test_personal_cancel_while_waiting_releases_reservation(self):
-        service = PersonalService.__new__(PersonalService)
-        lock = asyncio.Lock()
-        await lock.acquire()
-        resident = types.SimpleNamespace(tab=MagicMock(), solve_lock=lock)
-        service._mark_runtime_active = MagicMock()
-        service.initialize = AsyncMock()
-        service._ensure_resident_tab = AsyncMock(return_value=("slot", resident))
-        service._release_resident_slot_reservation = AsyncMock()
-        task = asyncio.create_task(service.refresh_google_cookies(None, token_id=9))
-        await asyncio.sleep(0)
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        service._release_resident_slot_reservation.assert_awaited_once_with(
-            "slot", resident
-        )
-        lock.release()
 
 
 if __name__ == "__main__":
