@@ -2779,8 +2779,6 @@ class GenerationHandler:
             if result.get("direct_media") and direct_video_url:
                 await self.token_manager.record_usage(token.id, is_video=True)
                 await self.token_manager.record_success(token.id)
-                if getattr(self, "load_balancer", None):
-                    self.load_balancer.clear_quota_cooldown(token.id, model_key)
                 if self.proxy_manager and hasattr(
                     self.proxy_manager,
                     "record_attempt_success",

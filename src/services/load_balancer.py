@@ -201,11 +201,6 @@ class LoadBalancer:
                     filtered_reasons[token.id] = "图片生成已禁用"
                     continue
 
-                route_ok, route_reason = await self._check_extension_route(token)
-                if not route_ok:
-                    filtered_reasons[token.id] = route_reason
-                    continue
-
                 if (
                     enforce_concurrency_filter
                     and self.concurrency_manager
@@ -217,11 +212,6 @@ class LoadBalancer:
             if for_video_generation:
                 if not token.video_enabled:
                     filtered_reasons[token.id] = "视频生成已禁用"
-                    continue
-
-                route_ok, route_reason = await self._check_extension_route(token)
-                if not route_ok:
-                    filtered_reasons[token.id] = route_reason
                     continue
 
                 if (
