@@ -2,12 +2,13 @@
 
 import os
 import asyncio
+import base64
 import hashlib
 import time
+import uuid
 import mimetypes
 from pathlib import Path
 from typing import Optional, Dict, Any
-from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.config import config
@@ -39,6 +40,7 @@ class FileCache:
         self.flow_client = flow_client
         self._cleanup_task = None
         self._download_locks: Dict[str, asyncio.Lock] = {}
+        self._download_lock_users: Dict[str, int] = {}
 
     def _is_cleanup_disabled(self) -> bool:
         return self.default_timeout <= 0
@@ -182,6 +184,77 @@ class FileCache:
                 except Exception:
                     pass
 
+    def _decode_and_write_base64(self, file_path: Path, base64_data: str) -> int:
+        raw_bytes = base64.b64decode(base64_data)
+        self._write_cached_content(file_path, raw_bytes)
+        return len(raw_bytes)
+
+    def _check_existing_cache_file(self, file_path: Path) -> bool:
+        if not file_path.exists():
+            return False
+        if self._is_cleanup_disabled():
+            return True
+        file_age = time.time() - file_path.stat().st_mtime
+        if file_age < self.default_timeout:
+            return True
+        try:
+            file_path.unlink()
+        except Exception:
+            pass
+        return False
+
+    def _verify_downloaded_file_size(self, file_path: Path) -> int:
+        if not file_path.exists():
+            return -1
+        size = file_path.stat().st_size
+        if size <= 0:
+            try:
+                file_path.unlink()
+            except Exception:
+                pass
+        return size
+
+    async def _run_download_subprocess(
+        self,
+        cmd: list[str],
+        timeout: float = 90,
+        env: Optional[Dict[str, str]] = None,
+    ) -> tuple[int, bytes, bytes]:
+        """Run external download command asynchronously and terminate on timeout/cancel."""
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=timeout
+            )
+            return int(proc.returncode or 0), stdout or b"", stderr or b""
+        except asyncio.TimeoutError as exc:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            raise TimeoutError(f"{cmd[0]} timed out after {timeout}s") from exc
+        except BaseException:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            raise
+
     async def start_cleanup_task(self):
         """Start background cleanup task"""
         if self._is_cleanup_disabled():
@@ -226,6 +299,25 @@ class FileCache:
                     response_text="",
                 )
 
+    def _scan_and_remove_expired_files(self, current_time: float) -> tuple[int, bool]:
+        removed_count = 0
+        for file_path in self.cache_dir.iterdir():
+            timeout = self.get_timeout()
+            if timeout <= 0:
+                return removed_count, True
+            if file_path.is_file():
+                try:
+                    file_age = current_time - file_path.stat().st_mtime
+                except OSError:
+                    continue
+                if file_age > timeout:
+                    try:
+                        file_path.unlink()
+                        removed_count += 1
+                    except Exception:
+                        pass
+        return removed_count, False
+
     async def _cleanup_expired_files(self):
         """Remove expired cache files"""
         try:
@@ -233,24 +325,13 @@ class FileCache:
             if timeout <= 0:
                 return
             current_time = time.time()
-            removed_count = 0
-
-            for file_path in self.cache_dir.iterdir():
-                timeout = self.get_timeout()
-                if timeout <= 0:
-                    debug_logger.log_info(
-                        "Cache cleanup disabled during cleanup pass, stop deleting files"
-                    )
-                    break
-                if file_path.is_file():
-                    # Check file age
-                    file_age = current_time - file_path.stat().st_mtime
-                    if file_age > timeout:
-                        try:
-                            file_path.unlink()
-                            removed_count += 1
-                        except Exception:
-                            pass
+            removed_count, stopped_early = await asyncio.to_thread(
+                self._scan_and_remove_expired_files, current_time
+            )
+            if stopped_early:
+                debug_logger.log_info(
+                    "Cache cleanup disabled during cleanup pass, stop deleting files"
+                )
 
             if removed_count > 0:
                 debug_logger.log_info(
@@ -301,189 +382,213 @@ class FileCache:
         filename = self._generate_cache_filename(url, media_type)
         file_path = self.cache_dir / filename
         download_lock = self._download_locks.setdefault(filename, asyncio.Lock())
+        self._download_lock_users[filename] = (
+            self._download_lock_users.get(filename, 0) + 1
+        )
 
-        async with download_lock:
-            # Check if already cached and not expired
-            if file_path.exists():
-                if self._is_cleanup_disabled():
+        try:
+            async with download_lock:
+                # Check if already cached and not expired
+                if await asyncio.to_thread(self._check_existing_cache_file, file_path):
+                    if not self._is_cleanup_disabled():
+                        debug_logger.log_info(f"Cache hit: {filename}")
                     return filename
-                file_age = time.time() - file_path.stat().st_mtime
-                if file_age < self.default_timeout:
-                    debug_logger.log_info(f"Cache hit: {filename}")
-                    return filename
+
+                # Download file
+                debug_logger.log_info(f"Downloading file from: {url}")
+
+                fingerprint = self._get_request_fingerprint()
+                proxy_url = await self._resolve_download_proxy(
+                    media_type, fingerprint=fingerprint
+                )
+                headers = self._build_download_headers(
+                    media_type, fingerprint=fingerprint
+                )
+
+                # Try method 1: curl_cffi with browser impersonation
                 try:
-                    file_path.unlink()
-                except Exception:
-                    pass
-
-            # Download file
-            debug_logger.log_info(f"Downloading file from: {url}")
-
-            fingerprint = self._get_request_fingerprint()
-            proxy_url = await self._resolve_download_proxy(
-                media_type, fingerprint=fingerprint
-            )
-            headers = self._build_download_headers(media_type, fingerprint=fingerprint)
-
-            # Try method 1: curl_cffi with browser impersonation
-            try:
-                async with AsyncSession() as session:
-                    response = await session.get(
-                        url,
-                        timeout=60,
-                        proxy=proxy_url,
-                        headers=headers,
-                        impersonate="chrome120",
-                        verify=False,
-                    )
-
-                    if response.status_code == 200 and response.content:
-                        self._write_cached_content(file_path, response.content)
-                        debug_logger.log_info(
-                            f"File cached (curl_cffi): {filename} ({len(response.content)} bytes)"
+                    async with AsyncSession() as session:
+                        response = await session.get(
+                            url,
+                            timeout=60,
+                            proxy=proxy_url,
+                            headers=headers,
+                            impersonate="chrome120",
+                            verify=False,
                         )
-                        return filename
+
+                        if response.status_code == 200 and response.content:
+                            content_bytes = response.content
+                            await asyncio.to_thread(
+                                self._write_cached_content, file_path, content_bytes
+                            )
+                            debug_logger.log_info(
+                                f"File cached (curl_cffi): {filename} ({len(content_bytes)} bytes)"
+                            )
+                            return filename
+                        debug_logger.log_warning(
+                            f"curl_cffi failed with HTTP {response.status_code}, trying wget..."
+                        )
+
+                except Exception as e:
                     debug_logger.log_warning(
-                        f"curl_cffi failed with HTTP {response.status_code}, trying wget..."
+                        f"curl_cffi failed: {str(e)}, trying wget..."
                     )
 
-            except Exception as e:
-                debug_logger.log_warning(f"curl_cffi failed: {str(e)}, trying wget...")
+                # Try method 2: wget command
+                try:
+                    wget_cmd = [
+                        "wget",
+                        "-q",
+                        "-O",
+                        str(file_path),
+                        "--timeout=60",
+                        "--tries=3",
+                        f"--user-agent={headers.get('User-Agent', '')}",
+                        f"--header=Accept: {headers.get('Accept', '*/*')}",
+                        f"--header=Accept-Language: {headers.get('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')}",
+                        f"--header=Connection: {headers.get('Connection', 'keep-alive')}",
+                        f"--header=Referer: {headers.get('Referer', 'https://flow.google.com/')}",
+                    ]
 
-            # Try method 2: wget command
-            try:
-                import subprocess
-
-                wget_cmd = [
-                    "wget",
-                    "-q",
-                    "-O",
-                    str(file_path),
-                    "--timeout=60",
-                    "--tries=3",
-                    f"--user-agent={headers.get('User-Agent', '')}",
-                    f"--header=Accept: {headers.get('Accept', '*/*')}",
-                    f"--header=Accept-Language: {headers.get('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')}",
-                    f"--header=Connection: {headers.get('Connection', 'keep-alive')}",
-                    f"--header=Referer: {headers.get('Referer', 'https://flow.google.com/')}",
-                ]
-
-                if "sec-ch-ua" in headers:
-                    wget_cmd.append(f"--header=sec-ch-ua: {headers['sec-ch-ua']}")
-                if "sec-ch-ua-mobile" in headers:
-                    wget_cmd.append(
-                        f"--header=sec-ch-ua-mobile: {headers['sec-ch-ua-mobile']}"
-                    )
-                if "sec-ch-ua-platform" in headers:
-                    wget_cmd.append(
-                        f"--header=sec-ch-ua-platform: {headers['sec-ch-ua-platform']}"
-                    )
-
-                if proxy_url:
-                    env = os.environ.copy()
-                    env["http_proxy"] = proxy_url
-                    env["https_proxy"] = proxy_url
-                else:
-                    env = None
-
-                wget_cmd.append(url)
-                result = subprocess.run(
-                    wget_cmd, capture_output=True, timeout=90, env=env
-                )
-
-                if result.returncode == 0 and file_path.exists():
-                    file_size = file_path.stat().st_size
-                    if file_size > 0:
-                        debug_logger.log_info(
-                            f"File cached (wget): {filename} ({file_size} bytes)"
+                    if "sec-ch-ua" in headers:
+                        wget_cmd.append(f"--header=sec-ch-ua: {headers['sec-ch-ua']}")
+                    if "sec-ch-ua-mobile" in headers:
+                        wget_cmd.append(
+                            f"--header=sec-ch-ua-mobile: {headers['sec-ch-ua-mobile']}"
                         )
-                        return filename
-                    raise Exception("Downloaded file is empty")
-
-                error_msg = (
-                    result.stderr.decode("utf-8", errors="ignore")
-                    if result.stderr
-                    else "Unknown error"
-                )
-                debug_logger.log_warning(f"wget failed: {error_msg}, trying curl...")
-
-            except FileNotFoundError:
-                debug_logger.log_warning("wget not found, trying curl...")
-            except Exception as e:
-                debug_logger.log_warning(f"wget failed: {str(e)}, trying curl...")
-
-            # Try method 3: system curl command
-            try:
-                import subprocess
-
-                curl_cmd = [
-                    "curl",
-                    "-L",
-                    "-s",
-                    "-o",
-                    str(file_path),
-                    "--max-time",
-                    "60",
-                    "-H",
-                    f"Accept: {headers.get('Accept', '*/*')}",
-                    "-H",
-                    f"Accept-Language: {headers.get('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')}",
-                    "-H",
-                    f"Connection: {headers.get('Connection', 'keep-alive')}",
-                    "-H",
-                    f"Referer: {headers.get('Referer', 'https://flow.google.com/')}",
-                    "-A",
-                    headers.get("User-Agent", ""),
-                ]
-
-                if "sec-ch-ua" in headers:
-                    curl_cmd.extend(["-H", f"sec-ch-ua: {headers['sec-ch-ua']}"])
-                if "sec-ch-ua-mobile" in headers:
-                    curl_cmd.extend(
-                        ["-H", f"sec-ch-ua-mobile: {headers['sec-ch-ua-mobile']}"]
-                    )
-                if "sec-ch-ua-platform" in headers:
-                    curl_cmd.extend(
-                        ["-H", f"sec-ch-ua-platform: {headers['sec-ch-ua-platform']}"]
-                    )
-                if proxy_url:
-                    curl_cmd.extend(["-x", proxy_url])
-
-                curl_cmd.append(url)
-                result = subprocess.run(curl_cmd, capture_output=True, timeout=90)
-
-                if result.returncode == 0 and file_path.exists():
-                    file_size = file_path.stat().st_size
-                    if file_size > 0:
-                        debug_logger.log_info(
-                            f"File cached (curl): {filename} ({file_size} bytes)"
+                    if "sec-ch-ua-platform" in headers:
+                        wget_cmd.append(
+                            f"--header=sec-ch-ua-platform: {headers['sec-ch-ua-platform']}"
                         )
-                        return filename
-                    raise Exception("Downloaded file is empty")
 
-                error_msg = (
-                    result.stderr.decode("utf-8", errors="ignore")
-                    if result.stderr
-                    else "Unknown error"
-                )
-                raise Exception(f"curl command failed: {error_msg}")
+                    if proxy_url:
+                        env = os.environ.copy()
+                        env["http_proxy"] = proxy_url
+                        env["https_proxy"] = proxy_url
+                    else:
+                        env = None
 
-            except FileNotFoundError as e:
-                normalized_error = self._normalize_cache_error(e)
-                debug_logger.log_error(
-                    error_message=f"Failed to download file: {str(e)}",
-                    status_code=0,
-                    response_text=str(e),
-                )
-                raise Exception(normalized_error) from e
-            except Exception as e:
-                normalized_error = self._normalize_cache_error(e)
-                debug_logger.log_error(
-                    error_message=f"Failed to download file: {str(e)}",
-                    status_code=0,
-                    response_text=str(e),
-                )
-                raise Exception(normalized_error) from e
+                    wget_cmd.append(url)
+                    returncode, _, stderr = await self._run_download_subprocess(
+                        wget_cmd, timeout=90, env=env
+                    )
+
+                    if returncode == 0:
+                        file_size = await asyncio.to_thread(
+                            self._verify_downloaded_file_size, file_path
+                        )
+                        if file_size > 0:
+                            debug_logger.log_info(
+                                f"File cached (wget): {filename} ({file_size} bytes)"
+                            )
+                            return filename
+                        if file_size == 0:
+                            raise Exception("Downloaded file is empty")
+
+                    error_msg = (
+                        stderr.decode("utf-8", errors="ignore")
+                        if stderr
+                        else "Unknown error"
+                    )
+                    debug_logger.log_warning(
+                        f"wget failed: {error_msg}, trying curl..."
+                    )
+
+                except FileNotFoundError:
+                    debug_logger.log_warning("wget not found, trying curl...")
+                except Exception as e:
+                    debug_logger.log_warning(f"wget failed: {str(e)}, trying curl...")
+
+                # Try method 3: system curl command
+                try:
+                    curl_cmd = [
+                        "curl",
+                        "-L",
+                        "-s",
+                        "-o",
+                        str(file_path),
+                        "--max-time",
+                        "60",
+                        "-H",
+                        f"Accept: {headers.get('Accept', '*/*')}",
+                        "-H",
+                        f"Accept-Language: {headers.get('Accept-Language', 'zh-CN,zh;q=0.9,en;q=0.8')}",
+                        "-H",
+                        f"Connection: {headers.get('Connection', 'keep-alive')}",
+                        "-H",
+                        f"Referer: {headers.get('Referer', 'https://flow.google.com/')}",
+                        "-A",
+                        headers.get("User-Agent", ""),
+                    ]
+
+                    if "sec-ch-ua" in headers:
+                        curl_cmd.extend(["-H", f"sec-ch-ua: {headers['sec-ch-ua']}"])
+                    if "sec-ch-ua-mobile" in headers:
+                        curl_cmd.extend(
+                            ["-H", f"sec-ch-ua-mobile: {headers['sec-ch-ua-mobile']}"]
+                        )
+                    if "sec-ch-ua-platform" in headers:
+                        curl_cmd.extend(
+                            [
+                                "-H",
+                                f"sec-ch-ua-platform: {headers['sec-ch-ua-platform']}",
+                            ]
+                        )
+                    if proxy_url:
+                        curl_cmd.extend(["-x", proxy_url])
+
+                    curl_cmd.append(url)
+                    returncode, _, stderr = await self._run_download_subprocess(
+                        curl_cmd, timeout=90
+                    )
+
+                    if returncode == 0:
+                        file_size = await asyncio.to_thread(
+                            self._verify_downloaded_file_size, file_path
+                        )
+                        if file_size > 0:
+                            debug_logger.log_info(
+                                f"File cached (curl): {filename} ({file_size} bytes)"
+                            )
+                            return filename
+                        if file_size == 0:
+                            raise Exception("Downloaded file is empty")
+
+                    error_msg = (
+                        stderr.decode("utf-8", errors="ignore")
+                        if stderr
+                        else "Unknown error"
+                    )
+                    raise Exception(f"curl command failed: {error_msg}")
+
+                except FileNotFoundError as e:
+                    normalized_error = self._normalize_cache_error(e)
+                    debug_logger.log_error(
+                        error_message=f"Failed to download file: {str(e)}",
+                        status_code=0,
+                        response_text=str(e),
+                    )
+                    raise Exception(normalized_error) from e
+                except Exception as e:
+                    normalized_error = self._normalize_cache_error(e)
+                    debug_logger.log_error(
+                        error_message=f"Failed to download file: {str(e)}",
+                        status_code=0,
+                        response_text=str(e),
+                    )
+                    raise Exception(normalized_error) from e
+        finally:
+            remaining = self._download_lock_users.get(filename, 1) - 1
+            if remaining <= 0:
+                self._download_lock_users.pop(filename, None)
+                if (
+                    not download_lock.locked()
+                    and self._download_locks.get(filename) is download_lock
+                ):
+                    self._download_locks.pop(filename, None)
+            else:
+                self._download_lock_users[filename] = remaining
 
     async def cache_base64_video(self, base64_data: str) -> str:
         """Cache base64 encoded video data to local file
@@ -494,18 +599,16 @@ class FileCache:
         Returns:
             Local cache filename
         """
-        import base64 as _b64
-        import uuid as _uuid
-
-        unique_id = hashlib.md5(f"{_uuid.uuid4()}{time.time()}".encode()).hexdigest()
+        unique_id = hashlib.md5(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()
         filename = f"{unique_id}.mp4"
         file_path = self.cache_dir / filename
 
         try:
-            video_data = _b64.b64decode(base64_data)
-            self._write_cached_content(file_path, video_data)
+            video_len = await asyncio.to_thread(
+                self._decode_and_write_base64, file_path, base64_data
+            )
             debug_logger.log_info(
-                f"Base64 video cached: {filename} ({len(video_data)} bytes)"
+                f"Base64 video cached: {filename} ({video_len} bytes)"
             )
             return filename
         except Exception as e:
@@ -527,9 +630,6 @@ class FileCache:
         Returns:
             Local cache filename
         """
-        import base64
-        import uuid
-
         # Generate unique filename
         unique_id = hashlib.md5(f"{uuid.uuid4()}{time.time()}".encode()).hexdigest()
         suffix = f"_{resolution}" if resolution else ""
@@ -537,12 +637,11 @@ class FileCache:
         file_path = self.cache_dir / filename
 
         try:
-            # Decode base64 and save to file
-            image_data = base64.b64decode(base64_data)
-            with open(file_path, "wb") as f:
-                f.write(image_data)
+            image_len = await asyncio.to_thread(
+                self._decode_and_write_base64, file_path, base64_data
+            )
             debug_logger.log_info(
-                f"Base64 image cached: {filename} ({len(image_data)} bytes)"
+                f"Base64 image cached: {filename} ({image_len} bytes)"
             )
             return filename
         except Exception as e:
@@ -566,21 +665,23 @@ class FileCache:
         """Get current cache timeout"""
         return self.default_timeout
 
+    def _clear_all_sync(self) -> int:
+        removed_count = 0
+        for file_path in self.cache_dir.iterdir():
+            if file_path.is_file():
+                try:
+                    file_path.unlink()
+                    removed_count += 1
+                except Exception:
+                    pass
+        return removed_count
+
     async def clear_all(self):
         """Clear all cached files"""
         try:
-            removed_count = 0
-            for file_path in self.cache_dir.iterdir():
-                if file_path.is_file():
-                    try:
-                        file_path.unlink()
-                        removed_count += 1
-                    except Exception:
-                        pass
-
+            removed_count = await asyncio.to_thread(self._clear_all_sync)
             debug_logger.log_info(f"Cache cleared: removed {removed_count} files")
             return removed_count
-
         except Exception as e:
             debug_logger.log_error(
                 error_message=f"Failed to clear cache: {str(e)}",

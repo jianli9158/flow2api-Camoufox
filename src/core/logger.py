@@ -1,8 +1,11 @@
 """Debug logger module for detailed API request/response logging"""
 
+import atexit
 import json
 import logging
+import queue
 from datetime import datetime
+from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, Optional
 from .config import config
@@ -11,12 +14,32 @@ from .config import config
 class DebugLogger:
     """Debug logger for API requests and responses"""
 
+    _TRUNCATE_DICT_KEYS = frozenset(
+        {
+            "encodedImage",
+            "encodedVideo",
+            "base64",
+            "b64_json",
+            "imageData",
+            "videoData",
+            "rawBytes",
+            "bytesBase64Encoded",
+            "data",
+        }
+    )
+
     def __init__(self):
         self.log_file = Path("logs.txt")
+        self._log_queue: Optional[queue.SimpleQueue] = None
+        self._file_handler: Optional[RotatingFileHandler] = None
+        self._queue_listener: Optional[QueueListener] = None
         self._setup_logger()
+        atexit.register(self.close)
 
     def _setup_logger(self):
-        """Setup file logger"""
+        """Setup non-blocking rotating file logger"""
+        self.close()
+
         # Create logger
         self.logger = logging.getLogger("debug_logger")
         self.logger.setLevel(logging.DEBUG)
@@ -24,19 +47,56 @@ class DebugLogger:
         # Remove existing handlers
         self.logger.handlers.clear()
 
-        # Create file handler
-        file_handler = logging.FileHandler(self.log_file, mode="a", encoding="utf-8")
+        # Create rotating file handler behind an in-memory queue
+        file_handler = RotatingFileHandler(
+            self.log_file,
+            mode="a",
+            maxBytes=20 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
         file_handler.setLevel(logging.DEBUG)
 
-        # Create formatter
         formatter = logging.Formatter("%(message)s", datefmt="%Y-%m-%d %H:%M:%S")
         file_handler.setFormatter(formatter)
 
-        # Add handler
-        self.logger.addHandler(file_handler)
+        log_queue: queue.SimpleQueue = queue.SimpleQueue()
+        queue_handler = QueueHandler(log_queue)
+        queue_handler.setLevel(logging.DEBUG)
+
+        queue_listener = QueueListener(
+            log_queue,
+            file_handler,
+            respect_handler_level=True,
+        )
+        queue_listener.start()
+
+        self._log_queue = log_queue
+        self._file_handler = file_handler
+        self._queue_listener = queue_listener
+
+        self.logger.addHandler(queue_handler)
 
         # Prevent propagation to root logger
         self.logger.propagate = False
+
+    def close(self):
+        """Stop background queue listener and close underlying file handler."""
+        listener = getattr(self, "_queue_listener", None)
+        self._queue_listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+
+        file_handler = getattr(self, "_file_handler", None)
+        self._file_handler = None
+        if file_handler is not None:
+            try:
+                file_handler.close()
+            except Exception:
+                pass
 
     def _mask_token(self, token: str) -> str:
         """Mask token for logging (show first 6 and last 6 characters)"""
@@ -52,36 +112,48 @@ class DebugLogger:
         """Write separator line"""
         self.logger.info(char * length)
 
+    @staticmethod
+    def _is_base64_data_uri(value: str) -> bool:
+        if value.startswith("data:") and ";base64," in value[:128]:
+            return True
+        return "data:" in value and ";base64," in value
+
     def _truncate_large_fields(self, data: Any, max_length: int = 200) -> Any:
-        """对大字段进行截断处理，特别是 base64 编码的图片数据
+        """对大字段进行截断处理，特别是 base64 编码的图片/视频数据与超长字符串
         
         Args:
             data: 要处理的数据
-            max_length: 字符串字段的最大长度
+            max_length: 特定 base64 字符串字段的最大长度
         
         Returns:
             截断后的数据副本
         """
+        string_limit = max(max_length * 10, 2000)
+        preview_len = min(100, max(20, max_length))
+
         if isinstance(data, dict):
             result = {}
             for key, value in data.items():
-                # 对特定的大字段进行截断
                 if (
-                    key in ("encodedImage", "base64", "imageData", "data")
+                    key in self._TRUNCATE_DICT_KEYS
                     and isinstance(value, str)
                     and len(value) > max_length
                 ):
                     result[key] = (
-                        f"{value[:100]}... (truncated, total {len(value)} chars)"
+                        f"{value[:preview_len]}... (truncated, total {len(value)} chars)"
                     )
                 else:
                     result[key] = self._truncate_large_fields(value, max_length)
             return result
         elif isinstance(data, list):
             return [self._truncate_large_fields(item, max_length) for item in data]
-        elif isinstance(data, str) and len(data) > 10000:
-            # 对超长字符串进行截断（可能是未知的 base64 字段）
-            return f"{data[:100]}... (truncated, total {len(data)} chars)"
+        elif isinstance(data, tuple):
+            return [self._truncate_large_fields(item, max_length) for item in data]
+        elif isinstance(data, str):
+            if (
+                len(data) > max_length and self._is_base64_data_uri(data)
+            ) or len(data) > string_limit:
+                return f"{data[:preview_len]}... (truncated, total {len(data)} chars)"
         return data
 
     def log_request(
@@ -139,8 +211,11 @@ class DebugLogger:
             if body is not None:
                 self.logger.info("\n📦 Request Body:")
                 if isinstance(body, (dict, list)):
-                    body_str = json.dumps(body, indent=2, ensure_ascii=False)
+                    body_to_log = self._truncate_large_fields(body)
+                    body_str = json.dumps(body_to_log, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
+                elif isinstance(body, str) and len(body) > 2000:
+                    self.logger.info(f"{body[:2000]}... (truncated)")
                 else:
                     self.logger.info(str(body))
 

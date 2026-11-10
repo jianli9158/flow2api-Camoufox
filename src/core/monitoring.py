@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import time
 import urllib.error
@@ -470,7 +471,15 @@ async def render_main_metrics(
 
 
 async def build_public_health_snapshot(db: Any) -> dict[str, Any]:
-    rows = await db.get_all_tokens_with_stats()
+    get_health_tokens = getattr(db, "get_public_health_tokens", None)
+    if callable(get_health_tokens):
+        candidate = get_health_tokens()
+        if inspect.isawaitable(candidate):
+            rows = await candidate
+        else:
+            rows = await db.get_all_tokens_with_stats()
+    else:
+        rows = await db.get_all_tokens_with_stats()
     now = datetime.now(timezone.utc)
 
     active_tokens = 0

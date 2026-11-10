@@ -28,10 +28,13 @@ class _BrowserRequest:
     borrower: Any = None
     owner_callback: Any = None
     hold: bool = False
+    in_browser_op: bool = True
     failed: bool = False
     risk_reported: bool = False
     fingerprint: Optional[Dict[str, Any]] = None
 
+
+_ActiveRequest = _BrowserRequest
 
 @dataclass
 class _SlotRecovery:
@@ -80,7 +83,6 @@ class BrowserCaptchaService:
         self._browser_count = 1
         self._round_robin_index = 0
         self._stats = {"req_total": 0, "gen_ok": 0, "gen_fail": 0, "api_403": 0}
-        self._token_semaphore = None
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
     async def _ensure_idle_reaper(self):
@@ -114,7 +116,10 @@ class BrowserCaptchaService:
                         if browser.idle_seconds() < idle_ttl:
                             continue
                         async with self._slot_condition:
-                            if self._is_slot_busy_for_allocation(slot_id):
+                            if self._is_slot_busy_for_allocation(slot_id) or any(
+                                r.slot_id == slot_id and r.hold
+                                for r in self._requests.values()
+                            ):
                                 continue
                             self._reserve_slot_locked(slot_id)
                             reserved = True
@@ -163,12 +168,6 @@ class BrowserCaptchaService:
             cls._instance = instance
             return instance
 
-    def _use_camoufox_engine(self) -> bool:
-        return True
-
-    def _check_available(self):
-        return
-
     async def _load_browser_count(self):
         if self.db:
             try:
@@ -182,7 +181,6 @@ class BrowserCaptchaService:
                     f"[BrowserCaptcha] 加载 browser_count 配置失败: {e}，使用默认值 1"
                 )
                 self._browser_count = 1
-        self._token_semaphore = asyncio.Semaphore(self._browser_count)
 
     async def reload_browser_count(self):
         old_count = self._browser_count
@@ -307,13 +305,15 @@ class BrowserCaptchaService:
         state = self._slot_recovery.get(slot_id)
         if state and state.phase not in {"ready", "probe"}:
             return True
-        if any(request.slot_id == slot_id for request in self._requests.values()):
+        if any(
+            request.slot_id == slot_id and request.in_browser_op
+            for request in self._requests.values()
+        ):
             return True
         if self._slot_reservations.get(slot_id, 0) > 0:
             return True
         browser = self._browsers.get(slot_id)
         return bool(browser and getattr(browser, "is_busy", lambda: False)())
-
     def _has_warmed_browser_for_allocation(self, slot_id: int) -> bool:
         browser = self._browsers.get(slot_id)
         return bool(browser and getattr(browser, "has_shared_browser", lambda: False)())
@@ -368,11 +368,20 @@ class BrowserCaptchaService:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         state.reason = "drain_timeout"
-                        return
+                        break
                     try:
                         await asyncio.wait_for(self._slot_condition.wait(), remaining)
                     except asyncio.TimeoutError:
                         continue
+                for ref, req in list(self._requests.items()):
+                    if req.slot_id == slot_id:
+                        self._requests.pop(ref, None)
+                        if req.owner and req.owner_callback:
+                            try:
+                                req.owner.remove_done_callback(req.owner_callback)
+                            except Exception:
+                                pass
+                self._slot_reservations.pop(slot_id, None)
                 state.phase = "recovering"
                 browser = self._browsers.get(slot_id)
 
@@ -484,6 +493,7 @@ class BrowserCaptchaService:
                 ):
                     request = candidate
                     request.hold = False
+                    request.in_browser_op = True
                     request.borrower = asyncio.current_task()
                     self._reserve_slot_locked(request.slot_id)
         if not request:
@@ -506,6 +516,7 @@ class BrowserCaptchaService:
                     generation=getattr(browser, "_runtime_generation", 0),
                     owner=asyncio.current_task(),
                     borrower=asyncio.current_task(),
+                    in_browser_op=True,
                 )
                 request.owner_callback = lambda owner: self._on_request_owner_done(
                     request
@@ -531,8 +542,11 @@ class BrowserCaptchaService:
             request.borrower = None
             if not request.hold:
                 await self._finish_request(request.ref, success=not request.failed)
+            else:
+                async with self._slot_condition:
+                    request.in_browser_op = False
+                    self._slot_condition.notify_all()
             await self._release_slot_reservation(request.slot_id)
-
     async def _select_browser_id(
         self,
         project_id: Optional[str],
@@ -562,20 +576,12 @@ class BrowserCaptchaService:
                 matching_idle_slot: Optional[int] = None
                 unbound_warm_idle_slot: Optional[int] = None
                 cold_idle_slot: Optional[int] = None
-                idle_slot: Optional[int] = None
+                unleased_idle_slot: Optional[int] = None
+                leased_idle_slot: Optional[int] = None
 
                 for offset in range(self._browser_count):
                     slot_id = (self._round_robin_index + offset) % self._browser_count
                     if self._is_slot_busy_for_allocation(slot_id):
-                        continue
-
-                    if idle_slot is None:
-                        idle_slot = slot_id
-
-                    browser = self._browsers.get(slot_id)
-                    if browser is None:
-                        if cold_idle_slot is None:
-                            cold_idle_slot = slot_id
                         continue
 
                     bound_token_id = self._slot_bound_token_id(slot_id)
@@ -585,6 +591,40 @@ class BrowserCaptchaService:
                     ):
                         matching_idle_slot = slot_id
                         break
+                    if expected_token_id is not None and any(
+                        r.slot_id == slot_id
+                        and r.hold
+                        and CamoufoxWorker._normalize_token_key(r.token_id)
+                        == expected_token_id
+                        for r in self._requests.values()
+                    ):
+                        matching_idle_slot = slot_id
+                        break
+
+                    has_other_hold_lease = any(
+                        r.slot_id == slot_id
+                        and r.hold
+                        and (
+                            expected_token_id is None
+                            or CamoufoxWorker._normalize_token_key(r.token_id)
+                            != expected_token_id
+                        )
+                        for r in self._requests.values()
+                    )
+                    if has_other_hold_lease:
+                        if leased_idle_slot is None:
+                            leased_idle_slot = slot_id
+                        continue
+
+                    if unleased_idle_slot is None:
+                        unleased_idle_slot = slot_id
+
+                    browser = self._browsers.get(slot_id)
+                    if browser is None:
+                        if cold_idle_slot is None:
+                            cold_idle_slot = slot_id
+                        continue
+
                     if (
                         bound_token_id is None
                         and self._has_warmed_browser_for_allocation(slot_id)
@@ -594,13 +634,14 @@ class BrowserCaptchaService:
 
                 if matching_idle_slot is not None:
                     selected_slot = matching_idle_slot
-                elif expected_token_id is None and unbound_warm_idle_slot is not None:
+                elif unbound_warm_idle_slot is not None:
                     selected_slot = unbound_warm_idle_slot
                 elif cold_idle_slot is not None:
                     selected_slot = cold_idle_slot
+                elif unleased_idle_slot is not None:
+                    selected_slot = unleased_idle_slot
                 else:
-                    selected_slot = idle_slot
-
+                    selected_slot = leased_idle_slot
                 if selected_slot is not None:
                     self._round_robin_index = (selected_slot + 1) % self._browser_count
                     self._reserve_slot_locked(selected_slot)
@@ -677,7 +718,6 @@ class BrowserCaptchaService:
         action: str = "IMAGE_GENERATION",
         token_id: int = None,
     ) -> tuple[Optional[str], Union[int, str], Optional[Dict[str, Any]]]:
-        self._check_available()
         self._stats["req_total"] += 1
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(project_id, token_id) as request:
@@ -709,7 +749,6 @@ class BrowserCaptchaService:
     async def refresh_google_cookies(
         self, project_id: Optional[str], *, token_id: int
     ) -> Dict[str, Any]:
-        self._check_available()
         if not token_id:
             raise ValueError("Cookie 刷新必须指定 Token ID")
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
@@ -725,7 +764,6 @@ class BrowserCaptchaService:
         action: str = "homepage",
         enterprise: bool = False,
     ) -> tuple[Optional[str], int]:
-        self._check_available()
         async with self._borrow_browser() as request:
             token = await asyncio.wait_for(
                 request.browser.get_custom_token(
@@ -748,7 +786,6 @@ class BrowserCaptchaService:
         action: str = "homepage",
         enterprise: bool = False,
     ) -> tuple[Dict[str, Any], int]:
-        self._check_available()
         async with self._borrow_browser() as request:
             payload = await asyncio.wait_for(
                 request.browser.get_custom_score(
@@ -801,7 +838,6 @@ class BrowserCaptchaService:
         timeout: int,
         browser_ref: Optional[Union[int, str]] = None,
     ) -> tuple[Dict[str, Any], Union[int, str], Optional[Dict[str, Any]]]:
-        self._check_available()
         deadline = time.monotonic() + max(1, float(timeout))
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(
@@ -856,7 +892,6 @@ class BrowserCaptchaService:
     ) -> Optional[Dict[str, Any]]:
         if not getattr(config, "browser_in_page_rpc", True):
             return None
-        self._check_available()
         deadline = time.monotonic() + max(5.0, float(timeout or 90))
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(
@@ -904,7 +939,6 @@ class BrowserCaptchaService:
         token_id: Optional[int] = None,
         browser_ref: Optional[Union[int, str]] = None,
     ) -> Optional[Dict[str, Any]]:
-        self._check_available()
         deadline = time.monotonic() + max(30.0, float(timeout or 120))
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(
@@ -947,7 +981,6 @@ class BrowserCaptchaService:
         token_id: Optional[int] = None,
         browser_ref: Optional[Union[int, str]] = None,
     ) -> Optional[Dict[str, Any]]:
-        self._check_available()
         deadline = time.monotonic() + max(45.0, float(timeout or 180))
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(
@@ -1032,10 +1065,6 @@ class BrowserCaptchaService:
     ):
         await self._finish_request(browser_ref, success=success)
 
-    async def remove_browser(self, browser_id: int):
-        async with self._browsers_lock:
-            self._browsers.pop(browser_id, None)
-
     async def close(self):
         async with self._slot_condition:
             self._closed = True
@@ -1074,7 +1103,6 @@ class BrowserCaptchaService:
 
         for browser in browsers:
             try:
-                await browser.force_close_pending_browser(close_all=True)
                 await browser.recycle_browser(
                     reason="service_shutdown", rotate_profile=False
                 )
@@ -1087,16 +1115,72 @@ class BrowserCaptchaService:
     async def release_token_browsers(
         self, token_id: Optional[int], reason: str = "token_relogin"
     ) -> None:
-        for browser in list(self._browsers.values()):
-            if (
-                token_id is None
-                or getattr(browser, "_shared_bound_token_id", None) == int(token_id)
-            ):
-                try:
-                    await browser.recycle_browser(reason=reason, rotate_profile=False)
-                except Exception:
-                    pass
+        normalized_token = (
+            CamoufoxWorker._normalize_token_key(token_id)
+            if token_id is not None
+            else None
+        )
+        async with self._browsers_lock:
+            candidates = list(self._browsers.items())
 
+        for slot_id, browser in candidates:
+            reserved = False
+            should_recycle = False
+            wait_deadline = time.monotonic() + 15.0
+            try:
+                async with self._slot_condition:
+                    while not self._closed and self._is_slot_busy_for_allocation(slot_id):
+                        remaining = wait_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                self._slot_condition.wait(), remaining
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                    bound_token = self._slot_bound_token_id(slot_id)
+                    has_matching_req = any(
+                        r.slot_id == slot_id
+                        and (
+                            normalized_token is None
+                            or CamoufoxWorker._normalize_token_key(r.token_id)
+                            == normalized_token
+                        )
+                        for r in self._requests.values()
+                    )
+                    if (
+                        normalized_token is None
+                        or bound_token == normalized_token
+                        or has_matching_req
+                    ):
+                        self._reserve_slot_locked(slot_id)
+                        reserved = True
+                        should_recycle = True
+                        for ref, req in list(self._requests.items()):
+                            if req.slot_id == slot_id and (
+                                normalized_token is None
+                                or CamoufoxWorker._normalize_token_key(req.token_id)
+                                == normalized_token
+                            ):
+                                self._requests.pop(ref, None)
+                                if req.owner and req.owner_callback:
+                                    try:
+                                        req.owner.remove_done_callback(
+                                            req.owner_callback
+                                        )
+                                    except Exception:
+                                        pass
+                if should_recycle:
+                    try:
+                        await browser.recycle_browser(
+                            reason=reason, rotate_profile=False
+                        )
+                    except Exception:
+                        pass
+            finally:
+                if reserved:
+                    await self._release_slot_reservation(slot_id)
     def get_stats(self):
         now = time.monotonic()
         states = []
@@ -1105,7 +1189,10 @@ class BrowserCaptchaService:
             state = self._slot_recovery.get(slot_id, _SlotRecovery())
             active_count = sum(r.slot_id == slot_id for r in self._requests.values())
             busy = (
-                active_count
+                any(
+                    r.slot_id == slot_id and r.in_browser_op
+                    for r in self._requests.values()
+                )
                 or self._slot_reservations.get(slot_id, 0)
                 or bool(
                     self._browsers.get(slot_id) and self._browsers[slot_id].is_busy()

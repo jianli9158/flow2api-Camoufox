@@ -145,8 +145,14 @@ class ProtocolLogin:
         from ..core.config import config
 
         use_camoufox = (
-            str(getattr(config, "captcha_method", "") or "").lower() == "browser"
-            and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox").lower() == "camoufox"
+            str(getattr(config, "captcha_method", "") or "").strip().lower()
+            in {"browser", "camoufox"}
+            and str(
+                getattr(config, "browser_captcha_engine", "camoufox") or "camoufox"
+            )
+            .strip()
+            .lower()
+            == "camoufox"
         )
         session_kwargs: Dict[str, Any] = {
             "impersonate": "firefox" if use_camoufox else IMPERSONATE,

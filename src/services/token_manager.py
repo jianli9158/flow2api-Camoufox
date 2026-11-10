@@ -914,31 +914,45 @@ class TokenManager:
                 # Legacy access-token refreshes do not return a Cookie snapshot.
                 await self.db.update_token(token_id, at=new_at, at_expires=new_at_expires)
 
-            # 验证 AT 有效性：通过 get_credits 测试
+            # 验证 AT 有效性：若 st_to_at 已完成余额校验则直接复用，避免重复 nzlxg RPC
             credits_result = None
-            try:
-                credits_result = await (
-                    self._get_credits_for_token(verification_token, new_at)
-                    if verification_token is not None
-                    else self.flow_client.get_credits(new_at)
-                )
-            except Exception as verify_err:
-                # AT 验证失败（可能返回 401），说明 ST 已过期
-                error_msg = str(verify_err)
-                if "401" in error_msg or "UNAUTHENTICATED" in error_msg:
-                    debug_logger.log_warning(
-                        f"[AT_REFRESH] Token {token_id}: AT 验证失败 (401)，ST 可能已过期"
+            if isinstance(result, dict) and isinstance(
+                result.get("_credits_result"), dict
+            ):
+                credits_result = result["_credits_result"]
+            elif (
+                isinstance(result, dict)
+                and "credits" in result
+                and "user_paygate_tier" in result
+            ):
+                credits_result = {
+                    "credits": result["credits"],
+                    "userPaygateTier": result.get("user_paygate_tier"),
+                }
+            else:
+                try:
+                    credits_result = await (
+                        self._get_credits_for_token(verification_token, new_at)
+                        if verification_token is not None
+                        else self.flow_client.get_credits(new_at)
                     )
-                    self._last_at_refresh_error[token_id] = (
-                        f"AT 验证失败 (401 UNAUTHENTICATED): {error_msg}"
-                    )
-                    record_token_refresh("at", "failure")
-                    return False
-                else:
-                    # 其他错误（如网络问题），仍视为成功
-                    debug_logger.log_warning(
-                        f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {error_msg}"
-                    )
+                except Exception as verify_err:
+                    # AT 验证失败（可能返回 401），说明 ST 已过期
+                    error_msg = str(verify_err)
+                    if "401" in error_msg or "UNAUTHENTICATED" in error_msg:
+                        debug_logger.log_warning(
+                            f"[AT_REFRESH] Token {token_id}: AT 验证失败 (401)，ST 可能已过期"
+                        )
+                        self._last_at_refresh_error[token_id] = (
+                            f"AT 验证失败 (401 UNAUTHENTICATED): {error_msg}"
+                        )
+                        record_token_refresh("at", "failure")
+                        return False
+                    else:
+                        # 其他错误（如网络问题），仍视为成功
+                        debug_logger.log_warning(
+                            f"[AT_REFRESH] Token {token_id}: AT 验证时发生非认证错误: {error_msg}"
+                        )
 
             if rotated_cookies:
                 from .browser_cookie_utils import validate_flow_cookie_storage

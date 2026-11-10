@@ -2,10 +2,13 @@
 
 import asyncio
 import hashlib
+import hmac
 import importlib
+import os
 import sys
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -47,9 +50,16 @@ db: Database = None
 concurrency_manager: Optional[ConcurrencyManager] = None
 captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 
-# Store active admin session tokens (in production, use Redis or database)
+# Store active admin session tokens (kept for backward compatibility) + signed 24h tokens
 active_admin_tokens = set()
+revoked_admin_tokens: Dict[str, float] = {}
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
+ADMIN_SESSION_TTL_SECONDS = 86400
+_ADMIN_SESSION_SECRET_PATH = (
+    Path(__file__).resolve().parent.parent.parent / "data" / ".session_secret"
+)
+_FALLBACK_PROCESS_SECRET = secrets.token_bytes(32)
+_ADMIN_SESSION_SECRET: Optional[bytes] = None
 # 历史版本曾把「账号邮箱与 Cookie 不匹配」当作失败原因写进 last_st_refresh_result。
 # 现在邮箱一律以 Flow 页面为准自动更正，这类旧记录不再回显给前端。
 _LEGACY_IDENTITY_ERROR_MARKERS = (
@@ -450,6 +460,111 @@ class PluginTokenUpdateRequest(BaseModel):
 # ========== Auth Middleware ==========
 
 
+def _get_admin_session_secret() -> bytes:
+    global _ADMIN_SESSION_SECRET
+    if _ADMIN_SESSION_SECRET is not None:
+        return _ADMIN_SESSION_SECRET
+
+    try:
+        _ADMIN_SESSION_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _ADMIN_SESSION_SECRET_PATH.is_file():
+            raw = _ADMIN_SESSION_SECRET_PATH.read_text(encoding="utf-8").strip()
+            if len(raw) >= 32:
+                try:
+                    os.chmod(_ADMIN_SESSION_SECRET_PATH, 0o600)
+                except OSError:
+                    pass
+                _ADMIN_SESSION_SECRET = raw.encode("utf-8")
+                return _ADMIN_SESSION_SECRET
+
+        generated = secrets.token_hex(32)
+        try:
+            fd = os.open(
+                str(_ADMIN_SESSION_SECRET_PATH),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as secret_file:
+                secret_file.write(generated)
+            _ADMIN_SESSION_SECRET = generated.encode("utf-8")
+            return _ADMIN_SESSION_SECRET
+        except FileExistsError:
+            raw = _ADMIN_SESSION_SECRET_PATH.read_text(encoding="utf-8").strip()
+            if raw:
+                _ADMIN_SESSION_SECRET = raw.encode("utf-8")
+                return _ADMIN_SESSION_SECRET
+    except Exception:
+        pass
+
+    _ADMIN_SESSION_SECRET = _FALLBACK_PROCESS_SECRET
+    return _ADMIN_SESSION_SECRET
+
+
+def _rotate_admin_session_secret() -> None:
+    global _ADMIN_SESSION_SECRET, _FALLBACK_PROCESS_SECRET
+    new_hex = secrets.token_hex(32)
+    _FALLBACK_PROCESS_SECRET = new_hex.encode("utf-8")
+    _ADMIN_SESSION_SECRET = _FALLBACK_PROCESS_SECRET
+    try:
+        _ADMIN_SESSION_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = _ADMIN_SESSION_SECRET_PATH.with_suffix(".tmp")
+        fd = os.open(
+            str(tmp_path),
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as secret_file:
+            secret_file.write(new_hex)
+        os.replace(str(tmp_path), str(_ADMIN_SESSION_SECRET_PATH))
+        try:
+            os.chmod(_ADMIN_SESSION_SECRET_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        pass
+
+
+def _prune_revoked_admin_tokens(now: Optional[float] = None) -> None:
+    ts = time.time() if now is None else now
+    expired = [tok for tok, exp in revoked_admin_tokens.items() if exp <= ts]
+    for tok in expired:
+        revoked_admin_tokens.pop(tok, None)
+
+
+def _extract_admin_token_expiry(token: str, default_exp: float) -> float:
+    parts = token.split(".")
+    if len(parts) == 3:
+        try:
+            return float(int(parts[0]))
+        except ValueError:
+            pass
+    return default_exp
+
+
+def _create_signed_admin_token(ttl_seconds: int = ADMIN_SESSION_TTL_SECONDS) -> str:
+    exp_ts = int(time.time()) + int(ttl_seconds)
+    nonce = secrets.token_urlsafe(24)
+    payload = f"{exp_ts}.{nonce}"
+    sig = hmac.new(
+        _get_admin_session_secret(),
+        payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{payload}.{sig}"
+
+
+def _revoke_admin_session_token(token: Optional[str]) -> None:
+    normalized = str(token or "").strip()
+    if not normalized:
+        return
+    now = time.time()
+    _prune_revoked_admin_tokens(now)
+    exp_ts = _extract_admin_token_expiry(normalized, now + ADMIN_SESSION_TTL_SECONDS)
+    if exp_ts > now:
+        revoked_admin_tokens[normalized] = exp_ts
+    active_admin_tokens.discard(normalized)
+
+
 async def verify_admin_token(request: Request, authorization: str = Header(None)):
     """Verify admin session token (NOT API key)"""
     header_token = ""
@@ -458,10 +573,10 @@ async def verify_admin_token(request: Request, authorization: str = Header(None)
 
     cookie_token = get_admin_token_from_cookie(request) or ""
 
-    if header_token and header_token in active_admin_tokens:
+    if header_token and is_admin_session_token_valid(header_token):
         return header_token
 
-    if cookie_token and cookie_token in active_admin_tokens:
+    if cookie_token and is_admin_session_token_valid(cookie_token):
         return cookie_token
 
     if header_token or cookie_token:
@@ -477,7 +592,34 @@ def get_admin_token_from_cookie(request: Request) -> Optional[str]:
 
 def is_admin_session_token_valid(token: Optional[str]) -> bool:
     normalized = str(token or "").strip()
-    return bool(normalized) and normalized in active_admin_tokens
+    if not normalized:
+        return False
+
+    now = time.time()
+    _prune_revoked_admin_tokens(now)
+    if normalized in revoked_admin_tokens:
+        return False
+
+    parts = normalized.split(".")
+    if len(parts) == 3:
+        exp_str, nonce, sig = parts
+        if not nonce or not sig:
+            return False
+        try:
+            exp_ts = int(exp_str)
+        except ValueError:
+            return False
+        if exp_ts <= now:
+            active_admin_tokens.discard(normalized)
+            return False
+        expected_sig = hmac.new(
+            _get_admin_session_secret(),
+            f"{exp_str}.{nonce}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(sig, expected_sig)
+
+    return normalized in active_admin_tokens
 
 
 # ========== Auth Endpoints ==========
@@ -486,20 +628,40 @@ def is_admin_session_token_valid(token: Optional[str]) -> bool:
 @router.post("/api/admin/login")
 async def admin_login(request: LoginRequest, response: Response):
     """Admin login - returns session token (NOT API key)"""
-    admin_config = await db.get_admin_config()
+    admin_config = await db.get_admin_config() if db else None
+    stored_username = admin_config.username if admin_config else config.admin_username
+    stored_password = (
+        admin_config.password
+        if (admin_config and config._admin_password is None)
+        else config.admin_password
+    )
 
-    if not AuthManager.verify_admin(request.username, request.password):
+    username_ok = bool(
+        request.username is not None
+        and stored_username is not None
+        and hmac.compare_digest(
+            request.username.encode("utf-8"),
+            stored_username.encode("utf-8"),
+        )
+    )
+    password_ok = await asyncio.to_thread(
+        AuthManager.verify_admin_password,
+        request.password,
+        stored_password,
+    )
+    if not (username_ok and password_ok):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Generate independent session token
-    session_token = f"admin-{secrets.token_urlsafe(32)}"
+    # Generate HMAC-SHA256 signed session token with 24h TTL
+    session_token = _create_signed_admin_token()
 
-    # Store in active tokens
+    # Store in active tokens for backward compatibility
     active_admin_tokens.add(session_token)
 
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
         value=session_token,
+        max_age=ADMIN_SESSION_TTL_SECONDS,
         httponly=True,
         samesite="lax",
         secure=False,
@@ -509,14 +671,14 @@ async def admin_login(request: LoginRequest, response: Response):
     return {
         "success": True,
         "token": session_token,  # Session token (NOT API key)
-        "username": admin_config.username,
+        "username": stored_username,
     }
 
 
 @router.post("/api/admin/logout")
 async def admin_logout(response: Response, token: str = Depends(verify_admin_token)):
     """Admin logout - invalidate session token"""
-    active_admin_tokens.discard(token)
+    _revoke_admin_session_token(token)
     response.delete_cookie(ADMIN_SESSION_COOKIE_NAME, path="/")
     return {"success": True, "message": "退出登录成功"}
 
@@ -526,24 +688,44 @@ async def change_password(
     request: ChangePasswordRequest, token: str = Depends(verify_admin_token)
 ):
     """Change admin password"""
-    admin_config = await db.get_admin_config()
+    admin_config = await db.get_admin_config() if db else None
+    stored_password = (
+        admin_config.password
+        if (admin_config and config._admin_password is None)
+        else config.admin_password
+    )
 
-    # Verify old password
-    if not AuthManager.verify_admin(admin_config.username, request.old_password):
+    # Verify old password without blocking event loop
+    old_password_ok = await asyncio.to_thread(
+        AuthManager.verify_admin_password,
+        request.old_password,
+        stored_password,
+    )
+    if not old_password_ok:
         raise HTTPException(status_code=400, detail="旧密码错误")
 
-    # Update password and username in database
-    update_params = {"password": request.new_password}
+    # Hash new password with bcrypt in worker thread before persisting
+    hashed_password = await asyncio.to_thread(
+        AuthManager.hash_password, request.new_password
+    )
+    update_params = {"password": hashed_password}
     if request.username:
         update_params["username"] = request.username
 
     await db.update_admin_config(**update_params)
 
     # 🔥 Hot reload: sync database config to memory
+    config.set_admin_password_from_db(hashed_password)
+    if request.username:
+        config.set_admin_username_from_db(request.username)
     await db.reload_config_to_memory()
 
     # 🔑 Invalidate all admin session tokens (force re-login for security)
+    for existing_tok in list(active_admin_tokens):
+        _revoke_admin_session_token(existing_tok)
+    _revoke_admin_session_token(token)
     active_admin_tokens.clear()
+    _rotate_admin_session_secret()
 
     return {"success": True, "message": "密码修改成功,请重新登录"}
 
@@ -608,7 +790,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
         "login_account": row.get("login_account") or "",
-        "login_password": row.get("login_password") or "",
+        "login_password": "********" if row.get("login_password") else "",
         "proxy_url": row.get("proxy_url") or "",
         "auto_refresh_enabled": bool(row.get("auto_refresh_enabled", True)),
         "refresh_interval_minutes": row.get("refresh_interval_minutes") or 30,
@@ -742,7 +924,11 @@ async def update_token(
             protocol_mode=request.protocol_mode,
             google_cookies=request.google_cookies,
             login_account=request.login_account,
-            login_password=request.login_password,
+            login_password=(
+                None
+                if request.login_password == "********"
+                else request.login_password
+            ),
             proxy_url=request.proxy_url,
             auto_refresh_enabled=request.auto_refresh_enabled,
             refresh_interval_minutes=request.refresh_interval_minutes,
@@ -1284,6 +1470,16 @@ async def browser_login_liveview_ws(websocket: WebSocket, session_id: str):
     """WebSocket 实时画面流与键鼠转发 (对齐 AIStudio2API LiveView)。"""
     from ..services.camoufox_bidi import CamoufoxLoginManager
 
+    await websocket.accept()
+
+    origin = (websocket.headers.get("origin") or "").strip()
+    if origin:
+        origin_host = urlparse(origin).netloc.lower()
+        request_host = (websocket.headers.get("host") or "").strip().lower()
+        if not origin_host or origin_host != request_host:
+            await websocket.close(code=4401)
+            return
+
     query_token = (websocket.query_params.get("token") or "").strip()
     cookie_token = (websocket.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
     if not (
@@ -1297,8 +1493,6 @@ async def browser_login_liveview_ws(websocket: WebSocket, session_id: str):
     if session is None:
         await websocket.close(code=4404)
         return
-
-    await websocket.accept()
     last_status = ""
     last_frame_seq = -1
     last_dialog_seq = -1

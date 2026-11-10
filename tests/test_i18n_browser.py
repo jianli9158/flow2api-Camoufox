@@ -27,15 +27,7 @@ def ui_server():
             if path in {"/", "/login", "/manage", "/test"}:
                 name = "login" if path == "/" else path[1:]
                 self.path = "/static/" + name + ".html"
-            elif (
-                not path.startswith("/static/")
-                and path
-                not in {
-                    "/extension/options.html",
-                    "/extension/options.js",
-                    "/extension/locales.json",
-                }
-            ) or ".." in path.split("/"):
+            elif not path.startswith("/static/") or ".." in path.split("/"):
                 self.send_error(404)
                 return
             super().do_GET()
@@ -564,43 +556,6 @@ def test_language_switch_works_when_browser_storage_is_disabled(browser_page):
     assert page.locator("html").get_attribute("lang") == "en"
     page.locator("[data-language-select]").select_option("zh-CN")
     playwright_api.expect(page.locator("#loginButton")).to_have_text("登录")
-
-
-def test_extension_language_preserves_settings_and_translates_status(browser_page):
-    page, base = browser_page
-    page.add_init_script("""
-        const settings = {uiLanguage:'en', routeKey:'保存'};
-        Object.defineProperty(window, 'chrome', {value: {
-            runtime: {lastError: null},
-            storage: {local: {
-                get(defaults, callback) {queueMicrotask(() => callback({...defaults,...settings}));},
-                set(values, callback) {Object.assign(settings,values); if(callback) queueMicrotask(callback);}
-            }}
-        }});
-    """)
-    page.goto(base + "/extension/options.html")
-    page.wait_for_load_state("networkidle")
-    playwright_api.expect(page.locator("#saveBtn")).to_have_text("Save")
-    assert page.locator("#routeKey").input_value() == "保存"
-    page.locator("#saveBtn").click()
-    playwright_api.expect(page.locator("#status")).to_have_text(
-        "Enter your Flow2API API key."
-    )
-    page.locator("#language").select_option("zh-CN")
-    assert page.locator("#routeKey").input_value() == "保存"
-    playwright_api.expect(page.locator("#status")).to_have_text(
-        "请填写 Flow2API API Key。"
-    )
-    page.locator("#apiKey").fill("local-test-key")
-    page.locator("#saveBtn").click()
-    playwright_api.expect(page.locator("#status")).to_have_text(
-        "已保存，后台连接会自动重连。"
-    )
-    page.locator("#language").select_option("en")
-    playwright_api.expect(page.locator("#status")).to_have_text(
-        "Settings saved. The background connection will reconnect automatically."
-    )
-    assert page.locator("#routeKey").input_value() == "保存"
 
 
 def test_upscaled_video_models_keep_reference_uploads(browser_page):

@@ -509,7 +509,7 @@ class FlowRpcCookieTests(unittest.IsolatedAsyncioTestCase):
                         self.assertIn(f"OSID={current}", stored)
                         payload["google_cookies"] = tokens[0].google_cookies
 
-    async def test_scheduled_fallback_persists_rotations_from_both_validation_rpcs(
+    async def test_scheduled_fallback_persists_rotations_from_validation_rpc(
         self,
     ):
         current = "session-old"
@@ -549,7 +549,7 @@ class FlowRpcCookieTests(unittest.IsolatedAsyncioTestCase):
                 f"OSID={current}", serialize_cookie_header_for_url(saved.google_cookies)
             )
             self.assertEqual(saved.last_st_refresh_result, "success")
-            self.assertEqual(len(self.requests), 4)
+            self.assertEqual(len(self.requests), 2)
             fresh_request = contextvars.Context().run(
                 asyncio.create_task,
                 self.client.get_credits(

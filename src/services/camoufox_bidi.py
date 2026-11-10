@@ -583,8 +583,9 @@ def load_or_create_account_camoufox_config(
     if fp_path.is_file():
         try:
             saved = json.loads(fp_path.read_text(encoding="utf-8"))
-            cfg = saved.get("config")
-            if isinstance(cfg, dict) and cfg:
+            raw_cfg = saved.get("config")
+            if isinstance(raw_cfg, dict) and raw_cfg:
+                cfg = dict(raw_cfg)
                 version_str = f"{ff_version}.0"
                 if saved.get("firefox_version") != ff_version:
                     for key in (
@@ -605,9 +606,10 @@ def load_or_create_account_camoufox_config(
                     "timezone": timezone,
                     "config": cfg,
                 }
-                fp_path.write_text(
-                    json.dumps(saved_payload, ensure_ascii=False), encoding="utf-8"
-                )
+                if saved != saved_payload:
+                    fp_path.write_text(
+                        json.dumps(saved_payload, ensure_ascii=False), encoding="utf-8"
+                    )
                 return cfg
         except Exception as exc:
             debug_logger.log_warning(
@@ -851,6 +853,8 @@ class LocalSocks5Relay:
             else f"http://{self.upstream_proxy_url}"
         )
         self._server: Optional[asyncio.AbstractServer] = None
+        self._client_tasks: Set[asyncio.Task] = set()
+        self._client_writers: Set[asyncio.StreamWriter] = set()
         self.host = "127.0.0.1"
         self.port = 0
 
@@ -871,10 +875,28 @@ class LocalSocks5Relay:
             except Exception:
                 pass
             self._server = None
+        writers = list(self._client_writers)
+        self._client_writers.clear()
+        for w in writers:
+            try:
+                w.close()
+            except Exception:
+                pass
+        tasks = list(self._client_tasks)
+        self._client_tasks.clear()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._client_tasks.add(current_task)
+        self._client_writers.add(writer)
         upstream_writer: Optional[asyncio.StreamWriter] = None
         try:
             header = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
@@ -920,9 +942,9 @@ class LocalSocks5Relay:
             upstream_reader, upstream_writer = await self._dial_upstream(
                 target_host, target_port
             )
+            self._client_writers.add(upstream_writer)
             writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
             await writer.drain()
-
             async def _pipe(
                 r: asyncio.StreamReader, w: asyncio.StreamWriter
             ) -> None:
@@ -951,8 +973,11 @@ class LocalSocks5Relay:
             except Exception:
                 pass
         finally:
+            if current_task is not None:
+                self._client_tasks.discard(current_task)
             for w in (upstream_writer, writer):
                 if w is not None:
+                    self._client_writers.discard(w)
                     try:
                         w.close()
                     except Exception:
@@ -1013,12 +1038,12 @@ class LocalSocks5Relay:
                     )
                 atyp = conn_resp[3]
                 if atyp == 1:
-                    await reader.readexactly(6)
+                    await asyncio.wait_for(reader.readexactly(6), timeout=15.0)
                 elif atyp == 4:
-                    await reader.readexactly(18)
+                    await asyncio.wait_for(reader.readexactly(18), timeout=15.0)
                 elif atyp == 3:
-                    ln = (await reader.readexactly(1))[0]
-                    await reader.readexactly(ln + 2)
+                    ln = (await asyncio.wait_for(reader.readexactly(1), timeout=15.0))[0]
+                    await asyncio.wait_for(reader.readexactly(ln + 2), timeout=15.0)
                 return reader, writer
 
             # HTTP CONNECT proxy
@@ -1541,51 +1566,23 @@ def write_camoufox_user_js(
         except Exception:
             pass
 
+def _start_stdout_drain(
+    proc: Optional[asyncio.subprocess.Process],
+) -> Optional[asyncio.Task]:
+    """Continuously drain subprocess stdout after BiDi startup to avoid 64KB OS pipe buffer deadlocks."""
+    if proc is None or proc.stdout is None:
+        return None
 
-# ============================================================================
-# 6. In-Page Protected Pump & Flow Batchexecute/StreamChat Scripts
-# ============================================================================
+    async def _drain() -> None:
+        try:
+            while proc.stdout is not None:
+                chunk = await proc.stdout.read(8192)
+                if not chunk:
+                    break
+        except Exception:
+            pass
 
-# Installed in the Flow tab's main world: captures trusted user-activation gestures
-# and provides `window.__flow2apiProtectedSend` + `window.__flow2apiExecuteRpc`
-FLOW_PROTECTED_PUMP_SOURCE = r"""
-(() => {
-    if (window.__flow2apiProtectedRuntimeInstalled) return true;
-    const state = {
-        grants: 0,
-        queue: [],
-        waking: false,
-        wake() {
-            if (state.waking || state.grants <= 0 || state.queue.length === 0) return;
-            state.waking = true;
-            setTimeout(() => {
-                state.waking = false;
-                while (state.grants > 0 && state.queue.length > 0) {
-                    state.grants--;
-                    const run = state.queue.shift();
-                    try { run(); } catch (_) {}
-                }
-            }, 0);
-        }
-    };
-
-    window.addEventListener('keydown', (event) => {
-        if (!event.isTrusted) return;
-        if (event.key === '?' || event.key === 'Shift') {
-            event.preventDefault();
-            event.stopImmediatePropagation();
-        }
-        state.grants = 64;
-        state.wake();
-    }, true);
-
-    Object.defineProperty(window, '__flow2apiProtectedRuntimeInstalled', {
-        value: state,
-        configurable: false
-    });
-    return true;
-})()
-"""
+    return asyncio.create_task(_drain())
 
 
 # ============================================================================
@@ -1609,13 +1606,14 @@ class CamoufoxWorker:
         self._shared_browser_lock = asyncio.Lock()
         self._frame_lock = asyncio.Lock()
         self._frame_boosts = 0
+        self._frame_divisor_set_to_1: bool = False
 
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._stdout_drain_task: Optional[asyncio.Task] = None
         self._bidi: Optional[BiDiClient] = None
         self._context_id: Optional[str] = None
         self._relay: Optional[LocalSocks5Relay] = None
         self._profile_dir: Optional[Path] = None
-
         self._shared_browser_pid: Optional[int] = None
         self._shared_proxy_url: Optional[str] = None
         self._shared_bound_token_id: Optional[int] = None
@@ -1719,10 +1717,6 @@ class CamoufoxWorker:
                     return await self._bidi.evaluate(win_ctx, expression)
         return None
 
-    async def _set_tab_render_layers(self, enabled: bool) -> None:
-        _ = enabled
-        return
-
     @asynccontextmanager
     async def _boost_frames(self):
         """Ensure Camoufox frame rate is at 60fps during interactive operations without polluting prefs.js with 1fps."""
@@ -1730,11 +1724,12 @@ class CamoufoxWorker:
             yield
             return
         async with self._frame_lock:
-            if self._frame_boosts == 0:
+            if self._frame_boosts == 0 and not self._frame_divisor_set_to_1:
                 try:
                     await self._chrome_evaluate(
                         "Services.prefs.setIntPref('gfx.display.frame-rate-divisor', 1)"
                     )
+                    self._frame_divisor_set_to_1 = True
                 except Exception:
                     pass
             self._frame_boosts += 1
@@ -1743,7 +1738,6 @@ class CamoufoxWorker:
         finally:
             async with self._frame_lock:
                 self._frame_boosts = max(0, self._frame_boosts - 1)
-
     def _resolve_account_dir(self, token_id: Optional[int]) -> Path:
         """Resolve the shared account directory `browser_data_rt/token_<id>` so LoginSession and Worker share identical fingerprint, cache, and Firefox profile."""
         if re.match(r"^browser_\d+$", self.user_data_dir.name):
@@ -1784,115 +1778,167 @@ class CamoufoxWorker:
             account_dir, CAMOUFOX_FIREFOX_MAJOR, "en-US", "America/New_York"
         )
 
-        # Start local SOCKS5 relay if upstream proxy has credentials or is SOCKS5
-        relay_addr: Optional[Tuple[str, int]] = None
-        if raw_proxy_url:
-            parsed_proxy = urlparse(raw_proxy_url)
-            if parsed_proxy.username or parsed_proxy.password or "socks" in (
-                parsed_proxy.scheme or ""
-            ).lower():
-                self._relay = LocalSocks5Relay(raw_proxy_url)
-                relay_addr = await self._relay.start()
-
-        if token_id:
-            profile_dir = account_dir / "firefox-profile"
-            profile_dir.mkdir(parents=True, exist_ok=True)
-            _clear_stale_firefox_profile_locks(profile_dir)
-            self._is_persistent_profile = True
-        else:
-            profile_dir = Path(
-                tempfile.mkdtemp(prefix=f"flow2api-camoufox-{self.token_id}-")
-            )
-            self._is_persistent_profile = False
-        self._profile_dir = profile_dir
-        self._account_dir = account_dir
-        self._warmed_projects.clear()
-        pass
-        cache_dir = account_dir / "camoufox-cache"
-        # Headless by default (like AIStudio2API Worker), unless explicitly disabled
-        self._headless = bool(
-            os.environ.get("CAMOUFOX_HEADLESS", "1").strip() not in ("0", "false", "False")
-        )
-        write_camoufox_user_js(
-            profile_dir,
-            fp_config,
-            proxy_url=raw_proxy_url,
-            relay_addr=relay_addr,
-            headless=self._headless,
-            live_view=False,
-            cache_dir=cache_dir,
-            executable_path=exe_path,
-        )
-
-        args = [exe_path]
-        if self._headless:
-            args.append("--headless")
-        args.extend(["--remote-debugging-port=0", "-wait-for-browser", "-profile", str(profile_dir)])
-
-        env = build_camoufox_env(
-            fp_config,
-            headless=self._headless,
-            live_view=False,
-            profile_dir=profile_dir,
-            executable_path=exe_path,
-        )
-        self._process = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-        )
-        self._shared_browser_pid = self._process.pid
-
-        # Wait for `WebDriver BiDi listening on ws://...`
-        endpoint = await self._wait_for_bidi_endpoint(
-            self._process, timeout=45.0
-        )
-        self._bidi = await BiDiClient.connect(endpoint, timeout=30.0)
-        await self._bidi.command("session.new", {"capabilities": {}})
         try:
-            await self._bidi.command(
-                "session.subscribe", {"events": ["script.message"]}
+            # Start local SOCKS5 relay if upstream proxy has credentials or is SOCKS5
+            relay_addr: Optional[Tuple[str, int]] = None
+            if raw_proxy_url:
+                parsed_proxy = urlparse(raw_proxy_url)
+                if parsed_proxy.username or parsed_proxy.password or "socks" in (
+                    parsed_proxy.scheme or ""
+                ).lower():
+                    self._relay = LocalSocks5Relay(raw_proxy_url)
+                    relay_addr = await self._relay.start()
+
+            if token_id:
+                profile_dir = account_dir / "firefox-profile"
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                _clear_stale_firefox_profile_locks(profile_dir)
+                self._is_persistent_profile = True
+            else:
+                profile_dir = Path(
+                    tempfile.mkdtemp(prefix=f"flow2api-camoufox-{self.token_id}-")
+                )
+                self._is_persistent_profile = False
+            self._profile_dir = profile_dir
+            self._account_dir = account_dir
+            self._warmed_projects.clear()
+            self._frame_divisor_set_to_1 = False
+            cache_dir = account_dir / "camoufox-cache"
+            # Headless by default (like AIStudio2API Worker), unless explicitly disabled
+            self._headless = bool(
+                os.environ.get("CAMOUFOX_HEADLESS", "1").strip() not in ("0", "false", "False")
             )
-        except Exception:
-            pass
-        pass
+            write_camoufox_user_js(
+                profile_dir,
+                fp_config,
+                proxy_url=raw_proxy_url,
+                relay_addr=relay_addr,
+                headless=self._headless,
+                live_view=False,
+                cache_dir=cache_dir,
+                executable_path=exe_path,
+            )
 
-        tree = await self._bidi.command(
-            "browsingContext.getTree", {"maxDepth": 0}
-        )
-        contexts = tree.get("contexts") or []
-        if not contexts or not isinstance(contexts[0], dict):
-            raise RuntimeError("Camoufox BiDi 未返回初始标签页")
-        self._context_id = str(contexts[0].get("context") or "")
-        if not self._context_id:
-            raise RuntimeError("Camoufox BiDi 初始 context ID 为空")
+            args = [exe_path]
+            if self._headless:
+                args.append("--headless")
+            args.extend(["--remote-debugging-port=0", "-wait-for-browser", "-profile", str(profile_dir)])
 
-        ua = str(
-            fp_config.get("navigator.userAgent")
-            or fp_config.get("headers.User-Agent")
-            or ""
-        )
-        accept_lang = str(
-            fp_config.get("headers.Accept-Language") or "en-US,en;q=0.9"
-        )
-        self._last_fingerprint = {
-            "user_agent": ua,
-            "accept_language": accept_lang,
-            "proxy_url": raw_proxy_url,
-            "platform": str(fp_config.get("navigator.platform") or "Win32"),
-            "language": str(fp_config.get("navigator.language") or "en-US"),
-            "languages": list(
-                fp_config.get("navigator.languages") or ["en-US", "en"]
-            ),
-            "timezone": str(fp_config.get("timezone") or "America/New_York"),
-        }
-        self._shared_proxy_url = raw_proxy_url
-        self._shared_launch_count += 1
-        self._shared_reuse_count = 0
-        debug_logger.log_info(
-            f"[Camoufox] Slot-{self.token_id} 进程已启动 (PID={self._shared_browser_pid}, BiDi={endpoint}, UA={ua[:80]})"
-        )
+            env = build_camoufox_env(
+                fp_config,
+                headless=self._headless,
+                live_view=False,
+                profile_dir=profile_dir,
+                executable_path=exe_path,
+            )
+            self._process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=env,
+            )
+            self._shared_browser_pid = self._process.pid
+
+            # Wait for `WebDriver BiDi listening on ws://...`
+            endpoint = await self._wait_for_bidi_endpoint(
+                self._process, timeout=45.0
+            )
+            self._stdout_drain_task = self._start_stdout_drain(self._process)
+            self._bidi = await BiDiClient.connect(endpoint, timeout=30.0)
+            await self._bidi.command("session.new", {"capabilities": {}})
+            try:
+                await self._bidi.command(
+                    "session.subscribe", {"events": ["script.message"]}
+                )
+            except Exception:
+                pass
+
+            tree = await self._bidi.command(
+                "browsingContext.getTree", {"maxDepth": 0}
+            )
+            contexts = tree.get("contexts") or []
+            if not contexts or not isinstance(contexts[0], dict):
+                raise RuntimeError("Camoufox BiDi 未返回初始标签页")
+            self._context_id = str(contexts[0].get("context") or "")
+            if not self._context_id:
+                raise RuntimeError("Camoufox BiDi 初始 context ID 为空")
+
+            ua = str(
+                fp_config.get("navigator.userAgent")
+                or fp_config.get("headers.User-Agent")
+                or ""
+            )
+            accept_lang = str(
+                fp_config.get("headers.Accept-Language") or "en-US,en;q=0.9"
+            )
+            self._last_fingerprint = {
+                "user_agent": ua,
+                "accept_language": accept_lang,
+                "proxy_url": raw_proxy_url,
+                "platform": str(fp_config.get("navigator.platform") or "Win32"),
+                "language": str(fp_config.get("navigator.language") or "en-US"),
+                "languages": list(
+                    fp_config.get("navigator.languages") or ["en-US", "en"]
+                ),
+                "timezone": str(fp_config.get("timezone") or "America/New_York"),
+            }
+            self._shared_proxy_url = raw_proxy_url
+            self._shared_launch_count += 1
+            self._shared_reuse_count = 0
+            debug_logger.log_info(
+                f"[Camoufox] Slot-{self.token_id} 进程已启动 (PID={self._shared_browser_pid}, BiDi={endpoint}, UA={ua[:80]})"
+            )
+        except BaseException:
+            drain_task = self._stdout_drain_task
+            proc = self._process
+            bidi = self._bidi
+            relay = self._relay
+            profile_dir_cleanup = self._profile_dir
+            self._stdout_drain_task = None
+            self._process = None
+            self._bidi = None
+            self._context_id = None
+            self._relay = None
+            self._profile_dir = None
+            self._shared_browser_pid = None
+            if drain_task is not None and not drain_task.done():
+                drain_task.cancel()
+            if bidi is not None:
+                try:
+                    await bidi.close()
+                except Exception:
+                    pass
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=3.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    except Exception:
+                        pass
+            if relay is not None:
+                try:
+                    await relay.close()
+                except Exception:
+                    pass
+            if (
+                profile_dir_cleanup is not None
+                and profile_dir_cleanup.exists()
+                and not self._is_persistent_profile
+            ):
+                shutil.rmtree(profile_dir_cleanup, ignore_errors=True)
+            raise
+
+    @staticmethod
+    def _start_stdout_drain(
+        proc: asyncio.subprocess.Process,
+    ) -> Optional[asyncio.Task]:
+        return _start_stdout_drain(proc)
 
     @staticmethod
     async def _wait_for_bidi_endpoint(
@@ -2060,10 +2106,9 @@ class CamoufoxWorker:
             return None
         serialized = json.dumps(exported, ensure_ascii=False, separators=(",", ":"))
         new_sig = (
-            build_cookie_signature(serialized)
+            build_cookie_signature(serialized, default_url=FLOW_ORIGIN)
             or hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         )
-        self._shared_bound_cookie_signature = new_sig
 
         # Update storage-state.json in account_dir and shared token_<id> dir
         dirs_to_update: List[Path] = []
@@ -2074,6 +2119,17 @@ class CamoufoxWorker:
             shared_token_dir = self.user_data_dir.parent / f"token_{bound_id}"
             if shared_token_dir.exists() and shared_token_dir not in dirs_to_update:
                 dirs_to_update.append(shared_token_dir)
+
+        primary_ss_exists = bool(
+            dirs_to_update and (dirs_to_update[0] / "storage-state.json").is_file()
+        )
+        if (
+            new_sig
+            and new_sig == self._shared_bound_cookie_signature
+            and primary_ss_exists
+        ):
+            return serialized
+
         for d in dirs_to_update:
             ss_path = d / "storage-state.json"
             try:
@@ -2103,7 +2159,9 @@ class CamoufoxWorker:
                 debug_logger.log_warning(
                     f"[Camoufox] 同步 Token-{bound_id} 轮换 Cookie 到数据库失败: {exc}"
                 )
+        self._shared_bound_cookie_signature = new_sig
         return serialized
+
     async def _load_token_session_binding(
         self, token_id: Optional[int]
     ) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
@@ -2173,6 +2231,10 @@ class CamoufoxWorker:
         ):
             return True
 
+        prev_signature = self._shared_bound_cookie_signature
+        signature_refreshed = bool(
+            prev_signature is not None and prev_signature != cookie_signature
+        )
         if google_cookies:
             browser_cookies = build_browser_cookie_targets(
                 google_cookies,
@@ -2211,7 +2273,7 @@ class CamoufoxWorker:
                         pass
                 account_dir = getattr(self, "_account_dir", None)
                 has_native_session_cookies = False
-                if self._is_persistent_profile:
+                if self._is_persistent_profile and not signature_refreshed:
                     try:
                         existing_live = await self._export_live_google_cookies()
                         existing_names = {c.get("name") for c in existing_live}
@@ -2222,7 +2284,10 @@ class CamoufoxWorker:
                             has_native_session_cookies = True
                     except Exception:
                         pass
-                if not has_native_session_cookies:
+                if signature_refreshed:
+                    if browser_cookies:
+                        await self._install_cookies_via_bidi(browser_cookies)
+                elif not has_native_session_cookies:
                     ss_cookies_loaded = False
                     if isinstance(account_dir, Path):
                         ss_path = account_dir / "storage-state.json"
@@ -2303,6 +2368,7 @@ class CamoufoxWorker:
     ) -> None:
         _ = rotate_profile
         proc = self._process
+        drain_task = self._stdout_drain_task
         bidi = self._bidi
         relay = self._relay
         profile_dir = self._profile_dir
@@ -2324,6 +2390,7 @@ class CamoufoxWorker:
             except Exception:
                 pass
         self._process = None
+        self._stdout_drain_task = None
         self._bidi = None
         self._context_id = None
         self._relay = None
@@ -2333,9 +2400,13 @@ class CamoufoxWorker:
         self._shared_proxy_url = None
         self._shared_bound_token_id = None
         self._shared_bound_cookie_signature = None
+        self._frame_divisor_set_to_1 = False
         self._runtime_generation += 1
         self._consecutive_browser_failures = 0
         self._shared_reuse_count = 0
+
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
 
         if bidi is not None:
             try:
@@ -2365,7 +2436,7 @@ class CamoufoxWorker:
             await relay.close()
         if profile_dir is not None and profile_dir.exists():
             if account_dir is not None and account_dir.exists():
-                save_startup_cache(profile_dir, account_dir)
+                await asyncio.to_thread(save_startup_cache, profile_dir, account_dir)
             if self._is_persistent_profile:
                 _clear_stale_firefox_profile_locks(profile_dir)
             else:
@@ -2584,7 +2655,6 @@ class CamoufoxWorker:
         )
 
         async with self._boost_frames():
-            await self._set_tab_render_layers(True)
             if needs_nav:
                 try:
                     await self._bidi.command(
@@ -2614,7 +2684,8 @@ class CamoufoxWorker:
                     pass
                 await asyncio.sleep(0.3)
             # Verify we did not get redirected to signed-out /about or accounts.google.com
-            await asyncio.sleep(0.4)
+            if needs_nav:
+                await asyncio.sleep(0.4)
             try:
                 page_check = await self._bidi.evaluate(
                     context_id,
@@ -2686,18 +2757,8 @@ class CamoufoxWorker:
             except Exception:
                 pass
 
-            try:
-                await self._bidi.evaluate(
-                    context_id,
-                    FLOW_PROTECTED_PUMP_SOURCE,
-                    await_promise=False,
-                )
-            except Exception:
-                pass
-
             await self._dismiss_flow_overlays(context_id)
             await self._send_trusted_gesture(context_id)
-            await self._sync_live_cookies_to_db()
             ready = False
             for _ in range(30):
                 try:
@@ -2750,8 +2811,6 @@ class CamoufoxWorker:
                         pass
                     await asyncio.sleep(0.5)
 
-            if ready:
-                await self._perform_human_warmup(context_id, project_id)
             return ready
 
     async def get_token(
@@ -2795,7 +2854,6 @@ class CamoufoxWorker:
                                 user_activation=True,
                                 timeout=35.0,
                             )
-                        await self._set_tab_render_layers(False)
 
                         if isinstance(result, dict) and result.get("ok"):
                             token = str(result.get("token") or "").strip()
@@ -2875,12 +2933,11 @@ class CamoufoxWorker:
                         "browsingContext.navigate",
                         {
                             "context": context_id,
-                            "url": f"{FLOW_ORIGIN}/robots.txt",
-                            "wait": "complete",
+                            "url": FLOW_PROJECTS_URL,
+                            "wait": "interactive",
                         },
                         timeout=25.0,
                     )
-
                 resolved_source_path = source_path or (
                     f"/project/{project_id}" if project_id else "/projects"
                 )
@@ -3090,8 +3147,10 @@ class CamoufoxWorker:
         timeout: int = 120,
         token_id: Optional[int] = None,
         token_proxy_url: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Execute native Flow image generation via in-page UI + StreamChat in headless Camoufox."""
+        if image_inputs:
+            return None
         return await self._execute_native_stream_chat_generation(
             project_id=project_id,
             prompt=prompt,
@@ -3103,7 +3162,6 @@ class CamoufoxWorker:
             token_id=token_id,
             token_proxy_url=token_proxy_url,
         )
-
     async def generate_native_video(
         self,
         *,
@@ -3152,320 +3210,143 @@ class CamoufoxWorker:
                 _, bidi, context_id = await self._get_or_create_shared_browser(
                     token_proxy_url=token_proxy_url, token_id=token_id
                 )
-                if True:
-                    try:
-                        target_url = f"{FLOW_ORIGIN}/project/{project_id}"
-                        await bidi.command(
-                            "browsingContext.navigate",
-                            {
-                                "context": context_id,
-                                "url": target_url,
-                                "wait": "complete",
-                            },
-                            timeout=45.0,
-                        )
-                        await asyncio.sleep(2.0)
-                        await bidi.evaluate(
-                            context_id,
-                            """(() => {
-                                try {
-                                    localStorage.removeItem("glue.CookieNotificationBar");
-                                    localStorage.removeItem("_grecaptcha");
-                                } catch (e) {}
-                                return true;
-                            })()""",
-                            await_promise=False,
-                        )
-                        await bidi.command(
-                            "browsingContext.navigate",
-                            {
-                                "context": context_id,
-                                "url": target_url,
-                                "wait": "complete",
-                            },
-                            timeout=45.0,
-                        )
-                        await asyncio.sleep(6.0)
-                        await bidi.evaluate(
-                            context_id,
-                            """(() => {
-                                window.__flow2apiStreamChatReqs = [];
-                                if (!window.__flow2apiOrigFetch) {
-                                    window.__flow2apiOrigFetch = window.fetch;
-                                    window.fetch = async function(input, init) {
-                                        const url = input instanceof Request ? input.url : String(input || "");
-                                        if (url.includes("StreamChat")) {
-                                            const entry = { url, status: 0, chunks: "", done: false, error: "" };
-                                            window.__flow2apiStreamChatReqs.push(entry);
+                target_url = f"{FLOW_ORIGIN}/project/{project_id}"
+                ar_upper = str(aspect_ratio or "").upper()
+                if "PORTRAIT" in ar_upper:
+                    ar_desc = "vertical portrait 9:16"
+                elif "SQUARE" in ar_upper:
+                    ar_desc = "square 1:1"
+                else:
+                    ar_desc = "landscape 16:9"
+                if media_kind == "video":
+                    ar_prefix = f"Generate 1 {ar_desc} video of "
+                else:
+                    model_hint = (
+                        "using Nano Banana Pro "
+                        if str(model_name or "").upper() == "GEM_PIX_2"
+                        else ""
+                    )
+                    ar_prefix = f"Generate 1 {ar_desc} image {model_hint}of "
+                clean_prompt = " ".join(str(prompt or "").split())
+                full_prompt = ar_prefix + clean_prompt
+
+                try:
+                    last_attempt_err: Optional[Exception] = None
+                    frames: List[Any] = []
+                    media_ids: List[str] = []
+                    full_chunks = ""
+                    sc_status = 0
+
+                    for attempt_idx in range(2):
+                        try:
+                            if attempt_idx == 1 or self._consecutive_risk_failures > 0:
+                                try:
+                                    await bidi.evaluate(
+                                        context_id,
+                                        """(() => {
                                             try {
-                                                const resp = await window.__flow2apiOrigFetch.apply(this, arguments);
-                                                entry.status = resp.status;
-                                                const clone = resp.clone();
-                                                (async () => {
-                                                    try {
-                                                        const reader = clone.body.getReader();
-                                                        const dec = new TextDecoder();
-                                                        while (true) {
-                                                            const { done, value } = await reader.read();
-                                                            if (done) break;
-                                                            entry.chunks += dec.decode(value, { stream: true });
-                                                        }
-                                                    } catch (e) {
-                                                        entry.error = String(e);
-                                                    } finally {
-                                                        entry.done = true;
-                                                    }
-                                                })();
-                                                return resp;
-                                            } catch (e) {
-                                                entry.error = String(e);
-                                                entry.done = true;
-                                                throw e;
-                                            }
-                                        }
-                                        return window.__flow2apiOrigFetch.apply(this, arguments);
-                                    };
-                                }
-                                return true;
-                            })()""",
-                            await_promise=False,
-                        )
-
-                        cookie_bar_rect = await bidi.evaluate(
-                            context_id,
-                            """(() => {
-                                const el = document.querySelector(".glue-cookie-notification-bar__accept");
-                                if (!el) return null;
-                                const r = el.getBoundingClientRect();
-                                if (r.width <= 0 || r.height <= 0) return null;
-                                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-                            })()""",
-                            await_promise=False,
-                        )
-                        if isinstance(cookie_bar_rect, dict):
-                            await bidi.command(
-                                "input.performActions",
-                                {
-                                    "context": context_id,
-                                    "actions": [
+                                                localStorage.removeItem("_grecaptcha");
+                                            } catch (e) {}
+                                            return true;
+                                        })()""",
+                                        await_promise=False,
+                                    )
+                                except Exception:
+                                    pass
+                                await bidi.command(
+                                    "browsingContext.navigate",
+                                    {
+                                        "context": context_id,
+                                        "url": target_url,
+                                        "wait": "complete",
+                                    },
+                                    timeout=45.0,
+                                )
+                                await asyncio.sleep(2.0)
+                                await self._perform_human_warmup(context_id, project_id)
+                            else:
+                                current_url = ""
+                                try:
+                                    current_url = str(
+                                        await bidi.evaluate(
+                                            context_id,
+                                            "String(location.href || '')",
+                                            await_promise=False,
+                                        )
+                                        or ""
+                                    )
+                                except Exception:
+                                    current_url = ""
+                                if f"/project/{project_id}" not in current_url:
+                                    await bidi.command(
+                                        "browsingContext.navigate",
                                         {
-                                            "type": "pointer",
-                                            "id": "mouse",
-                                            "parameters": {"pointerType": "mouse"},
-                                            "actions": [
-                                                {
-                                                    "type": "pointerMove",
-                                                    "x": int(cookie_bar_rect["x"]),
-                                                    "y": int(cookie_bar_rect["y"]),
-                                                    "duration": 250,
-                                                },
-                                                {"type": "pointerDown", "button": 0},
-                                                {"type": "pointerUp", "button": 0},
-                                            ],
-                                        }
-                                    ],
-                                },
-                            )
-                            await asyncio.sleep(0.6)
+                                            "context": context_id,
+                                            "url": target_url,
+                                            "wait": "interactive",
+                                        },
+                                        timeout=45.0,
+                                    )
 
-                        pm_rect = None
-                        for _ in range(15):
-                            pm_rect = await bidi.evaluate(
+                            await bidi.evaluate(
                                 context_id,
                                 """(() => {
-                                    const wiz = window.WIZ_global_data || {};
-                                    const pm = document.querySelector(".ProseMirror");
-                                    if (!pm) return null;
-                                    const r = pm.getBoundingClientRect();
-                                    if (r.width <= 0 || r.height <= 0) return null;
-                                    return {
-                                        x: Math.round(r.left + r.width / 2),
-                                        y: Math.round(r.top + r.height / 2),
-                                        bl: String(wiz.cfb2h || ""),
-                                        fSid: String(wiz.FdrFJe || ""),
-                                        at: String(wiz.SNlM0e || "")
-                                    };
+                                    window.__flow2apiStreamChatReqs = [];
+                                    if (!window.__flow2apiOrigFetch) {
+                                        window.__flow2apiOrigFetch = window.fetch;
+                                        window.fetch = async function(input, init) {
+                                            const url = input instanceof Request ? input.url : String(input || "");
+                                            if (url.includes("StreamChat")) {
+                                                const entry = { url, status: 0, chunks: "", done: false, error: "" };
+                                                window.__flow2apiStreamChatReqs.push(entry);
+                                                try {
+                                                    const resp = await window.__flow2apiOrigFetch.apply(this, arguments);
+                                                    entry.status = resp.status;
+                                                    const clone = resp.clone();
+                                                    (async () => {
+                                                        try {
+                                                            const reader = clone.body.getReader();
+                                                            const dec = new TextDecoder();
+                                                            while (true) {
+                                                                const { done, value } = await reader.read();
+                                                                if (done) break;
+                                                                entry.chunks += dec.decode(value, { stream: true });
+                                                            }
+                                                        } catch (e) {
+                                                            entry.error = String(e);
+                                                        } finally {
+                                                            entry.done = true;
+                                                        }
+                                                    })();
+                                                    return resp;
+                                                } catch (e) {
+                                                    entry.error = String(e);
+                                                    entry.done = true;
+                                                    throw e;
+                                                }
+                                            }
+                                            return window.__flow2apiOrigFetch.apply(this, arguments);
+                                        };
+                                    }
+                                    return true;
                                 })()""",
                                 await_promise=False,
                             )
-                            if isinstance(pm_rect, dict):
-                                if pm_rect.get("bl") and pm_rect.get("fSid"):
-                                    self._cached_wiz = {
-                                        "bl": str(pm_rect.get("bl") or ""),
-                                        "fSid": str(pm_rect.get("fSid") or ""),
-                                        "at": str(pm_rect.get("at") or ""),
-                                    }
-                                break
-                            await asyncio.sleep(0.5)
-                        if not isinstance(pm_rect, dict):
-                            raise RuntimeError("Camoufox 页面未找到 .ProseMirror 输入框")
 
-                        await bidi.command(
-                            "input.performActions",
-                            {
-                                "context": context_id,
-                                "actions": [
-                                    {
-                                        "type": "pointer",
-                                        "id": "mouse",
-                                        "parameters": {"pointerType": "mouse"},
-                                        "actions": [
-                                            {
-                                                "type": "pointerMove",
-                                                "x": int(pm_rect["x"]),
-                                                "y": int(pm_rect["y"]),
-                                                "duration": 250,
-                                            },
-                                            {"type": "pointerDown", "button": 0},
-                                            {"type": "pointerUp", "button": 0},
-                                        ],
-                                    }
-                                ],
-                            },
-                        )
-                        await asyncio.sleep(0.5)
-
-                        ar_upper = str(aspect_ratio or "").upper()
-                        if "PORTRAIT" in ar_upper:
-                            ar_desc = "vertical portrait 9:16"
-                        elif "SQUARE" in ar_upper:
-                            ar_desc = "square 1:1"
-                        else:
-                            ar_desc = "landscape 16:9"
-                        if media_kind == "video":
-                            ar_prefix = f"Generate 1 {ar_desc} video of "
-                        else:
-                            model_hint = (
-                                "using Nano Banana Pro "
-                                if str(model_name or "").upper() == "GEM_PIX_2"
-                                else ""
-                            )
-                            ar_prefix = f"Generate 1 {ar_desc} image {model_hint}of "
-                        clean_prompt = " ".join(str(prompt or "").split())
-                        full_prompt = ar_prefix + clean_prompt
-
-                        key_actions: List[Dict[str, Any]] = []
-                        for ch in full_prompt:
-                            key_actions.append({"type": "keyDown", "value": ch})
-                            key_actions.append({"type": "pause", "duration": 15})
-                            key_actions.append({"type": "keyUp", "value": ch})
-                            key_actions.append({"type": "pause", "duration": 25})
-                        await bidi.command(
-                            "input.performActions",
-                            {
-                                "context": context_id,
-                                "actions": [
-                                    {
-                                        "type": "key",
-                                        "id": "keyboard",
-                                        "actions": key_actions,
-                                    }
-                                ],
-                            },
-                        )
-                        await asyncio.sleep(1.0)
-
-                        gen_rect = await bidi.evaluate(
-                            context_id,
-                            """(() => {
-                                const btn = document.querySelector("button.generate-icon-button");
-                                if (!btn || btn.disabled) return null;
-                                const r = btn.getBoundingClientRect();
-                                return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-                            })()""",
-                            await_promise=False,
-                        )
-                        if not isinstance(gen_rect, dict):
-                            raise RuntimeError(
-                                "Camoufox 页面未找到可点击的 generate-icon-button"
-                            )
-                        self._last_stream_chat_at = time.monotonic()
-                        await bidi.command(
-                            "input.performActions",
-                            {
-                                "context": context_id,
-                                "actions": [
-                                    {
-                                        "type": "pointer",
-                                        "id": "mouse",
-                                        "parameters": {"pointerType": "mouse"},
-                                        "actions": [
-                                            {
-                                                "type": "pointerMove",
-                                                "x": int(gen_rect["x"]),
-                                                "y": int(gen_rect["y"]),
-                                                "duration": 250,
-                                            },
-                                            {"type": "pointerDown", "button": 0},
-                                            {"type": "pointerUp", "button": 0},
-                                        ],
-                                    }
-                                ],
-                            },
-                        )
-
-                        poll_steps = max(30, int(timeout or 90))
-                        sc_status = 0
-                        full_chunks = ""
-                        for _ in range(poll_steps):
-                            await asyncio.sleep(1.0)
-                            st = await bidi.evaluate(
+                            cookie_bar_rect = await bidi.evaluate(
                                 context_id,
                                 """(() => {
-                                    const reqs = window.__flow2apiStreamChatReqs || [];
-                                    if (!reqs.length) return null;
-                                    const last = reqs[reqs.length - 1];
-                                    return { status: last.status, done: last.done, len: (last.chunks || "").length, error: last.error };
+                                    const el = document.querySelector(".glue-cookie-notification-bar__accept");
+                                    if (!el) return null;
+                                    const r = el.getBoundingClientRect();
+                                    const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+                                    const vh = window.innerHeight || document.documentElement.clientHeight || 720;
+                                    if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh) return null;
+                                    return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
                                 })()""",
                                 await_promise=False,
                             )
-                            if isinstance(st, dict) and st.get("done"):
-                                sc_status = int(st.get("status") or 0)
-                                full_chunks = str(
-                                    await bidi.evaluate(
-                                        context_id,
-                                        "window.__flow2apiStreamChatReqs[window.__flow2apiStreamChatReqs.length - 1].chunks",
-                                        await_promise=False,
-                                    )
-                                    or ""
-                                )
-                                break
-                        if full_chunks and (
-                            "ask_for_permission" in full_chunks
-                            or not FlowFrontendMixin._extract_stream_chat_media_ids(
-                                FlowFrontendMixin._parse_batchexecute_frames(full_chunks)
-                            )
-                        ) and "PUBLIC_ERROR_" not in full_chunks:
-                            perm_rect = None
-                            for _ in range(12):
-                                await asyncio.sleep(0.5)
-                                perm_rect = await bidi.evaluate(
-                                    context_id,
-                                    """(() => {
-                                        const msgs = Array.from(document.querySelectorAll("flow-permission-message"));
-                                        if (!msgs.length) return null;
-                                        const lastMsg = msgs[msgs.length - 1];
-                                        lastMsg.scrollIntoView({ block: "center" });
-                                        const rows = Array.from(lastMsg.querySelectorAll(".option-row"));
-                                        const target = rows[1] || rows[0];
-                                        if (!target) return null;
-                                        const r = target.getBoundingClientRect();
-                                        if (r.width <= 0 || r.height <= 0 || r.top < 0) return null;
-                                        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
-                                    })()""",
-                                    await_promise=False,
-                                )
-                                if isinstance(perm_rect, dict):
-                                    break
-                            if isinstance(perm_rect, dict):
-                                prev_count = int(
-                                    await bidi.evaluate(
-                                        context_id,
-                                        "(window.__flow2apiStreamChatReqs || []).length",
-                                        await_promise=False,
-                                    )
-                                    or 1
-                                )
+                            if isinstance(cookie_bar_rect, dict):
                                 await bidi.command(
                                     "input.performActions",
                                     {
@@ -3478,191 +3359,458 @@ class CamoufoxWorker:
                                                 "actions": [
                                                     {
                                                         "type": "pointerMove",
-                                                        "x": int(perm_rect["x"]),
-                                                        "y": int(perm_rect["y"]),
-                                                        "duration": 250,
+                                                        "x": int(cookie_bar_rect["x"]),
+                                                        "y": int(cookie_bar_rect["y"]),
+                                                        "duration": 180,
                                                     },
                                                     {"type": "pointerDown", "button": 0},
-                                                    {"type": "pause", "duration": 80},
                                                     {"type": "pointerUp", "button": 0},
                                                 ],
                                             }
                                         ],
                                     },
                                 )
-                                full_chunks = ""
-                                for _ in range(poll_steps):
-                                    await asyncio.sleep(1.0)
-                                    st2 = await bidi.evaluate(
+                                await asyncio.sleep(0.2)
+
+                            pm_rect = None
+                            for _ in range(40):
+                                pm_rect = await bidi.evaluate(
+                                    context_id,
+                                    """(() => {
+                                        const wiz = window.WIZ_global_data || {};
+                                        const pm = document.querySelector(".ProseMirror");
+                                        if (!pm) return null;
+                                        const r = pm.getBoundingClientRect();
+                                        const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+                                        const vh = window.innerHeight || document.documentElement.clientHeight || 720;
+                                        if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh) return null;
+                                        const cx = Math.max(4, Math.min(vw - 4, Math.round(r.left + r.width / 2)));
+                                        const cy = Math.max(4, Math.min(vh - 4, Math.round(r.top + r.height / 2)));
+                                        return {
+                                            x: cx,
+                                            y: cy,
+                                            bl: String(wiz.cfb2h || ""),
+                                            fSid: String(wiz.FdrFJe || ""),
+                                            at: String(wiz.SNlM0e || "")
+                                        };
+                                    })()""",
+                                    await_promise=False,
+                                )
+                                if isinstance(pm_rect, dict):
+                                    if pm_rect.get("bl") and pm_rect.get("fSid"):
+                                        self._cached_wiz = {
+                                            "bl": str(pm_rect.get("bl") or ""),
+                                            "fSid": str(pm_rect.get("fSid") or ""),
+                                            "at": str(pm_rect.get("at") or ""),
+                                        }
+                                    break
+                                await asyncio.sleep(0.2)
+                            if not isinstance(pm_rect, dict):
+                                raise RuntimeError("Camoufox 页面未找到 .ProseMirror 输入框")
+
+                            await bidi.command(
+                                "input.performActions",
+                                {
+                                    "context": context_id,
+                                    "actions": [
+                                        {
+                                            "type": "pointer",
+                                            "id": "mouse",
+                                            "parameters": {"pointerType": "mouse"},
+                                            "actions": [
+                                                {
+                                                    "type": "pointerMove",
+                                                    "x": int(pm_rect["x"]),
+                                                    "y": int(pm_rect["y"]),
+                                                    "duration": 180,
+                                                },
+                                                {"type": "pointerDown", "button": 0},
+                                                {"type": "pointerUp", "button": 0},
+                                            ],
+                                        }
+                                    ],
+                                },
+                            )
+                            await asyncio.sleep(0.15)
+
+                            await bidi.evaluate(
+                                context_id,
+                                """(() => {
+                                    const pm = document.querySelector('.ProseMirror');
+                                    if (pm && (pm.textContent || '').trim()) {
+                                        pm.focus();
+                                        document.execCommand('selectAll', false, null);
+                                        document.execCommand('delete', false, null);
+                                    }
+                                })()""",
+                                await_promise=False,
+                            )
+
+                            bulk_inserted = False
+                            if len(full_prompt) > 8:
+                                bulk_text = full_prompt[:-4]
+                                try:
+                                    inserted_len = await bidi.call_function(
                                         context_id,
-                                        f"""(() => {{
-                                            const reqs = window.__flow2apiStreamChatReqs || [];
-                                            if (reqs.length <= {prev_count}) return null;
-                                            const last = reqs[reqs.length - 1];
-                                            return {{ status: last.status, done: last.done, len: (last.chunks || "").length, error: last.error }};
-                                        }})()""",
+                                        """(bulkText) => {
+                                            const pm = document.querySelector(".ProseMirror");
+                                            if (!pm) return 0;
+                                            pm.focus();
+                                            document.execCommand("insertText", false, bulkText);
+                                            return (pm.textContent || "").length;
+                                        }""",
+                                        arguments=[_to_bidi_local_value(bulk_text)],
                                         await_promise=False,
                                     )
-                                    if isinstance(st2, dict) and st2.get("done"):
-                                        sc_status = int(st2.get("status") or 0)
-                                        full_chunks = str(
-                                            await bidi.evaluate(
-                                                context_id,
-                                                "window.__flow2apiStreamChatReqs[window.__flow2apiStreamChatReqs.length - 1].chunks",
-                                                await_promise=False,
-                                            )
-                                            or ""
-                                        )
-                                        break
+                                    if isinstance(inserted_len, (int, float)) and int(inserted_len) >= len(bulk_text):
+                                        bulk_inserted = True
+                                except Exception:
+                                    bulk_inserted = False
 
-                        if not full_chunks:
-                            raise RuntimeError("Camoufox StreamChat 未返回响应流")
-                        if "PUBLIC_ERROR_" in full_chunks:
-                            err_match = re.search(
-                                r"PUBLIC_ERROR_[A-Z0-9_]+", full_chunks
+                            key_actions: List[Dict[str, Any]] = []
+                            if bulk_inserted:
+                                for ch in full_prompt[-4:]:
+                                    key_actions.append({"type": "keyDown", "value": ch})
+                                    key_actions.append({"type": "pause", "duration": 8})
+                                    key_actions.append({"type": "keyUp", "value": ch})
+                                    key_actions.append({"type": "pause", "duration": 12})
+                            else:
+                                for ch in full_prompt:
+                                    key_actions.append({"type": "keyDown", "value": ch})
+                                    key_actions.append({"type": "pause", "duration": 2})
+                                    key_actions.append({"type": "keyUp", "value": ch})
+                                    key_actions.append({"type": "pause", "duration": 3})
+                            await bidi.command(
+                                "input.performActions",
+                                {
+                                    "context": context_id,
+                                    "actions": [
+                                        {
+                                            "type": "key",
+                                            "id": "keyboard",
+                                            "actions": key_actions,
+                                        }
+                                    ],
+                                },
                             )
-                            err_code = (
-                                err_match.group(0)
-                                if err_match
-                                else "PUBLIC_ERROR_UNKNOWN"
-                            )
-                            self._consecutive_risk_failures += 1
-                            raise RuntimeError(
-                                f"Flow StreamChat 返回错误: {err_code} (status={sc_status})"
-                            )
+                            await asyncio.sleep(0.25)
 
-                        frames = FlowFrontendMixin._parse_batchexecute_frames(
-                            full_chunks
-                        )
-                        media_ids = FlowFrontendMixin._extract_stream_chat_media_ids(
-                            frames
-                        )
-                        if not media_ids and media_kind == "video":
-                            for rec in FlowFrontendMixin._extract_frontend_video_records(
-                                frames, project_id
-                            ):
-                                if rec and FlowFrontendMixin._is_uuid(rec[0]):
-                                    media_ids.append(str(rec[0]))
-                        if not media_ids:
-                            debug_logger.log_warning(
-                                f"[Camoufox] StreamChat ({media_kind}) 未提取到 media_id, preview={full_chunks[:600]!r}"
-                            )
-                            self._consecutive_risk_failures += 1
-                            raise RuntimeError(
-                                f"Camoufox StreamChat 未提取到 media_id (len={len(full_chunks)})"
-                            )
-
-                        resolved_media: List[Dict[str, Any]] = []
-                        for mid in media_ids[:1]:
-                            as29s_res = await bidi.call_function(
-                                context_id,
-                                """async function(cfg) {
-                                    const wiz = window.WIZ_global_data || {};
-                                    const bl = wiz.cfb2h || "boq_labs-ai-sandbox-frontend_20261105.10_p0";
-                                    const fSid = wiz.FdrFJe || "";
-                                    const at = wiz.SNlM0e || "";
-                                    const q = new URLSearchParams({
-                                        rpcids: "as29s",
-                                        "source-path": `/project/${cfg.projectId}/edit/${cfg.mediaId}`,
-                                        bl: bl,
-                                        "f.sid": fSid,
-                                        hl: "zh-CN",
-                                        _reqid: String(Math.floor(100000 + Math.random() * 900000)),
-                                        rt: "c"
-                                    });
-                                    const body = new URLSearchParams({
-                                        "f.req": JSON.stringify([[["as29s", JSON.stringify([cfg.mediaId]), null, "generic"]]]),
-                                        "at": at
-                                    });
-                                    const resp = await fetch(`https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?${q.toString()}`, {
-                                        method: "POST",
-                                        credentials: "include",
-                                        headers: {
-                                            "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
-                                            "x-same-domain": "1"
-                                        },
-                                        body: body.toString()
-                                    });
-                                    return { status: resp.status, text: await resp.text() };
-                                }""",
-                                arguments=[
-                                    _to_bidi_local_value(
-                                        {"projectId": project_id, "mediaId": mid}
-                                    )
-                                ],
-                                await_promise=True,
-                                timeout=30.0,
-                            )
-                            as29s_text = (
-                                str(as29s_res.get("text") or "")
-                                if isinstance(as29s_res, dict)
-                                else ""
-                            )
-                            as29s_frames = (
-                                FlowFrontendMixin._parse_batchexecute_frames(
-                                    as29s_text
+                            gen_rect = None
+                            for _ in range(10):
+                                gen_rect = await bidi.evaluate(
+                                    context_id,
+                                    """(() => {
+                                        const btn = document.querySelector("button.generate-icon-button:not([disabled])");
+                                        if (!btn || btn.disabled) return null;
+                                        const r = btn.getBoundingClientRect();
+                                        const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+                                        const vh = window.innerHeight || document.documentElement.clientHeight || 720;
+                                        if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh) return null;
+                                        return {
+                                            x: Math.max(4, Math.min(vw - 4, Math.round(r.left + r.width / 2))),
+                                            y: Math.max(4, Math.min(vh - 4, Math.round(r.top + r.height / 2)))
+                                        };
+                                    })()""",
+                                    await_promise=False,
                                 )
-                                if as29s_text
-                                else []
+                                if isinstance(gen_rect, dict):
+                                    break
+                                await asyncio.sleep(0.15)
+                            if not isinstance(gen_rect, dict):
+                                raise RuntimeError(
+                                    "Camoufox 页面未找到可点击的 generate-icon-button"
+                                )
+                            self._last_stream_chat_at = time.monotonic()
+                            await bidi.command(
+                                "input.performActions",
+                                {
+                                    "context": context_id,
+                                    "actions": [
+                                        {
+                                            "type": "pointer",
+                                            "id": "mouse",
+                                            "parameters": {"pointerType": "mouse"},
+                                            "actions": [
+                                                {
+                                                    "type": "pointerMove",
+                                                    "x": int(gen_rect["x"]),
+                                                    "y": int(gen_rect["y"]),
+                                                    "duration": 180,
+                                                },
+                                                {"type": "pointerDown", "button": 0},
+                                                {"type": "pointerUp", "button": 0},
+                                            ],
+                                        }
+                                    ],
+                                },
+                            )
+
+                            poll_steps = max(150, int((timeout or 90) * 5))
+                            sc_status = 0
+                            full_chunks = ""
+                            for _ in range(poll_steps):
+                                await asyncio.sleep(0.2)
+                                st = await bidi.evaluate(
+                                    context_id,
+                                    """(() => {
+                                        const reqs = window.__flow2apiStreamChatReqs || [];
+                                        if (!reqs.length) return null;
+                                        const last = reqs[reqs.length - 1];
+                                        return { status: last.status, done: last.done, chunks: last.done ? (last.chunks || "") : "", error: last.error };
+                                    })()""",
+                                    await_promise=False,
+                                )
+                                if isinstance(st, dict) and st.get("done"):
+                                    sc_status = int(st.get("status") or 0)
+                                    full_chunks = str(st.get("chunks") or "")
+                                    break
+                            if full_chunks and (
+                                "ask_for_permission" in full_chunks
+                                or not FlowFrontendMixin._extract_stream_chat_media_ids(
+                                    FlowFrontendMixin._parse_batchexecute_frames(full_chunks)
+                                )
+                            ) and "PUBLIC_ERROR_" not in full_chunks:
+                                perm_rect = None
+                                for _ in range(12):
+                                    await asyncio.sleep(0.5)
+                                    perm_rect = await bidi.evaluate(
+                                        context_id,
+                                        """(() => {
+                                            const msgs = Array.from(document.querySelectorAll("flow-permission-message"));
+                                            if (!msgs.length) return null;
+                                            const lastMsg = msgs[msgs.length - 1];
+                                            lastMsg.scrollIntoView({ block: "center" });
+                                            const rows = Array.from(lastMsg.querySelectorAll(".option-row"));
+                                            const target = rows[1] || rows[0];
+                                            if (!target) return null;
+                                            const r = target.getBoundingClientRect();
+                                            const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+                                            const vh = window.innerHeight || document.documentElement.clientHeight || 720;
+                                            if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh) return null;
+                                            return {
+                                                x: Math.max(4, Math.min(vw - 4, Math.round(r.left + r.width / 2))),
+                                                y: Math.max(4, Math.min(vh - 4, Math.round(r.top + r.height / 2)))
+                                            };
+                                        })()""",
+                                        await_promise=False,
+                                    )
+                                    if isinstance(perm_rect, dict):
+                                        break
+                                if isinstance(perm_rect, dict):
+                                    prev_count = int(
+                                        await bidi.evaluate(
+                                            context_id,
+                                            "(window.__flow2apiStreamChatReqs || []).length",
+                                            await_promise=False,
+                                        )
+                                        or 1
+                                    )
+                                    await bidi.command(
+                                        "input.performActions",
+                                        {
+                                            "context": context_id,
+                                            "actions": [
+                                                {
+                                                    "type": "pointer",
+                                                    "id": "mouse",
+                                                    "parameters": {"pointerType": "mouse"},
+                                                    "actions": [
+                                                        {
+                                                            "type": "pointerMove",
+                                                            "x": int(perm_rect["x"]),
+                                                            "y": int(perm_rect["y"]),
+                                                            "duration": 250,
+                                                        },
+                                                        {"type": "pointerDown", "button": 0},
+                                                        {"type": "pause", "duration": 80},
+                                                        {"type": "pointerUp", "button": 0},
+                                                    ],
+                                                }
+                                            ],
+                                        },
+                                    )
+                                    full_chunks = ""
+                                    for _ in range(poll_steps):
+                                        await asyncio.sleep(0.2)
+                                        st2 = await bidi.evaluate(
+                                            context_id,
+                                            f"""(() => {{
+                                                const reqs = window.__flow2apiStreamChatReqs || [];
+                                                if (reqs.length <= {prev_count}) return null;
+                                                const last = reqs[reqs.length - 1];
+                                                return {{ status: last.status, done: last.done, chunks: last.done ? (last.chunks || "") : "", error: last.error }};
+                                            }})()""",
+                                            await_promise=False,
+                                        )
+                                        if isinstance(st2, dict) and st2.get("done"):
+                                            sc_status = int(st2.get("status") or 0)
+                                            full_chunks = str(st2.get("chunks") or "")
+                                            break
+
+                            if not full_chunks:
+                                raise RuntimeError("Camoufox StreamChat 未返回响应流")
+                            if "PUBLIC_ERROR_" in full_chunks:
+                                err_match = re.search(
+                                    r"PUBLIC_ERROR_[A-Z0-9_]+", full_chunks
+                                )
+                                err_code = (
+                                    err_match.group(0)
+                                    if err_match
+                                    else "PUBLIC_ERROR_UNKNOWN"
+                                )
+                                self._consecutive_risk_failures += 1
+                                raise RuntimeError(
+                                    f"Flow StreamChat 返回错误: {err_code} (status={sc_status})"
+                                )
+
+                            frames = FlowFrontendMixin._parse_batchexecute_frames(
+                                full_chunks
+                            )
+                            media_ids = FlowFrontendMixin._extract_stream_chat_media_ids(
+                                frames
+                            )
+                            if not media_ids and media_kind == "video":
+                                for rec in FlowFrontendMixin._extract_frontend_video_records(
+                                    frames, project_id
+                                ):
+                                    if rec and FlowFrontendMixin._is_uuid(rec[0]):
+                                        media_ids.append(str(rec[0]))
+                            if not media_ids:
+                                debug_logger.log_warning(
+                                    f"[Camoufox] StreamChat ({media_kind}) 未提取到 media_id, preview={full_chunks[:600]!r}"
+                                )
+                                self._consecutive_risk_failures += 1
+                                raise RuntimeError(
+                                    f"Camoufox StreamChat 未提取到 media_id (len={len(full_chunks)})"
+                                )
+                            last_attempt_err = None
+                            break
+                        except Exception as attempt_exc:
+                            last_attempt_err = attempt_exc
+                            if attempt_idx == 0:
+                                debug_logger.log_warning(
+                                    f"[Camoufox] StreamChat ({media_kind}) 首次尝试失败 ({attempt_exc}), 执行预热重载重试"
+                                )
+                                continue
+                            raise
+                    if last_attempt_err is not None:
+                        raise last_attempt_err
+
+                    resolved_media: List[Dict[str, Any]] = []
+                    for mid in media_ids:
+                        as29s_res = await bidi.call_function(
+                            context_id,
+                            """async function(cfg) {
+                                const wiz = window.WIZ_global_data || {};
+                                const bl = wiz.cfb2h || cfg.cachedBl || "boq_labs-ai-sandbox-frontend_20261105.10_p0";
+                                const fSid = wiz.FdrFJe || cfg.cachedFSid || "";
+                                const at = wiz.SNlM0e || cfg.cachedAt || "";
+                                const q = new URLSearchParams({
+                                    rpcids: "as29s",
+                                    "source-path": `/project/${cfg.projectId}/edit/${cfg.mediaId}`,
+                                    bl: bl,
+                                    "f.sid": fSid,
+                                    hl: "zh-CN",
+                                    _reqid: String(Math.floor(100000 + Math.random() * 900000)),
+                                    rt: "c"
+                                });
+                                const body = new URLSearchParams({
+                                    "f.req": JSON.stringify([[["as29s", JSON.stringify([cfg.mediaId]), null, "generic"]]]),
+                                    "at": at
+                                });
+                                const resp = await fetch(`https://flow.google.com/_/AiSandboxAngularFrontend/data/batchexecute?${q.toString()}`, {
+                                    method: "POST",
+                                    credentials: "include",
+                                    headers: {
+                                        "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
+                                        "x-same-domain": "1"
+                                    },
+                                    body: body.toString()
+                                });
+                                return { status: resp.status, text: await resp.text() };
+                            }""",
+                            arguments=[
+                                _to_bidi_local_value(
+                                    {
+                                        "projectId": project_id,
+                                        "mediaId": mid,
+                                        "cachedBl": self._cached_wiz.get("bl") or "",
+                                        "cachedFSid": self._cached_wiz.get("fSid") or "",
+                                        "cachedAt": self._cached_wiz.get("at") or "",
+                                    }
+                                )
+                            ],
+                            await_promise=True,
+                            timeout=30.0,
+                        )
+                        as29s_text = (
+                            str(as29s_res.get("text") or "")
+                            if isinstance(as29s_res, dict)
+                            else ""
+                        )
+                        as29s_frames = (
+                            FlowFrontendMixin._parse_batchexecute_frames(
+                                as29s_text
+                            )
+                            if as29s_text
+                            else []
+                        )
+                        fife_url = (
+                            FlowFrontendMixin._find_flow_content_url(
+                                as29s_frames,
+                                "video" if media_kind == "video" else "image",
+                            )
+                            if as29s_frames
+                            else ""
+                        )
+                        if not fife_url and as29s_text:
+                            kind_token = "video" if media_kind == "video" else "image"
+                            url_match = re.search(
+                                rf"https://(?:flow-content\.google|storage\.googleapis\.com/ai-sandbox-videofx)/{kind_token}/[^\s\"'\\]+",
+                                as29s_text,
                             )
                             fife_url = (
-                                FlowFrontendMixin._find_flow_content_url(
-                                    as29s_frames,
-                                    "video" if media_kind == "video" else "image",
-                                )
-                                if as29s_frames
-                                else ""
+                                url_match.group(0) if url_match else ""
                             )
-                            if not fife_url and as29s_text:
-                                kind_token = "video" if media_kind == "video" else "image"
-                                url_match = re.search(
-                                    rf"https://(?:flow-content\.google|storage\.googleapis\.com/ai-sandbox-videofx)/{kind_token}/[^\s\"'\\]+",
-                                    as29s_text,
+                        if fife_url:
+                            if media_kind == "video":
+                                resolved_media.append(
+                                    {
+                                        "name": mid,
+                                        "projectId": project_id,
+                                        "video": {
+                                            "fifeUrl": fife_url,
+                                            "mediaGenerationId": mid,
+                                        },
+                                    }
                                 )
-                                fife_url = (
-                                    url_match.group(0) if url_match else ""
-                                )
-                            if fife_url:
-                                if media_kind == "video":
-                                    resolved_media.append(
-                                        {
-                                            "name": mid,
-                                            "projectId": project_id,
-                                            "video": {
+                            else:
+                                resolved_media.append(
+                                    {
+                                        "name": mid,
+                                        "projectId": project_id,
+                                        "image": {
+                                            "generatedImage": {
                                                 "fifeUrl": fife_url,
                                                 "mediaGenerationId": mid,
-                                            },
-                                        }
-                                    )
-                                else:
-                                    resolved_media.append(
-                                        {
-                                            "name": mid,
-                                            "projectId": project_id,
-                                            "image": {
-                                                "generatedImage": {
-                                                    "fifeUrl": fife_url,
-                                                    "mediaGenerationId": mid,
-                                                }
-                                            },
-                                        }
-                                    )
+                                            }
+                                        },
+                                    }
+                                )
+                    self._consecutive_risk_failures = 0
+                    return {
+                        "media": resolved_media,
+                        "mediaIds": media_ids,
+                        "frames": frames,
+                        "responseText": full_chunks,
+                        "rawLength": len(full_chunks),
+                        "session_id": f";{int(time.time() * 1000)}",
+                        "fingerprint": self.get_last_fingerprint(),
+                    }
+                finally:
+                    try:
                         await self._sync_live_cookies_to_db(token_id)
-                        self._consecutive_risk_failures = 0
-                        return {
-                            "media": resolved_media,
-                            "mediaIds": media_ids,
-                            "frames": frames,
-                            "responseText": full_chunks,
-                            "rawLength": len(full_chunks),
-                            "session_id": f";{int(time.time() * 1000)}",
-                            "fingerprint": self.get_last_fingerprint(),
-                        }
-                    finally:
-                        try:
-                            await self._sync_live_cookies_to_db(token_id)
-                        except Exception:
-                            pass
+                    except Exception:
                         pass
             finally:
                 self._solve_inflight = max(0, self._solve_inflight - 1)
@@ -3791,7 +3939,6 @@ class CamoufoxWorker:
                 started_at = time.time()
                 _, bidi, context_id = await self._get_or_create_shared_browser()
                 async with self._boost_frames():
-                    await self._set_tab_render_layers(True)
                     await bidi.command(
                         "browsingContext.navigate",
                         {
@@ -3875,7 +4022,6 @@ class CamoufoxWorker:
                                 }
                                 break
                             await asyncio.sleep(0.5)
-                await self._set_tab_render_layers(False)
                 return {
                     "token": str(token or "") or None,
                     "token_elapsed_ms": token_elapsed_ms,
@@ -4041,18 +4187,44 @@ class CamoufoxLiveView:
         self.dialog_seq: int = 0
         self.contexts: List[str] = []
         self._bidi: Optional[BiDiClient] = None
-        self._inputs: deque[Dict[str, Any]] = deque()
+        self._inputs: deque[Dict[str, Any]] = deque(maxlen=256)
+        self._subscribers: Set[Any] = set()
+        self._last_frame_requested_at: float = time.monotonic()
         self._input_event = asyncio.Event()
         self._wake_event = asyncio.Event()
         self._closed = False
         self._tasks: List[asyncio.Task] = []
+
+    def add_subscriber(self, subscriber: Any = None) -> Any:
+        token = subscriber if subscriber is not None else object()
+        self._subscribers.add(token)
+        self._last_frame_requested_at = time.monotonic()
+        self._wake_event.set()
+        return token
+
+    def remove_subscriber(self, subscriber: Any) -> None:
+        self._subscribers.discard(subscriber)
+
+    def snapshot(self, *, include_frame: bool = True) -> Dict[str, Any]:
+        if include_frame:
+            self._last_frame_requested_at = time.monotonic()
+        payload: Dict[str, Any] = {
+            "status": self.status,
+            "message": self.message,
+            "frame_seq": self.frame_seq,
+            "dialog": self.dialog,
+            "dialog_seq": self.dialog_seq,
+        }
+        if include_frame and self.frame_b64:
+            payload["frame_b64"] = self.frame_b64
+            payload["frame_meta"] = self.frame_meta
+        return payload
 
     def set_status(self, status: str, message: str = "") -> None:
         self.status = status
         if message:
             self.message = message
         self._wake_event.set()
-
     async def attach(self, bidi: BiDiClient, root_context_id: str) -> None:
         self._bidi = bidi
         self.contexts = [root_context_id]
@@ -4171,7 +4343,16 @@ class CamoufoxLiveView:
 
     async def _capture_loop(self) -> None:
         while not self._closed:
-            started = time.monotonic()
+            now = time.monotonic()
+            if len(self._subscribers) > 0:
+                self._last_frame_requested_at = now
+            elif (
+                self.frame_seq > 0
+                and (now - self._last_frame_requested_at) > 5.0
+            ):
+                await asyncio.sleep(0.4)
+                continue
+            started = now
             bidi = self._bidi
             ctx_id = self.active_context()
             if bidi and ctx_id and not bidi._closed:
@@ -4219,7 +4400,6 @@ class CamoufoxLiveView:
                     pass
             elapsed = time.monotonic() - started
             await asyncio.sleep(max(0.05, 0.14 - elapsed))
-
     async def _input_loop(self) -> None:
         while not self._closed:
             await self._input_event.wait()
@@ -4495,8 +4675,10 @@ class CamoufoxLoginSession:
         self.error: Optional[str] = None
         self.result: Optional[Dict[str, Any]] = None
         self.created_at: float = time.time()
+        self.finished_at: Optional[float] = None
         self.headless: bool = False
         self._process: Optional[asyncio.subprocess.Process] = None
+        self._stdout_drain_task: Optional[asyncio.Task] = None
         self._bidi: Optional[BiDiClient] = None
         self._relay: Optional[LocalSocks5Relay] = None
         self._temp_account_dir: Optional[Path] = None
@@ -4509,8 +4691,9 @@ class CamoufoxLoginSession:
         self.message = message
         if error is not None:
             self.error = error
+        if status in ("completed", "failed", "cancelled") and self.finished_at is None:
+            self.finished_at = time.time()
         self.live_view.set_status(status, message)
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -4611,7 +4794,9 @@ class CamoufoxLoginSession:
             self._profile_dir = self._temp_account_dir / "firefox-profile"
             self._profile_dir.mkdir(parents=True, exist_ok=True)
             _clear_stale_firefox_profile_locks(self._profile_dir)
-            restore_startup_cache(self._temp_account_dir, self._profile_dir)
+            await asyncio.to_thread(
+                restore_startup_cache, self._temp_account_dir, self._profile_dir
+            )
             cache_dir = self._temp_account_dir / "camoufox-cache"
 
             # Pass actual self.headless + live_view=True so macOS window mode disables separate GPU process
@@ -4649,6 +4834,7 @@ class CamoufoxLoginSession:
             endpoint = await CamoufoxWorker._wait_for_bidi_endpoint(
                 self._process, timeout=45.0
             )
+            self._stdout_drain_task = _start_stdout_drain(self._process)
             self._bidi = await BiDiClient.connect(endpoint, timeout=30.0)
             capabilities: Dict[str, Any] = {
                 "alwaysMatch": {
@@ -4714,8 +4900,11 @@ class CamoufoxLoginSession:
             # Persist to browser_data_rt/token_<id> BEFORE on_complete if token_id is already known
             if self.token_id and self._temp_account_dir and self._temp_account_dir.exists():
                 early_target_dir = self.user_data_root / f"token_{self.token_id}"
-                persist_account_login_artifacts(self._temp_account_dir, early_target_dir)
-
+                await asyncio.to_thread(
+                    persist_account_login_artifacts,
+                    self._temp_account_dir,
+                    early_target_dir,
+                )
             if on_complete is not None:
                 saved_info = await on_complete(self, exported)
                 exported.update(saved_info or {})
@@ -4733,7 +4922,11 @@ class CamoufoxLoginSession:
                 except Exception:
                     pass
                 target_dir = self.user_data_root / f"token_{final_token_id}"
-                persist_account_login_artifacts(self._temp_account_dir, target_dir)
+                await asyncio.to_thread(
+                    persist_account_login_artifacts,
+                    self._temp_account_dir,
+                    target_dir,
+                )
                 exported["cache_persisted_dir"] = str(target_dir)
             self.result = exported
             self.set_state(
@@ -5023,16 +5216,21 @@ class CamoufoxLoginSession:
 
     async def _cleanup(self, save_cache: bool = False) -> None:
         await self.live_view.close()
+        drain_task = self._stdout_drain_task
         bidi = self._bidi
         proc = self._process
         relay = self._relay
         profile_dir = self._profile_dir
         temp_account_dir = self._temp_account_dir
 
+        self._stdout_drain_task = None
         self._bidi = None
         self._process = None
         self._relay = None
         self._profile_dir = None
+
+        if drain_task is not None and not drain_task.done():
+            drain_task.cancel()
 
         if bidi is not None:
             try:
@@ -5061,11 +5259,12 @@ class CamoufoxLoginSession:
 
         if profile_dir is not None and profile_dir.exists():
             if save_cache and temp_account_dir is not None and temp_account_dir.exists():
-                save_startup_cache(profile_dir, temp_account_dir)
+                await asyncio.to_thread(
+                    save_startup_cache, profile_dir, temp_account_dir
+                )
                 _clear_stale_firefox_profile_locks(profile_dir)
             else:
                 shutil.rmtree(profile_dir, ignore_errors=True)
-
 
 class CamoufoxLoginManager:
     """Manages active Camoufox interactive login sessions for the Admin UI."""
@@ -5082,10 +5281,28 @@ class CamoufoxLoginManager:
             cls._instance = cls()
         return cls._instance
 
+    def _prune_sessions(self) -> None:
+        now = time.time()
+        for sid, sess in list(self._sessions.items()):
+            if sess.status in ("completed", "failed", "cancelled"):
+                ended_at = sess.finished_at or sess.created_at
+                age = now - ended_at
+                if age > 60.0 and sess.live_view.frame_b64:
+                    sess.live_view.frame_b64 = ""
+                if age > 300.0:
+                    self._sessions.pop(sid, None)
+            elif now - sess.created_at > max(600.0, sess.timeout_seconds + 300.0):
+                self._sessions.pop(sid, None)
+
     def get_session(self, session_id: str) -> Optional[CamoufoxLoginSession]:
-        return self._sessions.get(session_id)
+        self._prune_sessions()
+        sess = self._sessions.get(session_id)
+        if sess is not None and sess.status in ("starting", "waiting", "saving"):
+            sess.live_view._last_frame_requested_at = time.monotonic()
+        return sess
 
     def get_active_session(self) -> Optional[CamoufoxLoginSession]:
+        self._prune_sessions()
         for sess in list(self._sessions.values()):
             if sess.status in ("starting", "waiting", "saving"):
                 return sess
@@ -5109,9 +5326,7 @@ class CamoufoxLoginManager:
             for old_id, old_sess in list(self._sessions.items()):
                 if old_sess.status in ("starting", "waiting"):
                     await old_sess.cancel()
-                if time.time() - old_sess.created_at > 1800:
-                    self._sessions.pop(old_id, None)
-
+            self._prune_sessions()
             session_id = uuid.uuid4().hex[:16]
             session = CamoufoxLoginSession(
                 session_id,

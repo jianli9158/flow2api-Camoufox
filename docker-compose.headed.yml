@@ -6,16 +6,18 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.headed
-    image: flow2api:headed
+    image: flow2api-camoufox:headed
     container_name: flow2api-headed
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
       - ./tmp:/app/tmp
+      - ./browser_data_rt:/app/browser_data_rt
       - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
+      - FLOW2API_SERVER_PORT=8000
       - ALLOW_DOCKER_HEADED_CAPTCHA=true
       - DISPLAY=:99
       - XVFB_SCREEN=1440x900x24

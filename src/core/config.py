@@ -230,11 +230,23 @@ class Config:
 
     @property
     def server_host(self) -> str:
+        env_host = os.environ.get("FLOW2API_SERVER_HOST", "").strip()
+        if env_host:
+            return env_host
         return self._config["server"]["host"]
 
     @property
     def server_port(self) -> int:
-        return self._config["server"]["port"]
+        for env_key in ("FLOW2API_SERVER_PORT", "PORT"):
+            raw_port = os.environ.get(env_key, "").strip()
+            if raw_port:
+                try:
+                    port = int(raw_port)
+                    if 1 <= port <= 65535:
+                        return port
+                except ValueError:
+                    pass
+        return int(self._config["server"]["port"])
 
     @property
     def debug_enabled(self) -> bool:

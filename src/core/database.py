@@ -35,18 +35,90 @@ class Database:
             data_dir.mkdir(exist_ok=True)
             db_path = str(data_dir / "flow.db")
         self.db_path = db_path
-        self._write_lock = asyncio.Lock()
         self._connect_timeout = 30
         self._busy_timeout_ms = 30000
+        self._is_memory_db = (
+            db_path == ":memory:" or str(db_path).startswith("file::memory:")
+        )
+        self._conn: Optional[aiosqlite.Connection] = None
+        self._read_conn: Optional[aiosqlite.Connection] = None
+        self._conn_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._conn_lock: Optional[asyncio.Lock] = None
+        self._read_lock: Optional[asyncio.Lock] = None
+        self._write_lock = asyncio.Lock()
+        self._request_logs_columns_cache: Optional[set[str]] = None
 
     def db_exists(self) -> bool:
         """Check if database file exists"""
         return Path(self.db_path).exists()
 
-    async def _configure_connection(self, db):
+    async def _configure_connection(self, db, *, query_only: bool = False):
         """Apply SQLite runtime settings for better concurrent behavior."""
+        db.row_factory = aiosqlite.Row
         await db.execute(f"PRAGMA busy_timeout = {self._busy_timeout_ms}")
+        if not self._is_memory_db:
+            await db.execute("PRAGMA journal_mode = WAL")
+        await db.execute("PRAGMA synchronous = NORMAL")
         await db.execute("PRAGMA foreign_keys = ON")
+        if query_only:
+            await db.execute("PRAGMA query_only = ON")
+        await db.commit()
+
+    @staticmethod
+    def _is_conn_usable(conn: Optional[aiosqlite.Connection]) -> bool:
+        if conn is None:
+            return False
+        if not getattr(conn, "_running", False):
+            return False
+        if getattr(conn, "_connection", None) is None:
+            return False
+        if hasattr(conn, "is_alive") and not conn.is_alive():
+            return False
+        return True
+
+    async def _close_conn_instance(
+        self, conn: Optional[aiosqlite.Connection]
+    ) -> None:
+        if conn is None:
+            return
+        try:
+            if (
+                getattr(conn, "_running", False)
+                or getattr(conn, "_connection", None) is not None
+            ):
+                await asyncio.wait_for(conn.close(), timeout=2.0)
+        except Exception:
+            stop = getattr(conn, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
+
+    async def _open_connection(
+        self, *, query_only: bool = False
+    ) -> aiosqlite.Connection:
+        conn = aiosqlite.connect(self.db_path, timeout=self._connect_timeout)
+        conn.daemon = True
+        if hasattr(conn, "_thread") and getattr(conn, "_thread") is not None:
+            conn._thread.daemon = True
+        await conn
+        try:
+            await self._configure_connection(conn, query_only=query_only)
+            return conn
+        except BaseException:
+            await self._close_conn_instance(conn)
+            raise
+
+    async def close(self) -> None:
+        """Close persistent SQLite connection(s) if open."""
+        conn, read_conn = self._conn, self._read_conn
+        self._conn = None
+        self._read_conn = None
+        self._conn_loop = None
+        self._request_logs_columns_cache = None
+        await self._close_conn_instance(read_conn)
+        await self._close_conn_instance(conn)
 
     def _current_stats_date(self) -> str:
         """Return the logical date used by daily token statistics."""
@@ -54,19 +126,62 @@ class Database:
 
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
-        """Open a configured SQLite connection and optionally serialize writes."""
-        if write:
-            async with self._write_lock:
-                async with aiosqlite.connect(
-                    self.db_path, timeout=self._connect_timeout
-                ) as db:
-                    await self._configure_connection(db)
-                    yield db
+        """Provide a persistent event-loop-aware SQLite connection."""
+        running_loop = asyncio.get_running_loop()
+        old_conn = None
+        old_read_conn = None
+        if (
+            self._conn_loop is not running_loop
+            or self._conn_lock is None
+            or self._read_lock is None
+        ):
+            old_conn = self._conn
+            old_read_conn = self._read_conn
+            self._conn = None
+            self._read_conn = None
+            self._conn_loop = running_loop
+            self._conn_lock = asyncio.Lock()
+            self._write_lock = self._conn_lock
+            self._read_lock = asyncio.Lock()
+
+        if old_read_conn is not None:
+            await self._close_conn_instance(old_read_conn)
+        if old_conn is not None:
+            await self._close_conn_instance(old_conn)
+
+        if write or self._is_memory_db:
+            async with self._conn_lock:
+                if not self._is_conn_usable(self._conn):
+                    await self._close_conn_instance(self._conn)
+                    self._conn = await self._open_connection(query_only=False)
+                conn = self._conn
+                conn.row_factory = aiosqlite.Row
+                try:
+                    yield conn
+                except BaseException:
+                    try:
+                        if conn.in_transaction:
+                            await conn.rollback()
+                    except Exception:
+                        await self._close_conn_instance(conn)
+                        if self._conn is conn:
+                            self._conn = None
+                    raise
             return
 
-        async with aiosqlite.connect(self.db_path, timeout=self._connect_timeout) as db:
-            await self._configure_connection(db)
-            yield db
+        async with self._read_lock:
+            if not self._is_conn_usable(self._read_conn):
+                await self._close_conn_instance(self._read_conn)
+                self._read_conn = await self._open_connection(query_only=True)
+            conn = self._read_conn
+            conn.row_factory = aiosqlite.Row
+            try:
+                yield conn
+            except BaseException:
+                await self._close_conn_instance(conn)
+                if self._read_conn is conn:
+                    self._read_conn = None
+                raise
 
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
@@ -345,6 +460,7 @@ class Database:
                         Used only to initialize missing config rows with default values.
                         Existing config rows will NOT be overwritten.
         """
+        self._request_logs_columns_cache = None
         async with self._connect(write=True) as db:
             print("Checking database integrity and performing migrations...")
             await db.execute("PRAGMA journal_mode = WAL")
@@ -626,16 +742,50 @@ class Database:
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
 
+            # Ensure missing indexes exist on upgraded databases
+            if await self._table_exists(db, "tokens"):
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tokens_email_nocase ON tokens(email COLLATE NOCASE)"
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tokens_login_account_nocase ON tokens(login_account COLLATE NOCASE)"
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)"
+                )
+            if await self._table_exists(db, "projects"):
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_projects_token_id ON projects(token_id)"
+                )
+            if await self._table_exists(db, "tasks"):
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_token_id ON tasks(token_id)"
+                )
+            if await self._table_exists(db, "token_stats"):
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_token_stats_token_id ON token_stats(token_id)"
+                )
+            if await self._table_exists(db, "request_logs"):
+                await self._migrate_request_logs(db)
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_request_logs_created_at ON request_logs(created_at DESC)"
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_request_logs_token_id_created_at ON request_logs(token_id, created_at DESC)"
+                )
+
             # ========== Step 3: Ensure all config tables have default rows ==========
             # Note: This will NOT overwrite existing config rows
             # It only ensures missing rows are created with default values from setting.toml
             await self._ensure_config_rows(db, config_dict=config_dict)
 
             await db.commit()
+            self._request_logs_columns_cache = None
             print("Database migration check completed.")
 
     async def init_db(self):
         """Initialize database tables"""
+        self._request_logs_columns_cache = None
         async with self._connect(write=True) as db:
             await db.execute("PRAGMA journal_mode = WAL")
             await db.execute("PRAGMA synchronous = NORMAL")
@@ -857,12 +1007,24 @@ class Database:
 
             # Create indexes
             await db.execute("CREATE INDEX IF NOT EXISTS idx_task_id ON tasks(task_id)")
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_token_id ON tasks(token_id)"
+            )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_token_st ON tokens(st)")
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_project_id ON projects(project_id)"
             )
             await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_projects_token_id ON projects(token_id)"
+            )
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tokens_email ON tokens(email)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tokens_email_nocase ON tokens(email COLLATE NOCASE)"
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tokens_login_account_nocase ON tokens(login_account COLLATE NOCASE)"
             )
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)"
@@ -885,6 +1047,7 @@ class Database:
             )
 
             await db.commit()
+            self._request_logs_columns_cache = None
 
     async def _migrate_request_logs(self, db):
         """Migrate request_logs table from old schema to new schema"""
@@ -1125,6 +1288,16 @@ class Database:
                 ORDER BY t.created_at DESC
             """,
                 (today, today, today),
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_public_health_tokens(self) -> List[Dict[str, Any]]:
+        """Get minimal token fields required by public /health snapshot."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT id, is_active, at, at_expires, ban_reason, banned_at FROM tokens"
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
@@ -1380,7 +1553,7 @@ class Database:
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM token_stats WHERE token_id = ?", (token_id,)
+                "SELECT * FROM token_stats WHERE token_id = ? LIMIT 1", (token_id,)
             )
             row = await cursor.fetchone()
             if row:
@@ -1391,37 +1564,28 @@ class Database:
         """Increment image generation count with daily reset"""
         async with self._connect(write=True) as db:
             today = self._current_stats_date()
-            # Get current stats
             cursor = await db.execute(
-                "SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,)
+                """
+                UPDATE token_stats
+                SET image_count = image_count + 1,
+                    today_image_count = CASE WHEN today_date = ? THEN today_image_count + 1 ELSE 1 END,
+                    today_video_count = CASE WHEN today_date = ? THEN today_video_count ELSE 0 END,
+                    today_error_count = CASE WHEN today_date = ? THEN today_error_count ELSE 0 END,
+                    today_date = ?
+                WHERE token_id = ?
+                """,
+                (today, today, today, today, token_id),
             )
-            row = await cursor.fetchone()
-
-            # If date changed, reset all daily counters before recording today's image usage.
-            if row and row[0] != today:
+            if cursor.rowcount == 0:
                 await db.execute(
                     """
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = 1,
-                        today_video_count = 0,
-                        today_error_count = 0,
-                        today_date = ?
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
-                )
-            else:
-                # Same day, just increment both
-                await db.execute(
-                    """
-                    UPDATE token_stats
-                    SET image_count = image_count + 1,
-                        today_image_count = today_image_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
+                    INSERT INTO token_stats (
+                        token_id, image_count, today_image_count,
+                        today_video_count, today_error_count, today_date
+                    )
+                    VALUES (?, 1, 1, 0, 0, ?)
+                    """,
+                    (token_id, today),
                 )
             await db.commit()
 
@@ -1429,85 +1593,66 @@ class Database:
         """Increment video generation count with daily reset"""
         async with self._connect(write=True) as db:
             today = self._current_stats_date()
-            # Get current stats
             cursor = await db.execute(
-                "SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,)
+                """
+                UPDATE token_stats
+                SET video_count = video_count + 1,
+                    today_image_count = CASE WHEN today_date = ? THEN today_image_count ELSE 0 END,
+                    today_video_count = CASE WHEN today_date = ? THEN today_video_count + 1 ELSE 1 END,
+                    today_error_count = CASE WHEN today_date = ? THEN today_error_count ELSE 0 END,
+                    today_date = ?
+                WHERE token_id = ?
+                """,
+                (today, today, today, today, token_id),
             )
-            row = await cursor.fetchone()
-
-            # If date changed, reset all daily counters before recording today's video usage.
-            if row and row[0] != today:
+            if cursor.rowcount == 0:
                 await db.execute(
                     """
-                    UPDATE token_stats
-                    SET video_count = video_count + 1,
-                        today_image_count = 0,
-                        today_video_count = 1,
-                        today_error_count = 0,
-                        today_date = ?
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
-                )
-            else:
-                # Same day, just increment both
-                await db.execute(
-                    """
-                    UPDATE token_stats
-                    SET video_count = video_count + 1,
-                        today_video_count = today_video_count + 1,
-                        today_date = ?
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
+                    INSERT INTO token_stats (
+                        token_id, video_count, today_image_count,
+                        today_video_count, today_error_count, today_date
+                    )
+                    VALUES (?, 1, 0, 1, 0, ?)
+                    """,
+                    (token_id, today),
                 )
             await db.commit()
 
     async def increment_error_count(self, token_id: int):
         """Increment error count with daily reset
 
-        Updates two counters:
+        Updates counters:
         - error_count: Historical total errors (never reset)
         - consecutive_error_count: Consecutive errors (reset on success/enable)
         - today_error_count: Today's errors (reset on date change)
         """
         async with self._connect(write=True) as db:
             today = self._current_stats_date()
-            # Get current stats
             cursor = await db.execute(
-                "SELECT today_date FROM token_stats WHERE token_id = ?", (token_id,)
+                """
+                UPDATE token_stats
+                SET error_count = error_count + 1,
+                    consecutive_error_count = consecutive_error_count + 1,
+                    today_image_count = CASE WHEN today_date = ? THEN today_image_count ELSE 0 END,
+                    today_video_count = CASE WHEN today_date = ? THEN today_video_count ELSE 0 END,
+                    today_error_count = CASE WHEN today_date = ? THEN today_error_count + 1 ELSE 1 END,
+                    today_date = ?,
+                    last_error_at = CURRENT_TIMESTAMP
+                WHERE token_id = ?
+                """,
+                (today, today, today, today, token_id),
             )
-            row = await cursor.fetchone()
-
-            # If date changed, reset all daily counters before recording today's error.
-            if row and row[0] != today:
+            if cursor.rowcount == 0:
                 await db.execute(
                     """
-                    UPDATE token_stats
-                    SET error_count = error_count + 1,
-                        consecutive_error_count = consecutive_error_count + 1,
-                        today_image_count = 0,
-                        today_video_count = 0,
-                        today_error_count = 1,
-                        today_date = ?,
-                        last_error_at = CURRENT_TIMESTAMP
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
-                )
-            else:
-                # Same day, just increment all counters
-                await db.execute(
-                    """
-                    UPDATE token_stats
-                    SET error_count = error_count + 1,
-                        consecutive_error_count = consecutive_error_count + 1,
-                        today_error_count = today_error_count + 1,
-                        today_date = ?,
-                        last_error_at = CURRENT_TIMESTAMP
-                    WHERE token_id = ?
-                """,
-                    (today, token_id),
+                    INSERT INTO token_stats (
+                        token_id, error_count, consecutive_error_count,
+                        today_image_count, today_video_count, today_error_count,
+                        today_date, last_error_at
+                    )
+                    VALUES (?, 1, 1, 0, 0, 1, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (token_id, today),
                 )
             await db.commit()
 
@@ -1776,6 +1921,20 @@ class Database:
             )
             await db.commit()
 
+    async def _get_request_logs_columns(self, db) -> set[str]:
+        """Return cached column names of request_logs table."""
+        if self._request_logs_columns_cache is not None:
+            return self._request_logs_columns_cache
+        try:
+            cursor = await db.execute("PRAGMA table_info(request_logs)")
+            rows = await cursor.fetchall()
+            cols = {str(row[1]) for row in rows}
+            if cols:
+                self._request_logs_columns_cache = cols
+            return cols
+        except Exception:
+            return set()
+
     async def get_logs(
         self,
         limit: int = 100,
@@ -1789,11 +1948,10 @@ class Database:
                 "rl.request_body, rl.response_body," if include_payload else ""
             )
             response_excerpt_column = "substr(COALESCE(rl.response_body, ''), 1, 2048) as response_body_excerpt,"
-            has_status_text = await self._column_exists(
-                db, "request_logs", "status_text"
-            )
-            has_progress = await self._column_exists(db, "request_logs", "progress")
-            has_updated_at = await self._column_exists(db, "request_logs", "updated_at")
+            req_log_cols = await self._get_request_logs_columns(db)
+            has_status_text = "status_text" in req_log_cols
+            has_progress = "progress" in req_log_cols
+            has_updated_at = "updated_at" in req_log_cols
             status_text_column = (
                 "rl.status_text," if has_status_text else "'' as status_text,"
             )
@@ -1859,11 +2017,10 @@ class Database:
         """Get single request log detail including payload fields"""
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
-            has_status_text = await self._column_exists(
-                db, "request_logs", "status_text"
-            )
-            has_progress = await self._column_exists(db, "request_logs", "progress")
-            has_updated_at = await self._column_exists(db, "request_logs", "updated_at")
+            req_log_cols = await self._get_request_logs_columns(db)
+            has_status_text = "status_text" in req_log_cols
+            has_progress = "progress" in req_log_cols
+            has_updated_at = "updated_at" in req_log_cols
             status_text_column = (
                 "rl.status_text," if has_status_text else "'' as status_text,"
             )
@@ -1896,6 +2053,60 @@ class Database:
             )
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def cleanup_old_request_logs(
+        self, retention_days: int = 7, max_rows: int = 5000
+    ) -> int:
+        """Delete request_logs rows older than retention_days or beyond max_rows."""
+        deleted_total = 0
+        async with self._connect(write=True) as db:
+            if not await self._table_exists(db, "request_logs"):
+                return 0
+
+            if retention_days and retention_days > 0:
+                cursor = await db.execute(
+                    "DELETE FROM request_logs WHERE created_at < datetime('now', ?)",
+                    (f"-{int(retention_days)} days",),
+                )
+                if cursor.rowcount and cursor.rowcount > 0:
+                    deleted_total += cursor.rowcount
+
+            if max_rows and max_rows > 0:
+                cutoff_cursor = await db.execute(
+                    """
+                    SELECT created_at, id
+                    FROM request_logs
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1 OFFSET ?
+                    """,
+                    (int(max_rows),),
+                )
+                cutoff_row = await cutoff_cursor.fetchone()
+                if cutoff_row is not None:
+                    cutoff_created_at = cutoff_row[0]
+                    cutoff_id = cutoff_row[1]
+                    if cutoff_created_at is None:
+                        excess_cursor = await db.execute(
+                            "DELETE FROM request_logs WHERE created_at IS NULL AND id <= ?",
+                            (cutoff_id,),
+                        )
+                    else:
+                        excess_cursor = await db.execute(
+                            """
+                            DELETE FROM request_logs
+                            WHERE created_at IS NULL
+                               OR created_at < ?
+                               OR (created_at = ? AND id <= ?)
+                            """,
+                            (cutoff_created_at, cutoff_created_at, cutoff_id),
+                        )
+                    if excess_cursor.rowcount and excess_cursor.rowcount > 0:
+                        deleted_total += excess_cursor.rowcount
+
+            if db.in_transaction or deleted_total > 0:
+                await db.commit()
+
+        return deleted_total
 
     async def clear_all_logs(self):
         """Clear all request logs"""

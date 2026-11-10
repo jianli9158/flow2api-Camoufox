@@ -2,11 +2,14 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+import asyncio
 import base64
+import ipaddress
 import json
 import mimetypes
 import re
-from urllib.parse import urlparse
+import socket
+from urllib.parse import unquote, urljoin, urlparse
 
 from curl_cffi.requests import AsyncSession
 from fastapi import (
@@ -182,21 +185,118 @@ def _guess_mime_type(uri: str, fallback: str) -> str:
     return guessed or fallback
 
 
+_BLOCKED_IP_NETWORKS = (
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("224.0.0.0/4"),
+    ipaddress.ip_network("240.0.0.0/4"),
+    ipaddress.ip_network("::/128"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+    ipaddress.ip_network("ff00::/8"),
+)
+
+
+def _is_disallowed_ip(ip_obj: ipaddress._BaseAddress) -> bool:
+    candidates = [ip_obj]
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped is not None:
+        candidates.append(ip_obj.ipv4_mapped)
+    for addr in candidates:
+        if (
+            addr.is_loopback
+            or addr.is_link_local
+            or addr.is_private
+            or addr.is_unspecified
+            or addr.is_multicast
+            or addr.is_reserved
+            or any(addr in network for network in _BLOCKED_IP_NETWORKS)
+        ):
+            return True
+    return False
+
+
+async def _validate_safe_remote_url(url: str) -> None:
+    """Validate that a remote image URL uses HTTP(S) and resolves only to public IPs."""
+    parsed = urlparse(str(url or "").strip())
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported URL scheme: {scheme or 'empty'}")
+
+    host = (parsed.hostname or "").strip()
+    if not host:
+        raise ValueError("URL hostname is required")
+    if host.lower() in ("localhost", "localhost.localdomain"):
+        raise ValueError(f"Disallowed hostname: {host}")
+
+    raw_host_ip = host.split("%", 1)[0]
+    try:
+        literal_ip = ipaddress.ip_address(raw_host_ip)
+    except ValueError:
+        literal_ip = None
+
+    if literal_ip is not None:
+        if _is_disallowed_ip(literal_ip):
+            raise ValueError(f"Disallowed IP address: {literal_ip}")
+        return
+
+    try:
+        addr_infos = await asyncio.to_thread(socket.getaddrinfo, host, None)
+    except Exception as exc:
+        raise ValueError(f"Failed to resolve hostname {host}: {exc}") from exc
+
+    if not addr_infos:
+        raise ValueError(f"Hostname {host} resolved to no addresses")
+
+    for info in addr_infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_text = str(sockaddr[0]).split("%", 1)[0]
+        ip_obj = ipaddress.ip_address(ip_text)
+        if _is_disallowed_ip(ip_obj):
+            raise ValueError(f"Hostname {host} resolved to disallowed IP {ip_obj}")
+
+
 async def retrieve_image_data(url: str) -> Optional[bytes]:
     """Read image bytes from local /tmp cache or remote URL."""
     file_cache = getattr(generation_handler, "file_cache", None)
     try:
         if "/tmp/" in url and file_cache:
-            path = urlparse(url).path
-            filename = path.split("/tmp/")[-1]
-            local_file_path = file_cache.cache_dir / filename
+            raw_path = unquote(urlparse(url).path)
+            raw_name = raw_path.split("/tmp/")[-1]
+            if (
+                not raw_name
+                or "/" in raw_name
+                or "\\" in raw_name
+                or ".." in raw_name
+                or "\x00" in raw_name
+            ):
+                debug_logger.log_warning(
+                    f"[CONTEXT] 拒绝不安全的本地缓存路径: {raw_name!r}"
+                )
+                return None
 
-            if local_file_path.exists() and local_file_path.is_file():
-                data = local_file_path.read_bytes()
+            cache_root = file_cache.cache_dir.resolve()
+            candidate = (cache_root / raw_name).resolve()
+            if not candidate.is_relative_to(cache_root):
+                debug_logger.log_warning(
+                    f"[CONTEXT] 拒绝越界的本地缓存路径: {raw_name!r}"
+                )
+                return None
+
+            if candidate.exists() and candidate.is_file():
+                data = await asyncio.to_thread(candidate.read_bytes)
                 if data:
                     return data
     except Exception as exc:
         debug_logger.log_warning(f"[CONTEXT] 本地缓存读取失败: {str(exc)}")
+        return None
 
     proxy_url = None
     try:
@@ -206,31 +306,43 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
         debug_logger.log_warning(f"[CONTEXT] 图片下载代理解析失败: {str(exc)}")
 
     try:
+        current_url = url
         async with AsyncSession() as session:
-            response = await session.get(
-                url,
-                timeout=60,
-                proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
-                headers={
-                    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "Connection": "keep-alive",
-                    "Referer": "https://flow.google.com/",
-                },
-                impersonate="chrome120",
-                verify=False,
-            )
-            if response.status_code == 200 and response.content:
-                return response.content
-            debug_logger.log_warning(
-                f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
-            )
+            for _ in range(5):
+                await _validate_safe_remote_url(current_url)
+                response = await session.get(
+                    current_url,
+                    timeout=60,
+                    proxies={"http": proxy_url, "https": proxy_url} if proxy_url else None,
+                    headers={
+                        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+                        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Connection": "keep-alive",
+                        "Referer": "https://flow.google.com/",
+                    },
+                    impersonate="chrome120",
+                    verify=True,
+                    allow_redirects=False,
+                )
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get("location") or response.headers.get(
+                        "Location"
+                    )
+                    if not location:
+                        break
+                    current_url = urljoin(current_url, location)
+                    continue
+                if response.status_code == 200 and response.content:
+                    return response.content
+                debug_logger.log_warning(
+                    f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
+                )
+                break
     except Exception as exc:
         debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
 
     return None
-
 
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
     if not uri:

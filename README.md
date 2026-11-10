@@ -64,6 +64,17 @@ pip install -r requirements.txt
 python main.py
 ```
 
+### Docker 部署
+
+```bash
+git clone https://github.com/jianli9158/flow2api-Camoufox.git
+cd flow2api-Camoufox
+cp -n config/setting_example.toml config/setting.toml
+docker compose up -d --build
+```
+
+> 容器镜像已内置无头 Camoufox 所需的 GTK3 / X11 / 音频共享库，并挂载 `./browser_data_rt` 与 `./data` 持久化账号指纹及 SQLite 数据。默认通过 `FLOW2API_SERVER_PORT=8000` 监听容器内 `8000` 端口。
+
 ### 首次访问与添加账号
 
 1. 打开管理后台：**`http://localhost:8000`**（若 `config/setting.toml` 修改了端口则以实际端口为准），默认账号密码为 `admin` / `admin`，首次登录后请在「系统配置」中修改密码与 API Key。

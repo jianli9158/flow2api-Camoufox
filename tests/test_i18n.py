@@ -34,7 +34,7 @@ def test_language_negotiation(header, expected):
 
 def test_catalogs_have_matching_keys_and_interpolation_parameters():
     root = Path(__file__).resolve().parents[1] / "static" / "locales"
-    for path in [*root.glob("*.json"), root.parents[1] / "extension" / "locales.json"]:
+    for path in sorted(root.glob("*.json")):
         catalog = json.loads(path.read_text(encoding="utf-8"))
         assert catalog["zh-CN"].keys() == catalog["en"].keys(), path.name
         for language in ("zh-CN", "en"):

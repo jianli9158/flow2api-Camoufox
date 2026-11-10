@@ -117,7 +117,6 @@ async def lifespan(app: FastAPI):
     else:
         print("Existing database detected. Checking for missing tables and columns...")
         await db.check_and_migrate_db(config_dict)
-        print("Database migration check completed.")
 
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
@@ -137,17 +136,19 @@ async def lifespan(app: FastAPI):
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
     # Start 429 auto-unban task
-    import asyncio
-
     async def auto_unban_task():
-        """定时任务：每小时检查并解禁429被禁用的token"""
+        """定时任务：每小时检查并解禁429被禁用的token，并清理过期请求日志"""
         while True:
+            await asyncio.sleep(3600)  # 每小时执行一次
             try:
-                await asyncio.sleep(3600)  # 每小时执行一次
                 await token_manager.auto_unban_429_tokens()
             except Exception as e:
                 print(f"Auto-unban task error: {e}")
-
+            try:
+                if hasattr(db, "cleanup_old_request_logs"):
+                    await db.cleanup_old_request_logs()
+            except Exception as e:
+                print(f"Request log cleanup error: {e}")
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
     token_manager.start_protocol_refresher()
 
@@ -165,26 +166,31 @@ async def lifespan(app: FastAPI):
     print(f"Server running on http://{config.server_host}:{config.server_port}")
     print("=" * 60)
 
-    yield
-
-    # Shutdown
-    print("Flow2API Shutting down...")
-    # Stop file cache cleanup task
-    await generation_handler.file_cache.stop_cleanup_task()
-    # Stop auto-unban task
-    auto_unban_task_handle.cancel()
     try:
-        await auto_unban_task_handle
-    except asyncio.CancelledError:
-        pass
-    await token_manager.stop_protocol_refresher()
-    # Close browser if initialized
-    if browser_service:
-        await browser_service.close()
-        print("Browser captcha service closed")
-    print("File cache cleanup task stopped")
-    print("429 auto-unban task stopped")
-    print("Protocol token refresher stopped")
+        yield
+    finally:
+        # Shutdown
+        print("Flow2API Shutting down...")
+        # Stop file cache cleanup task
+        await generation_handler.file_cache.stop_cleanup_task()
+        # Stop auto-unban task
+        auto_unban_task_handle.cancel()
+        try:
+            await auto_unban_task_handle
+        except asyncio.CancelledError:
+            pass
+        await token_manager.stop_protocol_refresher()
+        # Close browser if initialized
+        if browser_service:
+            await browser_service.close()
+            print("Browser captcha service closed")
+        if hasattr(flow_client, "close"):
+            await flow_client.close()
+        if hasattr(db, "close"):
+            await db.close()
+        print("File cache cleanup task stopped")
+        print("429 auto-unban task stopped")
+        print("Protocol token refresher stopped")
 
 
 # Initialize components
@@ -219,7 +225,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

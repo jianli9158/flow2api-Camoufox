@@ -5,14 +5,16 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: flow2api:local
+    image: flow2api-camoufox:local
     container_name: flow2api
     ports:
       - "38000:8000"
     volumes:
       - ./data:/app/data
       - ./tmp:/app/tmp
+      - ./browser_data_rt:/app/browser_data_rt
       - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
+      - FLOW2API_SERVER_PORT=8000
     restart: unless-stopped

@@ -2,18 +2,14 @@
 
 import asyncio
 import contextvars
-import gzip
 from http.cookiejar import CookieJar
+import inspect
 import json
 import random
 import re
-import ssl
 import time
-from typing import Any, Dict, List, Optional, Union
-import urllib.error
-from urllib.parse import quote, urlparse
-import urllib.request
-
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 try:
     from curl_cffi import CurlInfo, CurlOpt
     from curl_cffi.requests import AsyncSession
@@ -62,6 +58,9 @@ class _FlowClientBase(FlowFrontendMixin):
         self.api_base_url = config.flow_api_base_url
         self.timeout = config.flow_timeout
         self._user_agent_cache = {}
+        self._http_sessions: Dict[Tuple[int, str, str, bool], Any] = {}
+        self._http_session_locks: Dict[int, asyncio.Lock] = {}
+        self._frontend_bootstrap_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
         self._request_fingerprint_ctx: contextvars.ContextVar[
             Optional[Dict[str, Any]]
         ] = contextvars.ContextVar("flow_request_fingerprint", default=None)
@@ -71,6 +70,101 @@ class _FlowClientBase(FlowFrontendMixin):
             "sec-fetch-mode": "cors",
             "sec-fetch-site": "cross-site",
         }
+
+    def _ensure_http_session_pool(
+        self,
+    ) -> Tuple[Dict[Tuple[int, str, str, bool], Any], Dict[int, asyncio.Lock]]:
+        sessions = getattr(self, "_http_sessions", None)
+        if sessions is None:
+            sessions = {}
+            self._http_sessions = sessions
+        locks = getattr(self, "_http_session_locks", None)
+        if locks is None:
+            locks = {}
+            self._http_session_locks = locks
+        return sessions, locks
+
+    async def _close_http_session(self, session: Any) -> None:
+        if session is None:
+            return
+        aexit = getattr(session, "__aexit__", None)
+        if callable(aexit):
+            try:
+                res = aexit(None, None, None)
+                if inspect.isawaitable(res):
+                    await res
+                return
+            except BaseException:
+                pass
+        close_fn = getattr(session, "close", None)
+        if callable(close_fn):
+            try:
+                res = close_fn()
+                if inspect.isawaitable(res):
+                    await res
+            except BaseException:
+                pass
+
+    async def _get_http_session(
+        self,
+        impersonate: str,
+        proxy_url: Optional[str],
+        flag: bool = False,
+    ) -> Tuple[Tuple[int, str, str, bool], Any]:
+        sessions, locks = self._ensure_http_session_pool()
+        loop_id = id(asyncio.get_running_loop())
+        normalized_impersonate = str(impersonate or "chrome")
+        key: Tuple[int, str, str, bool] = (
+            loop_id,
+            normalized_impersonate,
+            str(proxy_url or ""),
+            bool(flag),
+        )
+        existing = sessions.get(key)
+        if existing is not None:
+            return key, existing
+
+        lock = locks.get(loop_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[loop_id] = lock
+
+        async with lock:
+            existing = sessions.get(key)
+            if existing is not None:
+                return key, existing
+            created = AsyncSession(
+                trust_env=False,
+                impersonate=normalized_impersonate,
+            )
+            aenter = getattr(created, "__aenter__", None)
+            if callable(aenter):
+                entered = aenter()
+                if inspect.isawaitable(entered):
+                    entered = await entered
+                if entered is not None:
+                    created = entered
+            sessions[key] = created
+            return key, created
+
+    async def _evict_http_session(
+        self,
+        key: Tuple[int, str, str, bool],
+        session: Any,
+    ) -> None:
+        sessions, _ = self._ensure_http_session_pool()
+        if sessions.get(key) is session:
+            sessions.pop(key, None)
+        await self._close_http_session(session)
+
+    async def close(self) -> None:
+        """Close all pooled curl_cffi AsyncSession instances."""
+        sessions, locks = self._ensure_http_session_pool()
+        pooled = list(sessions.values())
+        sessions.clear()
+        locks.clear()
+        for session in pooled:
+            await self._close_http_session(session)
 
     def _generate_user_agent(self, account_id: str = None) -> str:
         if not hasattr(self, "_user_agent_cache"):
@@ -339,7 +433,6 @@ class _FlowClientBase(FlowFrontendMixin):
         use_media_proxy: bool = False,
         respect_fingerprint_proxy: bool = True,
         force_no_proxy: bool = False,
-        allow_urllib_fallback: bool = True,
         apply_default_client_headers: bool = True,
         impersonate: str = "chrome",
     ) -> Dict[str, Any]:
@@ -472,7 +565,11 @@ class _FlowClientBase(FlowFrontendMixin):
         start_time = time.time()
 
         try:
-            async with AsyncSession(trust_env=False) as session:
+            pool_key, session = await self._get_http_session(
+                impersonate=impersonate,
+                proxy_url=proxy_url,
+            )
+            try:
                 if method.upper() == "GET":
                     response = await session.get(
                         url,
@@ -493,55 +590,43 @@ class _FlowClientBase(FlowFrontendMixin):
                     else:
                         request_kwargs["json"] = json_data
                     response = await session.post(url, **request_kwargs)
+            except BaseException:
+                await self._evict_http_session(pool_key, session)
+                raise
 
-                duration_ms = (time.time() - start_time) * 1000
-                if config.debug_enabled:
-                    debug_logger.log_response(
-                        status_code=response.status_code,
-                        headers=dict(response.headers),
-                        body=response.text,
-                        duration_ms=duration_ms,
+            duration_ms = (time.time() - start_time) * 1000
+            if config.debug_enabled:
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers=dict(response.headers),
+                    body=response.text,
+                    duration_ms=duration_ms,
+                )
+
+            if response.status_code >= 400:
+                error_reason = f"HTTP Error {response.status_code}"
+                try:
+                    error_body = response.json()
+                    if "error" in error_body:
+                        error_info = error_body["error"]
+                        error_message = error_info.get("message", "")
+                        details = error_info.get("details", [])
+                        for detail in details:
+                            if detail.get("reason"):
+                                error_reason = detail.get("reason")
+                                break
+                        if error_message:
+                            error_reason = f"{error_reason}: {error_message}"
+                except Exception:
+                    error_reason = (
+                        f"HTTP Error {response.status_code}: {response.text[:200]}"
                     )
+                raise Exception(error_reason)
 
-                if response.status_code >= 400:
-                    error_reason = f"HTTP Error {response.status_code}"
-                    try:
-                        error_body = response.json()
-                        if "error" in error_body:
-                            error_info = error_body["error"]
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details:
-                                if detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                    except Exception:
-                        error_reason = (
-                            f"HTTP Error {response.status_code}: {response.text[:200]}"
-                        )
-                    raise Exception(error_reason)
-
-                return response.json()
+            return response.json()
 
         except Exception as e:
             error_msg = str(e)
-            if allow_urllib_fallback and self._should_fallback_to_urllib(error_msg):
-                try:
-                    return await asyncio.to_thread(
-                        self._sync_json_request_via_urllib,
-                        method.upper(),
-                        url,
-                        headers,
-                        json_data,
-                        proxy_url,
-                        request_timeout,
-                    )
-                except Exception as fallback_error:
-                    raise Exception(
-                        f"Flow API request failed: curl={error_msg}; urllib={fallback_error}"
-                    )
             raise Exception(f"Flow API request failed: {error_msg}")
 
     async def _make_text_request(
@@ -699,173 +784,113 @@ class _FlowClientBase(FlowFrontendMixin):
         start_time = time.time()
 
         try:
-            session_kwargs: Dict[str, Any] = {"trust_env": False}
             if cookie_jar is not None:
-                session_kwargs.update(
-                    cookies=cookie_jar, curl_infos=[CurlInfo.COOKIELIST]
-                )
-            if isinstance(cookie_jar, FlowCookieJar):
-                extra = cookie_jar.extra_cookie_header(url)
-                session_kwargs.update(
-                    curl_options={CurlOpt.COOKIE: extra},
-                    allow_redirects=not bool(extra),
-                )
-            async with AsyncSession(**session_kwargs) as session:
-                if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate=impersonate,
+                session_kwargs: Dict[str, Any] = {
+                    "trust_env": False,
+                    "cookies": cookie_jar,
+                    "curl_infos": [CurlInfo.COOKIELIST],
+                }
+                if isinstance(cookie_jar, FlowCookieJar):
+                    extra = cookie_jar.extra_cookie_header(url)
+                    session_kwargs.update(
+                        curl_options={CurlOpt.COOKIE: extra},
+                        allow_redirects=not bool(extra),
                     )
-                else:
-                    request_kwargs = {
-                        "headers": headers,
-                        "proxy": proxy_url,
-                        "timeout": request_timeout,
-                        "impersonate": impersonate,
-                    }
-                    if raw_body is not None:
-                        request_kwargs["data"] = raw_body
+                async with AsyncSession(**session_kwargs) as session:
+                    if method.upper() == "GET":
+                        response = await session.get(
+                            url,
+                            headers=headers,
+                            proxy=proxy_url,
+                            timeout=request_timeout,
+                            impersonate=impersonate,
+                        )
                     else:
-                        request_kwargs["json"] = json_data
-                    response = await session.post(url, **request_kwargs)
+                        request_kwargs = {
+                            "headers": headers,
+                            "proxy": proxy_url,
+                            "timeout": request_timeout,
+                            "impersonate": impersonate,
+                        }
+                        if raw_body is not None:
+                            request_kwargs["data"] = raw_body
+                        else:
+                            request_kwargs["json"] = json_data
+                        response = await session.post(url, **request_kwargs)
 
-                if cookie_jar is not None:
                     updater = getattr(self, "_update_flow_cookie_jar", None)
                     if updater is not None:
                         updater(cookie_jar, response)
+            else:
+                pool_key, session = await self._get_http_session(
+                    impersonate=impersonate,
+                    proxy_url=proxy_url,
+                )
+                try:
+                    if method.upper() == "GET":
+                        response = await session.get(
+                            url,
+                            headers=headers,
+                            proxy=proxy_url,
+                            timeout=request_timeout,
+                            impersonate=impersonate,
+                        )
+                    else:
+                        request_kwargs = {
+                            "headers": headers,
+                            "proxy": proxy_url,
+                            "timeout": request_timeout,
+                            "impersonate": impersonate,
+                        }
+                        if raw_body is not None:
+                            request_kwargs["data"] = raw_body
+                        else:
+                            request_kwargs["json"] = json_data
+                        response = await session.post(url, **request_kwargs)
+                except BaseException:
+                    await self._evict_http_session(pool_key, session)
+                    raise
 
-                duration_ms = (time.time() - start_time) * 1000
-                response_text = response.text
+            duration_ms = (time.time() - start_time) * 1000
+            response_text = response.text
 
-                if config.debug_enabled:
-                    debug_logger.log_response(
-                        status_code=response.status_code,
-                        headers={}
-                        if redact_sensitive_logs
-                        else dict(response.headers),
-                        body="<redacted>" if redact_sensitive_logs else response_text,
-                        duration_ms=duration_ms,
-                    )
+            if config.debug_enabled:
+                debug_logger.log_response(
+                    status_code=response.status_code,
+                    headers={}
+                    if redact_sensitive_logs
+                    else dict(response.headers),
+                    body="<redacted>" if redact_sensitive_logs else response_text,
+                    duration_ms=duration_ms,
+                )
 
-                if response.status_code >= 400 and return_error_response:
-                    return response_text
-
-                if response.status_code >= 400:
-                    error_reason = (
-                        f"HTTP Error {response.status_code}: {response_text[:500]}"
-                    )
-                    try:
-                        error_body = response.json()
-                        if "error" in error_body:
-                            error_info = error_body["error"]
-                            error_message = error_info.get("message", "")
-                            details = error_info.get("details", [])
-                            for detail in details:
-                                if detail.get("reason"):
-                                    error_reason = detail.get("reason")
-                                    break
-                            if error_message:
-                                error_reason = f"{error_reason}: {error_message}"
-                    except Exception:
-                        pass
-                    raise Exception(error_reason)
-
+            if response.status_code >= 400 and return_error_response:
                 return response_text
+
+            if response.status_code >= 400:
+                error_reason = (
+                    f"HTTP Error {response.status_code}: {response_text[:500]}"
+                )
+                try:
+                    error_body = response.json()
+                    if "error" in error_body:
+                        error_info = error_body["error"]
+                        error_message = error_info.get("message", "")
+                        details = error_info.get("details", [])
+                        for detail in details:
+                            if detail.get("reason"):
+                                error_reason = detail.get("reason")
+                                break
+                        if error_message:
+                            error_reason = f"{error_reason}: {error_message}"
+                except Exception:
+                    pass
+                raise Exception(error_reason)
+
+            return response_text
 
         except Exception as e:
             raise Exception(f"Flow API text request failed: {str(e)}")
-
-    def _should_fallback_to_urllib(self, error_message: str) -> bool:
-        error_lower = (error_message or "").lower()
-        return any(
-            keyword in error_lower
-            for keyword in [
-                "curl: (6)",
-                "curl: (7)",
-                "curl: (28)",
-                "curl: (35)",
-                "curl: (52)",
-                "curl: (56)",
-                "connection timed out",
-                "could not connect",
-                "failed to connect",
-                "ssl connect error",
-                "tls connect error",
-                "network is unreachable",
-            ]
-        )
-
-    def _sync_json_request_via_urllib(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict[str, Any]],
-        json_data: Optional[Dict[str, Any]],
-        proxy_url: Optional[str],
-        timeout: int,
-    ) -> Dict[str, Any]:
-        request_headers = dict(headers or {})
-        request_headers.setdefault("Accept", "application/json")
-        request_headers["Accept-Encoding"] = "identity"
-
-        data = None
-        if method.upper() != "GET" and json_data is not None:
-            data = json.dumps(json_data, ensure_ascii=False).encode("utf-8")
-            request_headers["Content-Type"] = "application/json"
-
-        handlers = [urllib.request.HTTPSHandler(context=ssl.create_default_context())]
-        if proxy_url:
-            handlers.append(
-                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-            )
-
-        opener = urllib.request.build_opener(*handlers)
-        request = urllib.request.Request(
-            url=url,
-            data=data,
-            headers=request_headers,
-            method=method.upper(),
-        )
-
-        try:
-            with opener.open(request, timeout=timeout) as response:
-                payload = response.read()
-                status_code = int(response.getcode() or 0)
-                content_encoding = str(
-                    response.headers.get("Content-Encoding") or ""
-                ).lower()
-        except urllib.error.HTTPError as exc:
-            payload = exc.read() if hasattr(exc, "read") else b""
-            status_code = int(getattr(exc, "code", 500) or 500)
-            content_encoding = str(
-                getattr(exc, "headers", {}).get("Content-Encoding") or ""
-            ).lower()
-            if content_encoding == "gzip" and payload:
-                try:
-                    payload = gzip.decompress(payload)
-                except Exception:
-                    pass
-            body_text = payload.decode("utf-8", errors="replace")
-            raise Exception(f"HTTP Error {status_code}: {body_text[:200]}") from exc
-        except Exception as exc:
-            raise Exception(str(exc)) from exc
-
-        if content_encoding == "gzip" and payload:
-            try:
-                payload = gzip.decompress(payload)
-            except Exception:
-                pass
-        body_text = payload.decode("utf-8", errors="replace")
-        if status_code >= 400:
-            raise Exception(f"HTTP Error {status_code}: {body_text[:200]}")
-
-        try:
-            return json.loads(body_text) if body_text else {}
-        except Exception as exc:
-            raise Exception(f"Invalid JSON response: {body_text[:200]}") from exc
 
     def _is_proxy_connection_error(self, error: Exception) -> bool:
         error_lower = str(error).lower()

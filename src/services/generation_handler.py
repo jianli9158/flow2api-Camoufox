@@ -1563,6 +1563,43 @@ class GenerationHandler:
         )
         return token_obj is not None
 
+    async def _upload_reference_images(
+        self,
+        token: Any,
+        images: List[bytes],
+        aspect_ratio: str,
+        project_id: str,
+    ) -> List[str]:
+        """Upload reference images (direct for 1 image, bounded concurrency for >1)."""
+        google_cookies = getattr(token, "google_cookies", None)
+        if len(images) == 1:
+            media_id = await self.flow_client.upload_image(
+                token.at,
+                images[0],
+                aspect_ratio,
+                project_id=project_id,
+                token_id=token.id,
+                google_cookies=google_cookies,
+            )
+            return [media_id]
+
+        semaphore = asyncio.Semaphore(3)
+
+        async def _upload_single(image_bytes: bytes) -> str:
+            async with semaphore:
+                return await self.flow_client.upload_image(
+                    token.at,
+                    image_bytes,
+                    aspect_ratio,
+                    project_id=project_id,
+                    token_id=token.id,
+                    google_cookies=google_cookies,
+                )
+
+        return list(
+            await asyncio.gather(*(_upload_single(img) for img in images))
+        )
+
     async def handle_generation(
         self,
         model: str,
@@ -1571,6 +1608,7 @@ class GenerationHandler:
         stream: bool = False,
         base_url_override: Optional[str] = None,
         video_media_id: Optional[str] = None,
+        token: Optional[Any] = None,
     ) -> AsyncGenerator:
         """统一生成入口
 
@@ -1581,7 +1619,7 @@ class GenerationHandler:
             stream: 是否流式输出
         """
         start_time = time.time()
-        token = None
+        token_selected_via_lb = False
         generation_type = None
         pending_token_state = {"active": False}
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
@@ -1655,22 +1693,24 @@ class GenerationHandler:
         debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
         token_select_started_at = time.time()
 
-        if generation_type == "image":
-            token = await self.load_balancer.select_token(
-                for_image_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
-        else:
-            token = await self.load_balancer.select_token(
-                for_video_generation=True,
-                model=model,
-                reserve=False,
-                enforce_concurrency_filter=False,
-                track_pending=True,
-            )
+        if token is None:
+            if generation_type == "image":
+                token = await self.load_balancer.select_token(
+                    for_image_generation=True,
+                    model=model,
+                    reserve=False,
+                    enforce_concurrency_filter=False,
+                    track_pending=True,
+                )
+            else:
+                token = await self.load_balancer.select_token(
+                    for_video_generation=True,
+                    model=model,
+                    reserve=False,
+                    enforce_concurrency_filter=False,
+                    track_pending=True,
+                )
+            token_selected_via_lb = token is not None
         perf_trace["token_select_ms"] = int(
             (time.time() - token_select_started_at) * 1000
         )
@@ -1730,7 +1770,8 @@ class GenerationHandler:
                 progress=15,
             )
             ensure_at_started_at = time.time()
-            token = await self.token_manager.ensure_valid_token(token)
+            if not token_selected_via_lb:
+                token = await self.token_manager.ensure_valid_token(token)
             perf_trace["ensure_at_ms"] = int(
                 (time.time() - ensure_at_started_at) * 1000
             )
@@ -2072,19 +2113,17 @@ class GenerationHandler:
                         f"上传 {len(images)} 张参考图片...\n"
                     )
 
-                # 支持多图输入
-                for idx, image_bytes in enumerate(images):
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        image_bytes,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
+                # 支持多图输入（多图并行上传，保持原始顺序）
+                uploaded_media_ids = await self._upload_reference_images(
+                    token=token,
+                    images=images,
+                    aspect_ratio=model_config["aspect_ratio"],
+                    project_id=project_id,
+                )
+                for idx, media_id in enumerate(uploaded_media_ids):
                     image_inputs.append(
                         {
-                        "name": media_id,
+                            "name": media_id,
                             "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
                         }
                     )
@@ -2575,24 +2614,16 @@ class GenerationHandler:
                     debug_logger.log_info(f"[I2V] 仅上传首帧: {start_media_id}")
 
                 elif image_count == 2:
-                    # 2张图: 首帧+尾帧
+                    # 2张图: 首帧+尾帧（并行上传并保持首尾顺序）
                     if stream:
                         yield self._create_stream_chunk("上传首帧和尾帧图片...\n")
-                    start_media_id = await self.flow_client.upload_image(
-                        token.at,
-                        images[0],
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
-                    end_media_id = await self.flow_client.upload_image(
-                        token.at,
-                        images[1],
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
+                    start_media_id, end_media_id = (
+                        await self._upload_reference_images(
+                            token=token,
+                            images=images[:2],
+                            aspect_ratio=model_config["aspect_ratio"],
+                            project_id=project_id,
+                        )
                     )
                     debug_logger.log_info(
                         f"[I2V] 上传首尾帧: {start_media_id}, {end_media_id}"
@@ -2605,18 +2636,16 @@ class GenerationHandler:
                         f"上传 {image_count} 张参考图片...\n"
                     )
 
-                for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        img,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
+                uploaded_media_ids = await self._upload_reference_images(
+                    token=token,
+                    images=images,
+                    aspect_ratio=model_config["aspect_ratio"],
+                    project_id=project_id,
+                )
+                for media_id in uploaded_media_ids:
                     reference_images.append(
                         {
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
                             "mediaId": media_id,
                         }
                     )
@@ -2631,18 +2660,16 @@ class GenerationHandler:
                         f"上传 {image_count} 张 Omni 参考图片...\n"
                     )
 
-                for img in images:
-                    media_id = await self.flow_client.upload_image(
-                        token.at,
-                        img,
-                        model_config["aspect_ratio"],
-                        project_id=project_id,
-                        token_id=token.id,
-                        google_cookies=getattr(token, "google_cookies", None),
-                    )
+                uploaded_media_ids = await self._upload_reference_images(
+                    token=token,
+                    images=images,
+                    aspect_ratio=model_config["aspect_ratio"],
+                    project_id=project_id,
+                )
+                for media_id in uploaded_media_ids:
                     reference_images.append(
                         {
-                        "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
+                            "imageUsageType": "IMAGE_USAGE_TYPE_ASSET",
                             "mediaId": media_id,
                         }
                     )
@@ -3451,8 +3478,14 @@ class GenerationHandler:
                 )
             effective_progress = max(0, min(100, int(effective_progress)))
 
-            request_body = json.dumps(request_data, ensure_ascii=False)
-            response_body = json.dumps(response_data, ensure_ascii=False)
+            sanitized_request = debug_logger._truncate_large_fields(
+                request_data, max_length=256
+            )
+            sanitized_response = debug_logger._truncate_large_fields(
+                response_data, max_length=256
+            )
+            request_body = json.dumps(sanitized_request, ensure_ascii=False)
+            response_body = json.dumps(sanitized_response, ensure_ascii=False)
 
             if log_id:
                 await self.db.update_request_log(

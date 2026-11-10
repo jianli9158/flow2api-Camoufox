@@ -175,15 +175,18 @@ class CurrentFlowClientMixin:
             google_cookies=google_cookies,
             token_id=token_id,
         )
-        return await self._call_flow_frontend_rpc(
-            rpc_id=rpc_id,
-            argument=argument,
-            cookie_header="",
-            timeout=effective_timeout,
-            project_id=project_id,
-            source_path=source_path,
-            cookie_storage=cookie_storage,
-        )
+        rpc_kwargs: Dict[str, Any] = {
+            "rpc_id": rpc_id,
+            "argument": argument,
+            "cookie_header": "",
+            "timeout": effective_timeout,
+            "project_id": project_id,
+            "source_path": source_path,
+            "cookie_storage": cookie_storage,
+        }
+        if token_id is not None:
+            rpc_kwargs["token_id"] = token_id
+        return await self._call_flow_frontend_rpc(**rpc_kwargs)
 
     async def st_to_at(
         self,
@@ -208,6 +211,10 @@ class CurrentFlowClientMixin:
             "user": {},
             "credits": credits.get("credits", 0),
             "userPaygateTier": credits.get("userPaygateTier"),
+            "user_paygate_tier": credits.get("userPaygateTier"),
+            "_credits_result": dict(credits)
+            if isinstance(credits, dict)
+            else {"credits": 0},
             "google_cookies": _safe_updated_flow_cookies(self, google_cookies),
         }
 
@@ -460,7 +467,7 @@ class CurrentFlowClientMixin:
                     .strip()
                     .lower()
                 )
-                if captcha_method in {"browser", "camoufox"}:
+                if captcha_method in {"browser", "camoufox"} and not image_inputs:
                     from .browser_captcha import BrowserCaptchaService
 
                     service = await BrowserCaptchaService.get_instance(self.db)
@@ -1159,15 +1166,6 @@ class CurrentFlowClientMixin:
     ) -> Dict[str, Any]:
         raise RuntimeError(
             "Character media is submitted through the current reference-media RPC"
-        )
-
-    async def stream_flow_creation_agent(
-        self,
-        *args: Any,
-        **kwargs: Any,
-    ) -> List[Dict[str, Any]]:
-        raise RuntimeError(
-            "Direct AI Sandbox agent streaming is retired; use current generation RPCs"
         )
 
     async def _warmup_flow_video_frontend_context(
