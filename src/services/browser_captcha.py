@@ -721,16 +721,20 @@ class BrowserCaptchaService:
         self._stats["req_total"] += 1
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(project_id, token_id) as request:
-            token, session_id = await asyncio.wait_for(
-                request.browser.get_token(
-                    project_id,
-                    self.website_key,
-                    action,
-                    token_proxy_url=token_proxy_url,
-                    token_id=token_id,
-                ),
-                timeout=max(1, float(config.flow_timeout)),
-            )
+            try:
+                token, session_id = await asyncio.wait_for(
+                    request.browser.get_token(
+                        project_id,
+                        self.website_key,
+                        action,
+                        token_proxy_url=token_proxy_url,
+                        token_id=token_id,
+                    ),
+                    timeout=max(1, float(config.flow_timeout)),
+                )
+            except Exception:
+                self._stats["gen_fail"] += 1
+                raise
             request.generation = getattr(request.browser, "_runtime_generation", 0)
             request.fingerprint = (
                 deepcopy(request.browser.get_last_fingerprint()) if token else None
@@ -906,18 +910,35 @@ class BrowserCaptchaService:
             if not callable(executor):
                 return None
             remaining = max(5.0, deadline - time.monotonic())
-            response = await asyncio.wait_for(
-                executor(
-                    rpc_id=rpc_id,
-                    argument=argument,
-                    project_id=project_id,
-                    source_path=source_path,
-                    timeout=int(remaining),
-                    token_id=token_id,
-                    token_proxy_url=token_proxy_url,
-                ),
-                timeout=remaining + 10.0,
-            )
+            try:
+                response = await asyncio.wait_for(
+                    executor(
+                        rpc_id=rpc_id,
+                        argument=argument,
+                        project_id=project_id,
+                        source_path=source_path,
+                        timeout=int(remaining),
+                        token_id=token_id,
+                        token_proxy_url=token_proxy_url,
+                    ),
+                    timeout=remaining + 10.0,
+                )
+            except asyncio.TimeoutError as exc:
+                error = RuntimeError(
+                    f"Flow frontend RPC ({rpc_id}) timed out after {int(remaining)}s"
+                )
+                if rpc_id in {
+                    "ogiZ0b",
+                    "SPrCad",
+                    "YhhmEf",
+                    "eb1hJf",
+                    "nprQif",
+                    "MZZa6b",
+                    "fZytfe",
+                    "p0UkFb",
+                }:
+                    error.submission_uncertain = True
+                raise error from exc
             request.generation = getattr(request.browser, "_runtime_generation", 0)
             request.fingerprint = deepcopy(request.browser.get_last_fingerprint())
             if isinstance(response, dict) and int(response.get("status") or 0) >= 400:

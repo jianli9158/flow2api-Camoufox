@@ -2,7 +2,8 @@
 
 import asyncio
 import random
-from typing import Optional, Dict
+import time
+from typing import Optional, Dict, Set
 from ..core.models import Token
 from ..core.config import config
 from ..core.account_tiers import (
@@ -32,6 +33,31 @@ class LoadBalancer:
             "default": None,
         }
         self._rr_lock = asyncio.Lock()
+        self._token_cooldowns: Dict[int, float] = {}
+
+    def mark_token_cooldown(
+        self, token_id: Optional[int], seconds: float = 180.0, reason: str = ""
+    ) -> None:
+        if token_id is None:
+            return
+        ttl = max(5.0, float(seconds or 180.0))
+        self._token_cooldowns[int(token_id)] = time.monotonic() + ttl
+        debug_logger.log_warning(
+            f"[LOAD_BALANCER] Token {token_id} 进入风控冷却 {ttl:.0f}s"
+            + (f" ({reason})" if reason else "")
+        )
+
+    def is_token_in_cooldown(self, token_id: Optional[int]) -> bool:
+        if token_id is None:
+            return False
+        key = int(token_id)
+        until = self._token_cooldowns.get(key)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            self._token_cooldowns.pop(key, None)
+            return False
+        return True
 
     async def _get_pending_count(
         self, token_id: int, for_image_generation: bool, for_video_generation: bool
@@ -151,6 +177,7 @@ class LoadBalancer:
         reserve: bool = False,
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
+        excluded_token_ids: Optional[Set[int]] = None,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -190,6 +217,9 @@ class LoadBalancer:
         required_tier = get_required_paygate_tier_for_model(model)
 
         for token in active_tokens:
+            if excluded_token_ids and token.id in excluded_token_ids:
+                filtered_reasons[token.id] = "当前请求已跳过"
+                continue
             normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
             if model and not supports_model_for_tier(model, normalized_tier):
                 filtered_reasons[token.id] = (
@@ -233,6 +263,7 @@ class LoadBalancer:
                 "inflight": inflight,
                 "remaining": remaining,
                 "needs_refresh": self.token_manager.needs_at_refresh(token),
+                "in_cooldown": self.is_token_in_cooldown(token.id),
                     "random": random.random(),
                 }
             )
@@ -257,21 +288,29 @@ class LoadBalancer:
             elif for_video_generation:
                 scenario = "video"
 
+            non_cooled = [item for item in available_tokens if not item["in_cooldown"]]
+            cooled = [item for item in available_tokens if item["in_cooldown"]]
+            rr_pool = non_cooled or cooled
             ordered_candidates = []
-            first_candidate = await self._select_round_robin(available_tokens, scenario)
+            first_candidate = await self._select_round_robin(rr_pool, scenario)
             if first_candidate is not None:
                 ordered_candidates.append(first_candidate)
                 ordered_candidates.extend(
                     item
                     for item in sorted(
-                        available_tokens, key=lambda item: item["token"].id or 0
+                        rr_pool, key=lambda item: item["token"].id or 0
                     )
                     if item["token"].id != first_candidate["token"].id
+                )
+            if non_cooled and cooled:
+                ordered_candidates.extend(
+                    sorted(cooled, key=lambda item: item["token"].id or 0)
                 )
             available_tokens = ordered_candidates
         else:
             available_tokens.sort(
                 key=lambda item: (
+                    1 if item["in_cooldown"] else 0,
                     1 if item["needs_refresh"] else 0,
                     item["inflight"],
                     0 if item["remaining"] is None else 1,
@@ -281,13 +320,20 @@ class LoadBalancer:
             )
 
         ready_candidates = [
-            item for item in available_tokens if not item["needs_refresh"]
+            item
+            for item in available_tokens
+            if not item["needs_refresh"] and not item["in_cooldown"]
         ]
         refresh_candidates = [
-            item for item in available_tokens if item["needs_refresh"]
+            item
+            for item in available_tokens
+            if item["needs_refresh"] and not item["in_cooldown"]
         ]
-        if ready_candidates and refresh_candidates:
-            available_tokens = ready_candidates + refresh_candidates
+        cooled_candidates = [
+            item for item in available_tokens if item["in_cooldown"]
+        ]
+        if ready_candidates or refresh_candidates:
+            available_tokens = ready_candidates + refresh_candidates + cooled_candidates
 
         debug_logger.log_info("[LOAD_BALANCER] 候选Token负载:")
         for item in available_tokens:

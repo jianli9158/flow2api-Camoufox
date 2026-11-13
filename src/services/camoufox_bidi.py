@@ -2884,8 +2884,8 @@ class CamoufoxWorker:
                         debug_logger.log_warning(
                             f"[Camoufox] Slot-{self.token_id} 第 {attempt + 1}/{max_retries} 次取码失败: {exc}"
                         )
-                        if "登录态已失效" in str(exc):
-                            break
+                        if "登录态已失效" in str(exc) or "登录已失效" in str(exc):
+                            raise
                         if self._consecutive_browser_failures >= 2 or (
                             self._bidi and self._bidi._closed
                         ):

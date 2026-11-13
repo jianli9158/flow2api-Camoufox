@@ -20,11 +20,16 @@ from ..core.logger import debug_logger
 # 简化模型名 → 基础模型名前缀 的映射
 # ──────────────────────────────────────────────
 IMAGE_BASE_MODELS = {
-    # Gemini 3.0 Pro (GEM_PIX_2)
+    # Gemini 3.0 Pro (GEM_PIX_2 / Nano Banana Pro)
     "gemini-3.0-pro-image": "gemini-3.0-pro-image",
-    # Nano Banana 2.1, with the existing Gemini 3.1 alias retained.
+    "nano-banana-pro": "gemini-3.0-pro-image",
+    # Nano Banana 2.1 (BELUGA), with the existing Gemini 3.1 alias retained.
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
+    "nano-banana-2.1": "gemini-3.1-flash-image",
+    "nano-banana-2": "gemini-3.1-flash-image",
+    # Nano Banana 2 Lite (HARBOR_SEAL)
     "gemini-3.1-flash-lite-image": "gemini-3.1-flash-lite-image",
+    "nano-banana-2-lite": "gemini-3.1-flash-lite-image",
 }
 
 # ──────────────────────────────────────────────

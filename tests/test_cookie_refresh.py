@@ -582,6 +582,20 @@ class TokenCookieRefreshTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.manager._refresh_at_inner(self.token_id))
         self.assertFalse((await self.db.get_token(self.token_id)).is_active)
 
+    async def test_refresh_cookies_disables_token_when_camoufox_reports_expired_login(self):
+        service = make_failing_browser_service(RuntimeError("Flow 登录已失效，请重新同步 Google Cookies"))
+        with (
+            patch("src.services.token_manager.config") as config,
+            patch.object(BrowserCaptchaService, "_instance", service),
+            patch.object(BrowserCaptchaService, "get_instance", AsyncMock(return_value=service)),
+        ):
+            config.captcha_method = "camoufox"
+            config.browser_captcha_engine = "camoufox"
+            self.assertFalse(await self.manager.refresh_cookies(self.token_id))
+        latest = await self.db.get_token(self.token_id)
+        self.assertFalse(latest.is_active)
+        self.assertIn("Flow 登录已失效", latest.last_st_refresh_result)
+
 
 class CookieRefreshScheduleTests(unittest.IsolatedAsyncioTestCase):
     """The Flow frontend AT is static, so refresh must follow the Cookie interval."""

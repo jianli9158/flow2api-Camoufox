@@ -1069,6 +1069,19 @@ class _FlowClientBase(FlowFrontendMixin):
             return None
         if "model_access_denied" in error_lower:
             return None
+        if any(
+            marker in error_lower
+            for marker in (
+                "public_error_unusual_activity",
+                "public_error_unsafe_generation",
+                "public_error_prominent_people_filter_failed",
+                "public_error_model_access_denied",
+                "too much traffic",
+                "登录态已失效",
+                "登录已失效",
+            )
+        ):
+            return None
         if "403" in error_lower:
             return "403错误"
         if "429" in error_lower or "too many requests" in error_lower:
@@ -1213,7 +1226,12 @@ class _FlowClientBase(FlowFrontendMixin):
         except Exception as e:
             from .browser_captcha import BrowserCaptchaQueueTimeout
 
-            if isinstance(e, BrowserCaptchaQueueTimeout):
+            err_msg = str(e)
+            if (
+                isinstance(e, BrowserCaptchaQueueTimeout)
+                or "登录态已失效" in err_msg
+                or "登录已失效" in err_msg
+            ):
                 raise
             debug_logger.log_error(f"[reCAPTCHA Camoufox] 错误: {str(e)}")
             self._set_request_fingerprint(None)

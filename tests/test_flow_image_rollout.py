@@ -125,6 +125,32 @@ class ImageModelCatalogTests(unittest.TestCase):
         self.assertEqual(
             MODEL_CONFIG["gemini-3.0-pro-image-landscape"]["model_name"], "GEM_PIX_2"
         )
+        pro = {
+            name: entry
+            for name, entry in MODEL_CONFIG.items()
+            if name.startswith("gemini-3.0-pro-image-")
+        }
+        self.assertEqual(len(pro), 15)
+        for name, entry in pro.items():
+            self.assertEqual(entry["model_name"], "GEM_PIX_2")
+            self.assertEqual(entry["display_name"], "Nano Banana Pro")
+            self.assertTrue(entry["listed"])
+        self.assertTrue(set(pro) <= openai)
+        self.assertTrue(set(pro) <= set(gemini))
+
+    def test_nano_banana_friendly_aliases_resolve_to_current_catalog(self):
+        self.assertEqual(
+            resolve_model_name("nano-banana-2.1", model_config=MODEL_CONFIG),
+            "gemini-3.1-flash-image-landscape",
+        )
+        self.assertEqual(
+            resolve_model_name("nano-banana-2-lite", model_config=MODEL_CONFIG),
+            "gemini-3.1-flash-lite-image-landscape",
+        )
+        self.assertEqual(
+            resolve_model_name("nano-banana-pro", model_config=MODEL_CONFIG),
+            "gemini-3.0-pro-image-landscape",
+        )
 
     def test_catalog_only_references_current_image_fields(self):
         self.assertEqual(
@@ -411,6 +437,212 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(models, ["BELUGA", "BELUGA"])
 
+    async def test_camoufox_mode_submits_direct_rpc_without_streamchat_ui_hijack(self):
+        import asyncio
+        from contextlib import asynccontextmanager
+        from src.services.browser_captcha import BrowserCaptchaService
+
+        fake_service = types.SimpleNamespace(
+            generate_native_image=AsyncMock(side_effect=AssertionError("should not call StreamChat UI")),
+            generate_native_video=AsyncMock(side_effect=AssertionError("should not call StreamChat UI")),
+        )
+        with patch.object(
+            type(config),
+            "captcha_method",
+            new_callable=PropertyMock,
+            return_value="camoufox",
+        ), patch.object(
+            BrowserCaptchaService,
+            "get_instance",
+            AsyncMock(return_value=fake_service),
+        ):
+            await self.client.generate_image(
+                "access",
+                PROJECT_ID,
+                "an apple",
+                "BELUGA",
+                "IMAGE_ASPECT_RATIO_LANDSCAPE",
+                token_id=7,
+            )
+            self.client._current_rpc.assert_awaited_once()
+            self.assertEqual(self.client._current_rpc.call_args.kwargs["rpc_id"], "ogiZ0b")
+
+            self.client._current_rpc.reset_mock()
+            self.client._get_recaptcha_token = AsyncMock(return_value=("CAPTCHA-V", None))
+            self.client._current_rpc = AsyncMock(
+                return_value=[["11111111-1111-1111-1111-111111111111", PROJECT_ID, "22222222-2222-2222-2222-222222222222"]]
+            )
+            await self.client.generate_video_text(
+                "access",
+                PROJECT_ID,
+                "ocean waves",
+                "veo_3_1_t2v_fast",
+                "VIDEO_ASPECT_RATIO_LANDSCAPE",
+                use_v2_model_config=True,
+                token_id=7,
+            )
+            self.client._current_rpc.assert_awaited_once()
+            self.assertEqual(self.client._current_rpc.call_args.kwargs["rpc_id"], "YhhmEf")
+        fake_service.generate_native_image.assert_not_called()
+        fake_service.generate_native_video.assert_not_called()
+
+        service = BrowserCaptchaService(db=None)
+        fake_browser = types.SimpleNamespace(
+            execute_flow_frontend_rpc=AsyncMock(side_effect=asyncio.TimeoutError()),
+            get_last_fingerprint=lambda: {},
+            _runtime_generation=0,
+        )
+        fake_request = types.SimpleNamespace(
+            ref="0:lease-1/",
+            browser=fake_browser,
+            generation=0,
+            fingerprint=None,
+            failed=False,
+        )
+
+        @asynccontextmanager
+        async def _borrow(*args, **kwargs):
+            yield fake_request
+
+        service._borrow_browser = _borrow
+        service._resolve_token_proxy_url = AsyncMock(return_value=None)
+        with self.assertRaises(RuntimeError) as ctx:
+            await service.execute_flow_frontend_rpc(
+                rpc_id="ogiZ0b",
+                argument=["arg"],
+                project_id=PROJECT_ID,
+                timeout=10,
+                token_id=7,
+            )
+        self.assertIn("ogiZ0b", str(ctx.exception))
+        self.assertTrue(getattr(ctx.exception, "submission_uncertain", False))
+
+
+    async def test_expired_login_from_camoufox_is_propagated_not_swallowed(self):
+        from src.services.browser_captcha import BrowserCaptchaService
+        from src.services.camoufox_bidi import CamoufoxWorker
+        from src.services.flow_client import FlowClient
+
+        client = FlowClient(proxy_manager=None, db=None)
+        fake_service = types.SimpleNamespace(
+            get_token=AsyncMock(
+                side_effect=RuntimeError(
+                    "Flow 账号登录态已失效（页面已跳转至未登录页），请在后台点击该账号的「重登」重新登录"
+                )
+            )
+        )
+        with patch.object(
+            BrowserCaptchaService, "get_instance", AsyncMock(return_value=fake_service)
+        ):
+            with self.assertRaisesRegex(RuntimeError, "登录态已失效"):
+                await client._get_recaptcha_token(PROJECT_ID, action="IMAGE_GENERATION", token_id=1)
+
+        worker = CamoufoxWorker(0, "/tmp/nonexistent-camoufox-test")
+        worker._get_or_create_shared_browser = AsyncMock(return_value=(None, None, "ctx"))
+        worker._ensure_flow_page_ready = AsyncMock(
+            side_effect=RuntimeError("Flow 账号登录态已失效（页面已跳转至未登录页）")
+        )
+        with self.assertRaisesRegex(RuntimeError, "登录态已失效"):
+            await worker.get_token(PROJECT_ID, token_id=1)
+
+    async def test_load_balancer_cooldown_and_generation_handler_failover(self):
+        from src.core.models import Token
+        from src.services.generation_handler import GenerationHandler
+        from src.services.load_balancer import LoadBalancer
+
+        tok3 = Token(id=3, st="st3", at="at3", email="risk@example.com", is_active=True, image_enabled=True, video_enabled=True)
+        tok2 = Token(id=2, st="st2", at="at2", email="good@example.com", is_active=True, image_enabled=True, video_enabled=True)
+
+        tm = types.SimpleNamespace(
+            get_active_tokens=AsyncMock(return_value=[tok3, tok2]),
+            needs_at_refresh=lambda t: False,
+            ensure_valid_token=AsyncMock(side_effect=lambda t: t),
+            ensure_project_exists=AsyncMock(return_value="proj-1"),
+            record_usage=AsyncMock(),
+            record_success=AsyncMock(),
+            record_error=AsyncMock(),
+            disable_token=AsyncMock(),
+        )
+        lb = LoadBalancer(tm)
+        lb.mark_token_cooldown(3, seconds=60.0, reason="PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+        chosen = await lb.select_token(for_image_generation=True, model="gemini-3.1-flash-image-landscape")
+        self.assertEqual(chosen.id, 2)
+        chosen2 = await lb.select_token(
+            for_image_generation=True,
+            model="gemini-3.1-flash-image-landscape",
+            excluded_token_ids={2},
+        )
+        self.assertEqual(chosen2.id, 3)
+
+        # Verify GenerationHandler fails over cleanly on PUBLIC_ERROR_UNUSUAL_ACTIVITY,
+        # but NEVER fails over when submission_uncertain=True.
+        lb2 = LoadBalancer(tm)
+        handler = GenerationHandler.__new__(GenerationHandler)
+        lb2._round_robin_state["image"] = 2
+        handler.token_manager = tm
+        handler.load_balancer = lb2
+        handler.proxy_manager = None
+        handler.db = types.SimpleNamespace()
+        handler.file_cache = types.SimpleNamespace()
+        handler._log_request = AsyncMock(return_value=None)
+        handler._update_request_log_progress = AsyncMock()
+
+        async def fake_generate_image(*, token_id, **kwargs):
+            if token_id == 3:
+                raise RuntimeError("Flow frontend RPC rejected: rpc=ogiZ0b, error=PUBLIC_ERROR_UNUSUAL_ACTIVITY")
+            return (
+                {"media": [{"name": "m1", "image": {"generatedImage": {"fifeUrl": "https://flow-content.google/image/ok"}}}]},
+                "sess-1",
+                {},
+            )
+
+        handler.flow_client = types.SimpleNamespace(
+            clear_request_fingerprint=lambda: None,
+            generate_image=AsyncMock(side_effect=fake_generate_image),
+            get_request_fingerprint=lambda: None,
+        )
+        with (
+            patch("src.services.generation_handler.config") as mock_cfg,
+            patch("src.services.load_balancer.config") as mock_lb_cfg,
+        ):
+            mock_cfg.cache_enabled = False
+            mock_cfg.call_logic_mode = "polling"
+            mock_lb_cfg.call_logic_mode = "polling"
+            chunks = [
+                c
+                async for c in handler.handle_generation(
+                    "gemini-3.1-flash-image-landscape",
+                    "a small cup",
+                    stream=False,
+                )
+            ]
+        joined = "".join(str(c) for c in chunks)
+        self.assertIn("https://flow-content.google/image/ok", joined)
+        self.assertTrue(lb2.is_token_in_cooldown(3))
+        self.assertEqual(handler.flow_client.generate_image.await_count, 2)
+
+        # Uncertain submission must NOT fail over to another account.
+        uncertain_err = RuntimeError("Flow frontend RPC timeout: rpc=ogiZ0b")
+        uncertain_err.submission_uncertain = True
+        self.assertFalse(handler._should_failover_token(uncertain_err, {}))
+
+        # Verify _get_retry_reason does not retry PUBLIC_ERROR_UNUSUAL_ACTIVITY on the same token.
+        from src.services.flow_client import FlowClient
+        real_client = FlowClient(proxy_manager=None, db=None)
+        self.assertIsNone(
+            real_client._get_retry_reason(
+                "Flow frontend RPC rejected: rpc=ogiZ0b, error=PUBLIC_ERROR_UNUSUAL_ACTIVITY"
+            )
+        )
+        self.assertIsNone(
+            real_client._get_retry_reason(
+                "Flow frontend RPC rejected: rpc=ogiZ0b, error=PUBLIC_ERROR_UNSAFE_GENERATION"
+            )
+        )
+        self.assertEqual(
+            real_client._get_retry_reason("HTTP Error 500: upstream error"),
+            "500/内部错误",
+        )
 
 if __name__ == "__main__":
     unittest.main()

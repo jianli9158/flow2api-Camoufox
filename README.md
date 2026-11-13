@@ -15,12 +15,12 @@
 
 ## ✨ 核心特性
 
-- 🦊 **Camoufox + WebDriver BiDi 原生引擎**：移植自 `AIStudio2API` 的反检测浏览器架构，内置 C++ 级 Windows 10/11 硬件指纹、WebGL 显卡特征、字体子集与音频上下文锁定，彻底解决 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 与 reCAPTCHA Enterprise v3 低分拦截。
-- ⚡ **页面内原生 `StreamChat` 生成管线**：文生图、图生图、文生视频、首尾帧/多参考图视频直接在持久化 `/project/{id}` 页面内通过真实 WebDriver BiDi 交互与 `StreamChat` / `batchexecute` 完成，避免打码端与请求端 TLS/Cookie/Session 割裂。
+- 🦊 **Camoufox + WebDriver BiDi 原生引擎**：移植自 `AIStudio2API` 的反检测浏览器架构，内置 C++ 级 Windows 10/11 硬件指纹、WebGL 显卡特征、字体子集与音频上下文锁定，结合页面内同源 `batchexecute` RPC（`ogiZ0b` / `YhhmEf` / `fZytfe` / `p0UkFb`）与真实 `reCAPTCHA Enterprise` 打码，避免打码端与请求端 TLS/Cookie/Session 割裂。
+- 🛡️ **多账号风控冷却、自动故障转移与防重复提交**：`LoadBalancer` 与 `GenerationHandler` 支持在提交前遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` / `too much traffic` / `429` 时自动冷却当前账号（默认 180 秒）并无感切换下一个可用账号；检测到登录态失效时立即冒泡并自动禁用对应 Token；对生成类 RPC 超时严格标记 `submission_uncertain` 防止重复扣费。
 - 🖥️ **WebSocket LiveView 远程登录向导**：管理后台内置无头浏览器实时画面流（Canvas 帧流 + 键鼠转发），无需桌面环境或 Xvfb，直接在网页内完成 Google 账号登录并自动导出完整 Cookie 与持久化 Profile。
 - 🔄 **全自动无感 Cookie 续期**：服务启动时自动唤醒常驻 Camoufox 槽位，后台定时通过账号绑定的真实浏览器实例续期 `__Secure-1PSIDTS` / `SIDCC` / `OSID` 并同步写回 SQLite 与 `storage-state.json`。
-- 🪶 **极致精简代码库**：彻底移除旧版 `nodriver` / `playwright` 有头打码、Chrome 打码扩展以及 10 家第三方付费打码通道（净删减近 3 万行历史冗余代码），无需任何第三方打码 API Key。
-- 🧩 **双协议兼容**：同时支持 OpenAI `/v1/chat/completions`（流式/非流式）与 Gemini 官方 `/v1beta/models/{model}:generateContent` / `:streamGenerateContent` 接口。
+- 🪶 **极致精简与高性能工程化**：彻底移除旧版 `nodriver` / `playwright` 有头打码、Chrome 扩展目录（`extension/`）及 10 家第三方付费打码通道；内置持久化 SQLite 连接池、HTTP/TLS 连接复用与非阻塞异步媒体缓存。
+- 🧩 **双协议兼容**：同时支持 OpenAI `/v1/chat/completions`（流式/非流式）与 Gemini 官方 `/v1beta/models/{model}:generateContent` / `:streamGenerateContent`（及 `/models/...`）接口。
 - 📊 **全新管理控制台**：重构登录页、管理后台（`/manage`）与在线测试台（`/test`），支持多 Token 轮询、并发控制、实时积分查询、代理池配置及中英文无缝切换。
 
 ---
@@ -30,11 +30,11 @@
 ```mermaid
 flowchart LR
     Client["OpenAI / Gemini 客户端"] --> API["FastAPI 路由层<br/>/v1/chat/completions<br/>/v1beta/models/*"]
-    API --> LB["LoadBalancer & TokenManager<br/>并发控制 / 轮询调度 / 自动续期"]
+    API --> LB["LoadBalancer & TokenManager<br/>并发控制 / 风控冷却 / 故障转移 / 自动续期"]
     LB --> BCS["BrowserCaptchaService<br/>账号亲和槽位池"]
     BCS --> Worker["CamoufoxWorker<br/>WebDriver BiDi 持久会话"]
     Worker --> Profile["browser_data_rt/token_{id}<br/>固定 Windows 指纹 + Firefox Profile"]
-    Worker --> Flow["flow.google.com<br/>页面内 StreamChat / batchexecute"]
+    Worker --> Flow["flow.google.com<br/>页面内 reCAPTCHA + 同源 batchexecute"]
 ```
 
 ---
@@ -98,7 +98,15 @@ docker compose up -d --build
 
 ### 1. 图片生成
 
-当前 `/v1/models` 与 Gemini `/models` 公开 Nano Banana 2.1（`BELUGA`）和 Nano Banana 2 Lite 两个图片系列，共 30 个比例与分辨率变体。旧 Pro 名称 `gemini-3.0-pro-image-*` 继续兼容调用 Nano Banana Pro（`GEM_PIX_2`）。
+当前 `/v1/models` 与 Gemini `/models` 公开 **Nano Banana 2.1**（`BELUGA`）、**Nano Banana 2 Lite**（`HARBOR_SEAL`）与 **Nano Banana Pro**（`GEM_PIX_2`）三个图片系列，共 **45 个**比例与分辨率变体，并支持通过简写别名 + `generationConfig.imageConfig` 动态解析：
+
+| 图片系列 | 公开模型 ID 前缀 | 简写别名（支持 `aspectRatio` / `imageSize`） | 上游模型标识 |
+|---|---|---|---|
+| **Nano Banana 2.1** | `gemini-3.1-flash-image-*` | `gemini-3.1-flash-image`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` |
+| **Nano Banana 2 Lite** | `gemini-3.1-flash-lite-image-*` | `gemini-3.1-flash-lite-image`、`nano-banana-2-lite` | `HARBOR_SEAL` |
+| **Nano Banana Pro** | `gemini-3.0-pro-image-*` | `gemini-3.0-pro-image`、`nano-banana-pro` | `GEM_PIX_2` |
+
+每个系列均包含以下 15 个比例与分辨率后缀（以下以 `gemini-3.1-flash-image-*` 为例）：
 
 | 当前公开名称 | 分辨率 | 比例 |
 |---|---:|---:|
@@ -118,7 +126,7 @@ docker compose up -d --build
 | `gemini-3.1-flash-image-four-three-4k` | 4K | 横屏 4:3 |
 | `gemini-3.1-flash-image-three-four-4k` | 4K | 竖屏 3:4 |
 
-Nano Banana 2 Lite 使用 `gemini-3.1-flash-lite-image-*`，比例及分辨率后缀与上表一致（如 `gemini-3.1-flash-lite-image-landscape`、`gemini-3.1-flash-lite-image-portrait-2k`）。
+Nano Banana 2 Lite 与 Nano Banana Pro 分别使用 `gemini-3.1-flash-lite-image-*` 和 `gemini-3.0-pro-image-*`，比例及分辨率后缀与上表完全一致（例如 `gemini-3.1-flash-lite-image-landscape`、`gemini-3.0-pro-image-portrait-2k`）。
 
 ### 2. 视频生成
 

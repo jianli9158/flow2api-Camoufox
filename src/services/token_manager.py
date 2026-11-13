@@ -1247,6 +1247,12 @@ class TokenManager:
             latest = await self.db.get_token(token_id)
             if latest and latest.google_cookies != token.google_cookies:
                 return await self._do_refresh_at(token_id, latest.st, latest)
+            if latest and (
+                "登录已失效" in str(latest.last_st_refresh_result or "")
+                or "登录态已失效" in str(latest.last_st_refresh_result or "")
+            ):
+                await self.disable_token(token_id)
+                self._clear_at_validation_cache(token_id)
             return False
 
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
@@ -1261,7 +1267,14 @@ class TokenManager:
             if not (latest.google_cookies or "").strip():
                 return
             # Cookie and AT metadata are committed together after current RPC validation.
-            await self._try_refresh_st(token_id, latest)
+            if not await self._try_refresh_st(token_id, latest):
+                refreshed_snapshot = await self.db.get_token(token_id)
+                if refreshed_snapshot and (
+                    "登录已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
+                    or "登录态已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
+                ):
+                    await self.disable_token(token_id)
+                    self._clear_at_validation_cache(token_id)
 
     async def run_protocol_refresh_once(self) -> None:
         """Refresh current-Flow Cookie sessions whose refresh interval is due."""

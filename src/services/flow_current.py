@@ -461,83 +461,6 @@ class CurrentFlowClientMixin:
                 "image_model_name": model_name,
             }
             try:
-                runtime_cfg = self._get_runtime_config()
-                captcha_method = (
-                    str(getattr(runtime_cfg, "captcha_method", "") or "")
-                    .strip()
-                    .lower()
-                )
-                if captcha_method in {"browser", "camoufox"} and not image_inputs:
-                    from .browser_captcha import BrowserCaptchaService
-
-                    service = await BrowserCaptchaService.get_instance(self.db)
-                    native_image_fn = getattr(service, "generate_native_image", None)
-                    if callable(native_image_fn):
-                        if progress_callback:
-                            await progress_callback("submitting_image", 48)
-                        native_res = await native_image_fn(
-                            project_id=project_id,
-                            prompt=prompt,
-                            aspect_ratio=aspect_ratio,
-                            model_name=model_name,
-                            image_inputs=image_inputs,
-                            timeout=max(
-                                getattr(runtime_cfg, "flow_image_request_timeout", 120),
-                                150,
-                            ),
-                            token_id=token_id,
-                        )
-                        if isinstance(native_res, dict):
-                            submission_accepted = True
-                            attempt["recaptcha_ok"] = True
-                            media = list(native_res.get("media") or [])
-                            if not media:
-                                for mid in list(native_res.get("mediaIds") or [])[:2]:
-                                    resolved = await self.get_media(
-                                        self.FRONTEND_ACCESS_TOKEN,
-                                        mid,
-                                        google_cookies=google_cookies,
-                                        token_id=token_id,
-                                        project_id=project_id,
-                                    )
-                                    url = (
-                                        (resolved.get("image") or {})
-                                        .get("generatedImage", {})
-                                        .get("fifeUrl")
-                                        or resolved.get("fifeUrl")
-                                    )
-                                    if url:
-                                        media.append(
-                                            {
-                                                "name": mid,
-                                                "projectId": project_id,
-                                                "image": {
-                                                    "generatedImage": {
-                                                        "fifeUrl": url,
-                                                        "mediaGenerationId": mid,
-                                                    }
-                                                },
-                                            }
-                                        )
-                            if not media:
-                                raise RuntimeError(
-                                    "Camoufox StreamChat image media could not be resolved"
-                                )
-                            session_id = str(
-                                native_res.get("session_id")
-                                or str(uuid.uuid4()).upper()
-                            )
-                            attempt["success"] = True
-                            attempt["duration_ms"] = int(
-                                (time.time() - started_at) * 1000
-                            )
-                            trace["generation_attempts"].append(attempt)
-                            trace["final_success_attempt"] = retry_attempt + 1
-                            return (
-                                {"media": media, "frontendRpc": "StreamChat"},
-                                session_id,
-                                trace,
-                            )
                 if progress_callback:
                     await progress_callback("solving_image_captcha", 38)
                 # client always submits explicit model and generation parameters.
@@ -687,71 +610,9 @@ class CurrentFlowClientMixin:
         last_error: Optional[Exception] = None
         for retry_attempt in range(attempt_budget):
             browser_id = None
+            submission_accepted = False
             request_model_key = fallback_model_key or model_keys[0]
             try:
-                runtime_cfg = self._get_runtime_config()
-                captcha_method = (
-                    str(getattr(runtime_cfg, "captcha_method", "") or "")
-                    .strip()
-                    .lower()
-                )
-                from .browser_captcha import BrowserCaptchaService
-
-                if (
-                    captcha_method in {"browser", "camoufox"}
-                    and mode in {"text", "t2v"}
-                    and (token_id is not None or BrowserCaptchaService._instance is not None)
-                ):
-                    service = await BrowserCaptchaService.get_instance(self.db)
-                    native_video_fn = getattr(service, "generate_native_video", None)
-                    if callable(native_video_fn):
-                        native_res = await native_video_fn(
-                            project_id=project_id,
-                            prompt=prompt,
-                            aspect_ratio=aspect_ratio,
-                            model_key=request_model_key,
-                            timeout=max(self._get_video_submit_timeout(), 180),
-                            token_id=token_id,
-                        )
-                        if isinstance(native_res, dict) and native_res.get("mediaIds"):
-                            operations = [
-                                {
-                                    "operation": {"name": mid},
-                                    "name": mid,
-                                    "mediaName": mid,
-                                    "projectId": project_id,
-                                    "sceneId": mid,
-                                    "status": "MEDIA_GENERATION_STATUS_ACTIVE",
-                                    "aspectRatio": aspect_ratio,
-                                    "modelKey": request_model_key,
-                                    "frontendRpc": "StreamChat",
-                                }
-                                for mid in list(native_res.get("mediaIds") or [])[:1]
-                            ]
-                            media_list = list(native_res.get("media") or [])
-                            direct_url = ""
-                            if media_list and isinstance(media_list[0], dict):
-                                direct_url = str(
-                                    ((media_list[0].get("video") or {}).get("fifeUrl"))
-                                    or ""
-                                ).strip()
-                            if direct_url and "/video/" in direct_url:
-                                return {
-                                    "direct_media": True,
-                                    "video_url": direct_url,
-                                    "operations": operations,
-                                    "projectId": project_id,
-                                    "aspectRatio": aspect_ratio,
-                                    "modelKey": request_model_key,
-                                    "frontendRpc": "StreamChat",
-                                }
-                            return {
-                                "operations": operations,
-                                "projectId": project_id,
-                                "aspectRatio": aspect_ratio,
-                                "modelKey": request_model_key,
-                                "frontendRpc": "StreamChat",
-                            }
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
                     action="VIDEO_GENERATION",
@@ -784,6 +645,7 @@ class CurrentFlowClientMixin:
                     project_id=project_id,
                     timeout=max(self._get_video_submit_timeout(), 90),
                 )
+                submission_accepted = True
                 return self._normalize_frontend_video_submission(
                     payload,
                     project_id=project_id,
@@ -793,10 +655,27 @@ class CurrentFlowClientMixin:
                 )
             except Exception as error:
                 last_error = error
-                # MODEL_ACCESS_DENIED 为账号权限拒绝，重试不会改变结果
-                if "MODEL_ACCESS_DENIED" in str(error):
+                if (
+                    submission_accepted
+                    or bool(getattr(error, "outcome_unknown", False))
+                    or bool(getattr(error, "submission_uncertain", False))
+                ):
                     raise
+                # 账号权限/风控/内容安全/登录失效等错误不重复提交同一账号
                 error_text = str(error).lower()
+                if any(
+                    marker in error_text
+                    for marker in (
+                        "model_access_denied",
+                        "public_error_unusual_activity",
+                        "public_error_unsafe_generation",
+                        "public_error_prominent_people_filter_failed",
+                        "too much traffic",
+                        "登录态已失效",
+                        "登录已失效",
+                    )
+                ):
+                    raise
                 is_missing_model = bool(
                     re.search(r"code\s*=\s*\[?5\]?", error_text)
                     or "not_found" in error_text
@@ -812,7 +691,12 @@ class CurrentFlowClientMixin:
                 if retry_attempt >= max_retries - 1:
                     raise
             finally:
-                await self._notify_browser_captcha_request_finished(browser_id)
+                if isinstance(browser_id, str) and ":lease-" in browser_id:
+                    await self._notify_browser_captcha_request_finished(
+                        browser_id, success=submission_accepted,
+                    )
+                else:
+                    await self._notify_browser_captcha_request_finished(browser_id)
         raise last_error or RuntimeError("Flow frontend video generation failed")
 
     async def generate_video_text(
