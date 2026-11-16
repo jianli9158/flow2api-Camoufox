@@ -1774,7 +1774,10 @@
                     method: 'POST',
                     body: JSON.stringify(payload)
                 });
-                if (!r) return;
+                if (!r) {
+                    if (btn) { btn.disabled = false; btn.textContent = I18n.t('启动登录浏览器'); }
+                    return;
+                }
                 const d = await r.json();
                 if (!d.success || !d.session_id) {
                     throw new Error(d.detail || d.message || I18n.t('启动登录会话失败'));
@@ -1785,6 +1788,7 @@
                 }
                 updateBrowserLoginProfileHint();
                 updateBrowserLoginBadge(d.status || 'waiting', d.message || I18n.t('等待登录...'));
+                if (btn) { btn.disabled = false; btn.textContent = I18n.t('启动登录浏览器'); }
                 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
                 const wsUrl = `${proto}//${location.host}/api/tokens/browser-login/ws/${d.session_id}`;
                 try {

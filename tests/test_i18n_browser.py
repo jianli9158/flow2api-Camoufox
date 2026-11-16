@@ -46,84 +46,99 @@ def ui_server():
         thread.join(timeout=5)
 
 
-@pytest.fixture
-def browser_page(ui_server):
-    with playwright_api.sync_playwright() as playwright:
-        if not Path(playwright.chromium.executable_path).is_file():
-            pytest.skip("Playwright Chromium is not installed")
-        browser = playwright.chromium.launch(headless=True)
-        context = browser.new_context(locale="en-US")
-        page = context.new_page()
-        errors = []
-        page.on("pageerror", lambda error: errors.append(str(error)))
-        page.route(
-            "https://cdn.tailwindcss.com/**",
-            lambda route: route.fulfill(
-                content_type="application/javascript",
-                body="window.tailwind={};document.head.insertAdjacentHTML('beforeend','<style>.hidden{display:none!important}</style>');",
-            ),
-        )
+def _launch_chromium_browser(playwright):
+    if Path(playwright.chromium.executable_path).is_file():
+        return playwright.chromium.launch(headless=True)
+    for channel in ("chrome", "msedge"):
+        try:
+            return playwright.chromium.launch(channel=channel, headless=True)
+        except playwright_api.Error:
+            continue
+    pytest.skip("Playwright Chromium / local Chrome is not installed")
 
-        def api_response(route):
-            path = urlsplit(route.request.url).path
-            data = {"success": True}
-            status = 200
-            if path == "/api/stats":
-                if "/login" in route.request.headers.get("referer", ""):
-                    status = 401
-                data = {"total_tokens": 1, "active_tokens": 1}
-            elif path == "/api/tokens":
-                data = [
-                    {
-                        "id": 1,
-                        "email": "account@example.com",
-                        "remark": "保存",
-                        "is_active": True,
-                        "protocol_mode": "protocol",
-                        "credits": 100,
-                        "image_enabled": True,
-                        "video_enabled": True,
-                    }
-                ]
-            elif path == "/api/logs":
-                data = [
-                    {
-                        "id": 1,
-                        "operation": "generate_image",
-                        "token_email": "account@example.com",
-                        "status_code": 200,
-                        "progress": 100,
-                        "created_at": "2026-10-26T10:00:00Z",
-                        "duration": 1.5,
-                    }
-                ]
-            elif path == "/api/logs/1":
-                data = {
+
+@pytest.fixture(scope="module")
+def chromium_browser():
+    with playwright_api.sync_playwright() as playwright:
+        browser = _launch_chromium_browser(playwright)
+        try:
+            yield browser
+        finally:
+            browser.close()
+
+
+@pytest.fixture
+def browser_page(ui_server, chromium_browser):
+    context = chromium_browser.new_context(locale="en-US")
+    page = context.new_page()
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.route(
+        "https://cdn.tailwindcss.com/**",
+        lambda route: route.fulfill(
+            content_type="application/javascript",
+            body="window.tailwind={};document.head.insertAdjacentHTML('beforeend','<style>.hidden{display:none!important}</style>');",
+        ),
+    )
+
+    def api_response(route):
+        path = urlsplit(route.request.url).path
+        data = {"success": True}
+        status = 200
+        if path == "/api/stats":
+            if "/login" in route.request.headers.get("referer", ""):
+                status = 401
+            data = {"total_tokens": 1, "active_tokens": 1}
+        elif path == "/api/tokens":
+            data = [
+                {
+                    "id": 1,
+                    "email": "account@example.com",
+                    "remark": "保存",
+                    "is_active": True,
+                    "protocol_mode": "protocol",
+                    "credits": 100,
+                    "image_enabled": True,
+                    "video_enabled": True,
+                }
+            ]
+        elif path == "/api/logs":
+            data = [
+                {
                     "id": 1,
                     "operation": "generate_image",
+                    "token_email": "account@example.com",
                     "status_code": 200,
                     "progress": 100,
                     "created_at": "2026-10-26T10:00:00Z",
                     "duration": 1.5,
-                    "request_body": '{"prompt":"保存"}',
-                    "response_body": '{"message":"保存"}',
                 }
-            elif path == "/api/captcha/config":
-                data = {"captcha_method": "camoufox"}
-            elif path == "/api/token-refresh/config":
-                data = {"enabled": True, "refresh_interval_minutes": 120}
-            route.fulfill(
-                status=status, content_type="application/json", body=json.dumps(data)
-            )
+            ]
+        elif path == "/api/logs/1":
+            data = {
+                "id": 1,
+                "operation": "generate_image",
+                "status_code": 200,
+                "progress": 100,
+                "created_at": "2026-10-26T10:00:00Z",
+                "duration": 1.5,
+                "request_body": '{"prompt":"保存"}',
+                "response_body": '{"message":"保存"}',
+            }
+        elif path == "/api/captcha/config":
+            data = {"captcha_method": "camoufox"}
+        elif path == "/api/token-refresh/config":
+            data = {"enabled": True, "refresh_interval_minutes": 120}
+        route.fulfill(
+            status=status, content_type="application/json", body=json.dumps(data)
+        )
 
-        page.route("**/api/**", api_response)
-        try:
-            yield page, ui_server
-            assert errors == []
-        finally:
-            context.close()
-            browser.close()
-
+    page.route("**/api/**", api_response)
+    try:
+        yield page, ui_server
+        assert errors == []
+    finally:
+        context.close()
 
 def open_page(page, address):
     page.goto(address)
@@ -813,7 +828,8 @@ def test_manage_browser_profile_dir_and_login_modal_binding(browser_page):
     assert login_requests[0]["clean_login"] is False
 
     page.locator("#browserLoginClean").check()
-    page.locator("#browserLoginStartBtn").click()
+    with page.expect_response("**/api/tokens/browser-login/start"):
+        page.locator("#browserLoginStartBtn").click()
     assert len(cancel_requests) == 1
     assert len(login_requests) == 2
     assert login_requests[1]["clean_login"] is True
