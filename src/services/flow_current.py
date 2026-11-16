@@ -658,6 +658,9 @@ class CurrentFlowClientMixin:
         token_video_concurrency: Optional[int],
         google_cookies: Optional[str],
         reference_media_ids: Optional[List[str]] = None,
+        reference_entity_ids: Optional[List[Any]] = None,
+        reference_audio_ids: Optional[List[Any]] = None,
+        reference_likeness_ids: Optional[List[Any]] = None,
         start_media_id: Optional[str] = None,
         end_media_id: Optional[str] = None,
         video_media_id: Optional[str] = None,
@@ -698,6 +701,9 @@ class CurrentFlowClientMixin:
                     session_id=str(uuid.uuid4()).upper(),
                     mode=mode,
                     reference_media_ids=reference_media_ids,
+                    reference_entity_ids=reference_entity_ids,
+                    reference_audio_ids=reference_audio_ids,
+                    reference_likeness_ids=reference_likeness_ids,
                     start_media_id=start_media_id,
                     end_media_id=end_media_id,
                     video_media_id=video_media_id,
@@ -804,6 +810,8 @@ class CurrentFlowClientMixin:
         token_video_concurrency: Optional[int] = None,
         google_cookies: Optional[str] = None,
         resolution: Optional[str] = None,
+        reference_entities: Optional[List[Any]] = None,
+        reference_audios: Optional[List[Any]] = None,
     ) -> dict:
         media_ids = [
             str(item.get("mediaId") or item.get("name") or "").strip()
@@ -817,6 +825,8 @@ class CurrentFlowClientMixin:
             aspect_ratio=aspect_ratio,
             mode="references",
             reference_media_ids=media_ids,
+            reference_entity_ids=reference_entities,
+            reference_audio_ids=reference_audios,
             resolution=resolution,
             token_id=token_id,
             token_video_concurrency=token_video_concurrency,
@@ -2472,7 +2482,7 @@ class CurrentFlowClientMixin:
         character_refs: Optional[List[Any]] = None,
         workflow_refs: Optional[List[Any]] = None,
     ) -> List[Any]:
-        """Construct BOQ `_.g_` message array `[Au, qz_media_refs?, $M_character_refs?, Rt_workflow_refs?]`."""
+        """Construct BOQ `_.g_` message array `[Au, hh_media_refs?, Vo_audio_refs?, Nw_character_refs?, tx_likeness_refs?]`."""
         parts: List[Any] = []
         text = str(prompt or "").strip()
         if text:
@@ -2489,12 +2499,7 @@ class CurrentFlowClientMixin:
             if mid:
                 item = [mid, title] if title else [mid]
                 normalized_media.append(item)
-                parts.append([None, [[item]]])
-
-        if not parts:
-            parts.append([""])
-
-        g_msg: List[Any] = [[parts]]
+                parts.append([None, [item]])
 
         normalized_chars: List[List[Any]] = []
         for cref in character_refs or []:
@@ -2505,25 +2510,32 @@ class CurrentFlowClientMixin:
                 cid = str(cref or "").strip()
                 cname = ""
             if cid:
-                normalized_chars.append([cid, cname] if cname else [cid])
+                citem = [cid, cname] if cname else [cid]
+                normalized_chars.append(citem)
+                parts.append([None, [None, None, citem]])
 
         normalized_wfs: List[List[Any]] = []
         for wref in workflow_refs or []:
             if isinstance(wref, dict):
-                wid = str(wref.get("workflowId") or wref.get("id") or "").strip()
-                wtitle = str(wref.get("title") or "").strip()
+                wid = str(wref.get("mediaId") or wref.get("workflowId") or wref.get("id") or "").strip()
+                wtitle = str(wref.get("title") or wref.get("name") or "").strip()
             else:
                 wid = str(wref or "").strip()
                 wtitle = ""
             if wid:
-                normalized_wfs.append([wid, wtitle] if wtitle else [wid])
+                normalized_wfs.append([wid])
+                parts.append([None, [None, [wid, wtitle] if wtitle else [wid]]])
 
-        if normalized_media or normalized_chars or normalized_wfs:
-            g_msg.append(normalized_media or [])
-        if normalized_chars or normalized_wfs:
-            g_msg.append(normalized_chars or [])
-        if normalized_wfs:
-            g_msg.append(normalized_wfs)
+        if not parts:
+            parts.append([""])
+
+        g_msg: List[Any] = [[parts]]
+        if normalized_media or normalized_wfs or normalized_chars:
+            g_msg.append(normalized_media or None)
+        if normalized_wfs or normalized_chars:
+            g_msg.append(normalized_wfs or None)
+        if normalized_chars:
+            g_msg.append(normalized_chars)
         return g_msg
 
     def _build_agent_webchannel_request(

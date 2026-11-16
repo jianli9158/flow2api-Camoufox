@@ -334,8 +334,45 @@ class FlowFrontendMixin:
         return 2
 
     @staticmethod
-    def _frontend_prompt(prompt: str) -> List[Any]:
-        return [[[str(prompt or "")]]]
+    def _frontend_prompt(
+        prompt: str,
+        *,
+        character_refs: Optional[List[Any]] = None,
+        audio_refs: Optional[List[Any]] = None,
+        media_refs: Optional[List[Any]] = None,
+    ) -> List[Any]:
+        parts: List[Any] = []
+        for mref in media_refs or []:
+            if isinstance(mref, dict):
+                mid = str(mref.get("mediaId") or mref.get("id") or mref.get("name") or "").strip()
+                mtitle = str(mref.get("title") or mref.get("displayName") or "").strip()
+            else:
+                mid = str(mref or "").strip()
+                mtitle = ""
+            if mid:
+                parts.append([None, [[mid, mtitle] if mtitle else [mid]]])
+        for cref in character_refs or []:
+            if isinstance(cref, dict):
+                cid = str(cref.get("id") or cref.get("characterId") or cref.get("entityId") or "").strip()
+                cname = str(cref.get("displayName") or cref.get("name") or cref.get("title") or "").strip()
+            else:
+                cid = str(cref or "").strip()
+                cname = ""
+            if cid:
+                parts.append([None, [None, None, [cid, cname] if cname else [cid]]])
+        for aref in audio_refs or []:
+            if isinstance(aref, dict):
+                aid = str(aref.get("mediaId") or aref.get("id") or "").strip()
+                atitle = str(aref.get("title") or aref.get("name") or "").strip()
+            else:
+                aid = str(aref or "").strip()
+                atitle = ""
+            if aid:
+                parts.append([None, [None, [aid, atitle] if atitle else [aid]]])
+        text = str(prompt or "")
+        if text or not parts:
+            parts.append([text])
+        return [parts]
 
     @staticmethod
     def _frontend_generation_metadata(session_id: str) -> List[Any]:
@@ -441,13 +478,20 @@ class FlowFrontendMixin:
         session_id: str,
         mode: str = "text",
         reference_media_ids: Optional[List[str]] = None,
+        reference_entity_ids: Optional[List[Any]] = None,
+        reference_audio_ids: Optional[List[Any]] = None,
+        reference_likeness_ids: Optional[List[Any]] = None,
         start_media_id: Optional[str] = None,
         end_media_id: Optional[str] = None,
         video_media_id: Optional[str] = None,
         resolution: Optional[str] = None,
         output_spec: Optional[Any] = None,
     ) -> tuple[str, List[Any]]:
-        prompt_value = self._frontend_prompt(prompt)
+        prompt_value = self._frontend_prompt(
+            prompt,
+            character_refs=reference_entity_ids,
+            audio_refs=reference_audio_ids,
+        )
         prompt_message = [None, None, prompt_value]
         aspect_value = self._map_frontend_video_aspect_ratio(aspect_ratio)
         metadata = self._frontend_generation_metadata(session_id)
@@ -460,7 +504,22 @@ class FlowFrontendMixin:
                 self._frontend_media_reference(media_id)
                 for media_id in (reference_media_ids or [])
                 if str(media_id or "").strip()
-            ]
+            ] or None
+            audio_refs_wire = []
+            for aref in reference_audio_ids or []:
+                aid = str(aref.get("mediaId") or aref.get("id") if isinstance(aref, dict) else aref or "").strip()
+                if aid:
+                    audio_refs_wire.append([aid])
+            entity_refs_wire = []
+            for eref in reference_entity_ids or []:
+                eid = str(eref.get("id") or eref.get("characterId") or eref.get("entityId") if isinstance(eref, dict) else eref or "").strip()
+                if eid:
+                    entity_refs_wire.append([eid])
+            likeness_refs_wire = []
+            for lref in reference_likeness_ids or []:
+                lid = str(lref.get("id") or lref.get("likenessId") if isinstance(lref, dict) else lref or "").strip()
+                if lid:
+                    likeness_refs_wire.append([lid])
             rpc_id = "MZZa6b"
             request = [
                 prompt_message,
@@ -470,10 +529,10 @@ class FlowFrontendMixin:
                 None,
                 metadata,
                 None,
-                None,
+                audio_refs_wire or None,
                 output_spec,
-                None,
-                None,
+                entity_refs_wire or None,
+                likeness_refs_wire or None,
                 resolution_message,
             ]
         elif normalized_mode == "start_end":

@@ -2,7 +2,10 @@
 
 import asyncio
 import base64
+import contextvars
 import hashlib
+import inspect
+import json
 import re
 import time
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
@@ -13,10 +16,25 @@ from fastapi import HTTPException
 
 from ..core.config import config
 from ..core.logger import debug_logger
-from ..core.models import Token
+from ..core.models import RequestLog, Token
 
 
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+_resolved_flow_token_id: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
+    "_resolved_flow_token_id", default=None
+)
+
+
+def get_resolved_flow_token_id() -> Optional[int]:
+    return _resolved_flow_token_id.get()
+
+
+def set_resolved_flow_token_id(token_id: Optional[int]) -> contextvars.Token:
+    return _resolved_flow_token_id.set(token_id)
+
+
+def reset_resolved_flow_token_id(ctx_token: contextvars.Token) -> None:
+    _resolved_flow_token_id.reset(ctx_token)
 
 
 class FlowFeatureService:
@@ -93,6 +111,8 @@ class FlowFeatureService:
                 status_code=401,
                 detail=f"Flow session is invalid or expired for token {token.id}",
             )
+        if valid_token and valid_token.id is not None:
+            _resolved_flow_token_id.set(valid_token.id)
 
         resolved_project_id = str(project_id or "").strip()
         if require_project and not resolved_project_id:
@@ -103,6 +123,87 @@ class FlowFeatureService:
                 )
 
         return valid_token, resolved_project_id
+
+    @staticmethod
+    def _serialize_log_payload(payload: Any) -> str:
+        if payload is None:
+            return "{}"
+        try:
+            sanitized = debug_logger._truncate_large_fields(payload, max_length=256)
+            return json.dumps(sanitized, ensure_ascii=False, default=str)
+        except Exception:
+            return json.dumps({"raw": str(payload)[:512]}, ensure_ascii=False)
+
+    async def log_api_request(
+        self,
+        *,
+        token_id: Optional[int],
+        operation: str,
+        request_data: Any,
+        response_data: Any,
+        status_code: int,
+        duration: float,
+        log_id: Optional[int] = None,
+        status_text: Optional[str] = None,
+        progress: Optional[int] = None,
+    ) -> Optional[int]:
+        """Persist a Flow feature API request/response record to request_logs when DB supports it."""
+        if self.db is None:
+            return None
+        try:
+            effective_status_text = status_text or (
+                "completed"
+                if status_code == 200
+                else "failed"
+                if status_code >= 400
+                else "processing"
+            )
+            effective_progress = progress
+            if effective_progress is None:
+                effective_progress = 100 if status_code == 200 else 0
+            effective_progress = max(0, min(100, int(effective_progress)))
+            request_body = self._serialize_log_payload(request_data)
+            response_body = self._serialize_log_payload(response_data)
+
+            if log_id:
+                update_fn = getattr(self.db, "update_request_log", None)
+                if callable(update_fn):
+                    res = update_fn(
+                        log_id,
+                        token_id=token_id,
+                        operation=operation,
+                        request_body=request_body,
+                        response_body=response_body,
+                        status_code=status_code,
+                        duration=round(max(0.0, float(duration)), 3),
+                        status_text=effective_status_text,
+                        progress=effective_progress,
+                    )
+                    if inspect.isawaitable(res):
+                        await res
+                return log_id
+
+            add_fn = getattr(self.db, "add_request_log", None)
+            if not callable(add_fn):
+                return None
+            log = RequestLog(
+                token_id=token_id,
+                operation=operation,
+                request_body=request_body,
+                response_body=response_body,
+                status_code=status_code,
+                duration=round(max(0.0, float(duration)), 3),
+                status_text=effective_status_text,
+                progress=effective_progress,
+            )
+            res = add_fn(log)
+            if inspect.isawaitable(res):
+                created_id = await res
+                return created_id if isinstance(created_id, int) else None
+            return res if isinstance(res, int) else None
+        except Exception as exc:
+            debug_logger.log_warning(f"[FlowFeatures] Failed to log request ({operation}): {exc}")
+            return None
 
     async def get_project(
         self,
@@ -954,3 +1055,93 @@ class FlowFeatureService:
         result["tokenId"] = token.id
         result["email"] = token.email
         return result
+
+    async def generate_reference_video(
+        self,
+        *,
+        prompt: str,
+        model_key: str = "macaron_cookie_r2v_8s_relaxed",
+        aspect_ratio: str = "VIDEO_ASPECT_RATIO_LANDSCAPE",
+        character_refs: Optional[List[Any]] = None,
+        voice_refs: Optional[List[Any]] = None,
+        image_refs: Optional[List[Any]] = None,
+        resolution: Optional[str] = None,
+        wait: bool = True,
+        poll_interval: float = 5.0,
+        timeout: int = 360,
+        project_id: Optional[str] = None,
+        email: Optional[str] = None,
+        token_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        token, resolved_project_id = await self.resolve_account_context(
+            email=email,
+            token_id=token_id,
+            project_id=project_id,
+            require_project=True,
+        )
+        media_ids: List[str] = []
+        for iref in image_refs or []:
+            if isinstance(iref, dict):
+                mid = str(iref.get("mediaId") or iref.get("id") or iref.get("name") or "").strip()
+            else:
+                mid = str(iref or "").strip()
+            if mid:
+                media_ids.append(mid)
+        has_refs = bool(media_ids or character_refs or voice_refs)
+        mode = "references" if has_refs else "text"
+        submission = await self.flow_client._current_generate_video(
+            project_id=resolved_project_id,
+            prompt=prompt,
+            model_key=model_key,
+            aspect_ratio=aspect_ratio,
+            mode=mode,
+            reference_media_ids=media_ids or None,
+            reference_entity_ids=character_refs or None,
+            reference_audio_ids=voice_refs or None,
+            resolution=resolution,
+            token_id=token.id,
+            token_video_concurrency=None,
+            google_cookies=token.google_cookies,
+        )
+        ops = submission.get("operations") or []
+        if not wait or not ops:
+            submission["projectId"] = resolved_project_id
+            submission["tokenId"] = token.id
+            submission["email"] = token.email
+            return submission
+        deadline = asyncio.get_event_loop().time() + max(timeout, 30)
+        last_status = submission
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(poll_interval)
+            last_status = await self.flow_client.check_video_status(
+                at=token.at or "",
+                operations=ops,
+                token_id=token.id,
+                google_cookies=token.google_cookies,
+            )
+            checked_ops = last_status.get("operations") or []
+            if checked_ops:
+                first_op = checked_ops[0]
+                status = str(first_op.get("status") or "")
+                meta_video = ((first_op.get("operation") or {}).get("metadata") or {}).get("video") or {}
+                fife_url = meta_video.get("fifeUrl")
+                if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and fife_url:
+                    return {
+                        "status": status,
+                        "videoUrl": fife_url,
+                        "mediaId": (first_op.get("operation") or {}).get("name") or meta_video.get("mediaGenerationId"),
+                        "projectId": resolved_project_id,
+                        "tokenId": token.id,
+                        "email": token.email,
+                        "operations": checked_ops,
+                    }
+                if "FAILED" in status:
+                    raise RuntimeError(f"Flow video generation failed: {first_op}")
+        return {
+            "status": "TIMEOUT",
+            "projectId": resolved_project_id,
+            "tokenId": token.id,
+            "email": token.email,
+            "lastStatus": last_status,
+        }
+

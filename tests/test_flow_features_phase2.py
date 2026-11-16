@@ -106,10 +106,12 @@ class FlowCurrentPhase2Tests(unittest.IsolatedAsyncioTestCase):
             workflow_refs=[WF_ID],
         )
         self.assertEqual(rich[0][0][0], ["Animate @Hero"])
-        self.assertEqual(rich[0][0][1], [None, [[[MEDIA_ID, "ref1"]]]])
+        self.assertEqual(rich[0][0][1], [None, [[MEDIA_ID, "ref1"]]])
+        self.assertEqual(rich[0][0][2], [None, [None, None, [CHAR_ID, "Hero"]]])
+        self.assertEqual(rich[0][0][3], [None, [None, [WF_ID]]])
         self.assertEqual(rich[1], [[MEDIA_ID, "ref1"]])
-        self.assertEqual(rich[2], [[CHAR_ID, "Hero"]])
-        self.assertEqual(rich[3], [[WF_ID]])
+        self.assertEqual(rich[2], [[WF_ID]])
+        self.assertEqual(rich[3], [[CHAR_ID, "Hero"]])
 
         req_json = client._build_agent_stream_chat_request(
             project_id=PROJECT_ID,
@@ -654,6 +656,69 @@ class FlowAgentRoutesTests(unittest.TestCase):
         pref_resp = self.client.get("/v1/flow/user/preferences", params={"token_id": 3})
         self.assertEqual(pref_resp.status_code, 200)
         self.assertTrue(pref_resp.json()["isWatermarkEnabledByUser"])
+
+    def test_agent_sse_and_video_request_logs(self):
+        created_logs = []
+        updated_logs = []
+
+        async def _add_log(log_obj):
+            created_logs.append(log_obj)
+            return 77
+
+        async def _update_log(log_id, **kwargs):
+            updated_logs.append((log_id, kwargs))
+
+        self.db.get_all_tokens = AsyncMock(return_value=[self.token])
+        self.db.add_request_log = _add_log
+        self.db.update_request_log = _update_log
+
+        async def fake_stream(**kwargs):
+            yield {"event": "session", "projectId": PROJECT_ID, "sessionId": SESSION_ID}
+            yield {
+                "event": "done",
+                "projectId": PROJECT_ID,
+                "sessionId": SESSION_ID,
+                "title": "Logged",
+                "text": "OK",
+                "tokenId": 3,
+                "email": "agent@example.com",
+            }
+
+        self.flow_client.stream_agent_chat = fake_stream
+        sse_resp = self.client.post(
+            "/v1/flow/agent/chat",
+            json={"prompt": "Track me", "stream": True, "email": "agent@example.com"},
+        )
+        self.assertEqual(sse_resp.status_code, 200)
+        self.assertEqual(len(created_logs), 1)
+        self.assertEqual(created_logs[0].operation, "flow_agent_chat")
+        self.assertEqual(created_logs[0].status_code, 102)
+        self.assertEqual(len(updated_logs), 1)
+        log_id, patch_data = updated_logs[0]
+        self.assertEqual(log_id, 77)
+        self.assertEqual(patch_data["status_code"], 200)
+        self.assertEqual(patch_data["status_text"], "completed")
+        self.assertEqual(patch_data["progress"], 100)
+        self.assertEqual(patch_data["token_id"], 3)
+
+        self.flow_client._current_generate_video = AsyncMock(
+            return_value={"operations": [{"name": "op-1"}]}
+        )
+        vid_resp = self.client.post(
+            "/v1/flow/videos",
+            json={"prompt": "Fox waves", "character_refs": [CHAR_ID], "wait": False, "token_id": 3},
+        )
+        self.assertEqual(vid_resp.status_code, 200)
+        self.assertEqual(len(created_logs), 2)
+        self.assertEqual(created_logs[1].operation, "flow_generate_video")
+        self.assertEqual(created_logs[1].status_code, 200)
+        self.assertEqual(created_logs[1].token_id, 3)
+
+        schema_resp = self.client.get("/openapi.json")
+        self.assertEqual(schema_resp.status_code, 200)
+        assets_post = schema_resp.json()["paths"]["/v1/flow/assets"]["post"]
+        self.assertIn("multipart/form-data", assets_post["requestBody"]["content"])
+        self.assertIn("application/json", assets_post["requestBody"]["content"])
 
 
 if __name__ == "__main__":

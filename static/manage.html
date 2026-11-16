@@ -1243,10 +1243,32 @@
                 extend_video:'续写视频',
                 upsample_image:'放大图片',
                 upsample_video:'放大视频',
+                flow_get_project:'Flow 读取项目',
+                flow_get_asset:'Flow 查询资产',
+                flow_upload_asset:'Flow 上传资产',
+                flow_list_voices:'Flow 音色列表',
+                flow_get_voice:'Flow 音色详情',
+                flow_create_voice:'Flow 语音合成',
+                flow_delete_voice:'Flow 删除音色',
+                flow_list_characters:'Flow 角色列表',
+                flow_get_character:'Flow 角色详情',
+                flow_create_character:'Flow 创建角色',
+                flow_update_character:'Flow 更新角色',
+                flow_delete_character:'Flow 删除角色',
+                flow_agent_chat:'Flow Agent 对话',
+                flow_agent_approve:'Flow Agent 审批',
+                flow_list_agent_sessions:'Flow Agent 会话列表',
+                flow_get_agent_session:'Flow Agent 会话详情',
+                flow_rename_agent_session:'Flow Agent 重命名会话',
+                flow_delete_agent_session:'Flow Agent 删除会话',
+                flow_get_user_preferences:'Flow 读取用户偏好',
+                flow_update_user_preferences:'Flow 更新用户偏好',
+                flow_get_project_settings:'Flow 读取项目设置',
+                flow_update_project_settings:'Flow 更新项目设置',
+                flow_generate_video:'Flow 参考生视频',
             };
             return labels[operation]?I18n.t(labels[operation]):operation||'-';
         }
-
         function renderLogs(logs){
             const tb=$('logsTableBody');
             const source=Array.isArray(logs)?logs:[];
@@ -1321,9 +1343,8 @@
 
         function extractLogPrimaryUrl(responseBodyObj){
             if(!responseBodyObj||typeof responseBodyObj!=='object') return null;
-            return responseBodyObj.url||((responseBodyObj.data&&responseBodyObj.data[0]&&responseBodyObj.data[0].url)?responseBodyObj.data[0].url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_video_url)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.local_url)?responseBodyObj.generated_assets.upscaled_image.local_url:null)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.url)?responseBodyObj.generated_assets.upscaled_image.url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_image_url)||null;
+            return responseBodyObj.url||responseBodyObj.videoUrl||responseBodyObj.wavUrl||responseBodyObj.audioUrl||((responseBodyObj.data&&responseBodyObj.data[0]&&responseBodyObj.data[0].url)?responseBodyObj.data[0].url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_video_url)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.local_url)?responseBodyObj.generated_assets.upscaled_image.local_url:null)||((responseBodyObj.generated_assets&&responseBodyObj.generated_assets.upscaled_image&&responseBodyObj.generated_assets.upscaled_image.url)?responseBodyObj.generated_assets.upscaled_image.url:null)||(responseBodyObj.generated_assets&&responseBodyObj.generated_assets.final_image_url)||null;
         }
-
         function extractLogSuccessSummary(log,responseBodyObj){
             if((log&&Number(log.status_code))!==200) return '';
             if(!responseBodyObj||typeof responseBodyObj!=='object') return I18n.t("生成成功，已返回结果");

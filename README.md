@@ -154,18 +154,21 @@ python main.py
 
 ### Flow 原生特征接口 (`/v1/flow/*`)
 
+> 完整字段说明、账号/项目绑定规范、SSE 事件格式与 `curl` 示例见 [`docs/FLOW_API.md`](docs/FLOW_API.md)（启动服务后也可访问 `/docs` Swagger UI）。所有 `/v1/flow/*` 调用均支持传入 `token_id` / `email` / `project_id` 固定所属账号与项目，并自动写入后台「请求日志」。
+
 | 类别 | 方法与路径 | 说明 |
 |---|---|---|
 | **项目与资产** | `GET /v1/flow/projects/{project_id}` | 读取指定 Flow 项目详情与媒体/语音/角色资产列表 |
 | | `GET /v1/flow/assets/{media_id}` | 解析资产签名下载地址与元数据 |
-| | `POST /v1/flow/assets` | 上传参考图（JSON `image_base64`/`image_url` 或 multipart 文件）返回 `mediaId` |
+| | `POST /v1/flow/assets` | 上传参考图（支持 JSON `image_base64`/`image_url` 与 `multipart/form-data` 文件）返回 `mediaId` |
 | **语音与 TTS** | `GET /v1/flow/voices` / `GET /v1/flow/voices/{voice_ref}` | 列出内置音色与项目自定义语音 / 获取单个音色 |
 | | `POST /v1/flow/voices` | TTS 合成；支持 `response_format` 为 `json`、`wav` 或 `pcm`，及 `cache_audio` |
 | | `DELETE /v1/flow/voices/{voice_ref}` | 删除自定义语音 |
 | **角色管理** | `GET /v1/flow/characters` / `GET /v1/flow/characters/{character_id}` | 列出或查询角色设定 |
 | | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建、更新（名称/音色/设定/收藏）或删除角色 |
+| **参考生视频** | `POST /v1/flow/videos` | 关联 `character_refs`、`voice_refs` 与 `image_refs` 生成参考视频，支持同步轮询或异步返回 |
 | **Creation Agent** | `POST /v1/flow/agent/chat` | 发起或继续 Agent 对话（`stream: true` 输出 SSE：`session` / `thinking` / `text` / `a2ui` / `media` / `permission` / `done` / `error`） |
-| | `POST /v1/flow/agent/sessions/{session_id}/approve` | 批准（`approved`）或拒绝（`denied`）Agent 扣费/生成确认卡片 |
+| | `POST /v1/flow/agent/sessions/{session_id}/approve` | 批准（`approved` / `approved_sticky`）或拒绝（`denied`）Agent 扣费/生成确认卡片 |
 | | `GET /v1/flow/agent/sessions` / `GET` / `PATCH` / `DELETE .../{session_id}` | 查询会话列表、读取历史轮次、重命名或删除会话 |
 | **偏好与设置** | `GET` / `PATCH /v1/flow/user/preferences` | 读取或更新 Flow 用户全局偏好（自动清框、水印开关等） |
 | | `GET` / `PATCH /v1/flow/projects/{project_id}/settings` | 读取或更新项目面板与默认生图/生视频配置 |
@@ -173,7 +176,6 @@ python main.py
 ### 控制台与监控端点
 
 - `GET /login`、`GET /manage`、`GET /test`：登录页、管理控制台、模型/Agent/语音工作台
-- `GET /health`：返回服务状态及活跃 / 即将过期 / 已过期 / 禁用账号统计
 - `GET /metrics`：Prometheus 监控指标输出
 - `GET /api/captcha/browser-stats` & `POST /api/captcha/score-test`：Camoufox 槽位实时状态与站点 reCAPTCHA 分数实测
 - `POST /api/tokens/browser-login/start` & `WS /api/tokens/browser-login/ws/{session_id}`：启动 LiveView 远程登录会话与帧流转发

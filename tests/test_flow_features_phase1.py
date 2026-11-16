@@ -440,6 +440,11 @@ class FlowRoutesPhase1Tests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(asset_resp.json()["url"], AUDIO_URL)
             self.assertEqual(asset_resp.json()["mediaType"], "audio")
 
+            self.flow_client.mock_rpc.return_value = [[], [], [], [], None, []]
+            proj_resp = await client.get(f"/v1/flow/projects/{PROJECT_ID}", headers=headers)
+            self.assertEqual(proj_resp.status_code, 200)
+            self.assertEqual(proj_resp.json()["projectId"], PROJECT_ID)
+
             # 2. POST /v1/flow/assets (base64 upload + SSRF block)
             ssrf_resp = await client.post(
                 "/v1/flow/assets",
@@ -532,6 +537,86 @@ class FlowRoutesPhase1Tests(unittest.IsolatedAsyncioTestCase):
             c_del = await client.delete(f"/v1/flow/characters/{CHAR_ID}", headers=headers)
             self.assertEqual(c_del.status_code, 200)
             self.assertTrue(c_del.json()["deleted"])
+
+    async def test_multipart_upload_and_request_logs_recorded(self):
+        import json as _json
+
+        recorded_logs = []
+
+        async def _capture_log(log_obj):
+            recorded_logs.append(log_obj)
+            return len(recorded_logs)
+
+        self.db.add_request_log = AsyncMock(side_effect=_capture_log)
+        self.flow_client.upload_image = AsyncMock(return_value="multipart-img-uuid")
+        self.flow_client.generate_voice_audio = AsyncMock(
+            return_value={
+                "mediaId": MEDIA_ID,
+                "workflowId": WORKFLOW_ID,
+                "projectId": PROJECT_ID,
+                "voice": "Achernar",
+                "name": "Achernar",
+                "style": "",
+                "model": "gemini_v4s_tts_flow",
+                "saved": False,
+                "audioUrl": AUDIO_URL,
+                "format": "pcm_24khz_16bit_mono",
+                "frontendRpc": "no0P6",
+            }
+        )
+
+        transport = ASGITransport(app=self.app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = {"Authorization": "Bearer test-secret-key"}
+
+            mp_resp = await client.post(
+                "/v1/flow/assets",
+                headers=headers,
+                files={"file": ("ref.png", b"fake-png-bytes", "image/png")},
+                data={"aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT", "token_id": "9"},
+            )
+            self.assertEqual(mp_resp.status_code, 200)
+            self.assertEqual(mp_resp.json()["mediaId"], "multipart-img-uuid")
+            self.assertEqual(self.flow_client.upload_image.await_args.args[1], b"fake-png-bytes")
+            self.assertEqual(
+                self.flow_client.upload_image.await_args.kwargs["aspect_ratio"],
+                "IMAGE_ASPECT_RATIO_PORTRAIT",
+            )
+
+            with patch.object(
+                self.service, "_download_binary", AsyncMock(return_value=b"\x01\x00\x02\x00")
+            ):
+                wav_resp = await client.post(
+                    "/v1/flow/voices",
+                    headers=headers,
+                    json={"text": "Hello log", "voice": "achernar", "response_format": "wav"},
+                )
+            self.assertEqual(wav_resp.status_code, 200)
+
+            err_resp = await client.post(
+                "/v1/flow/assets",
+                headers=headers,
+                json={"image_url": "http://127.0.0.1:8001/secret.png"},
+            )
+            self.assertEqual(err_resp.status_code, 400)
+
+        self.assertEqual(len(recorded_logs), 3)
+        self.assertEqual(recorded_logs[0].operation, "flow_upload_asset")
+        self.assertEqual(recorded_logs[0].token_id, 9)
+        self.assertEqual(recorded_logs[0].status_code, 200)
+        req0 = _json.loads(recorded_logs[0].request_body)
+        self.assertEqual(req0["upload_mode"], "multipart")
+        self.assertEqual(req0["file_bytes"], len(b"fake-png-bytes"))
+
+        self.assertEqual(recorded_logs[1].operation, "flow_create_voice")
+        self.assertEqual(recorded_logs[1].token_id, 9)
+        resp1 = _json.loads(recorded_logs[1].response_body)
+        self.assertNotIn("audioBytes", resp1)
+        self.assertEqual(resp1["audioBytesLength"], 48)
+
+        self.assertEqual(recorded_logs[2].operation, "flow_upload_asset")
+        self.assertEqual(recorded_logs[2].status_code, 400)
+        self.assertEqual(recorded_logs[2].status_text, "failed")
 
 
 if __name__ == "__main__":
