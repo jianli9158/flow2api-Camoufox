@@ -565,10 +565,10 @@ def test_upscaled_video_models_keep_reference_uploads(browser_page):
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jNekAAAAASUVORK5CYII="
     )
     for model, limit in [
-        ("veo_3_1_i2v_s_4k", "(1-2 images)"),
-        ("veo_3_1_i2v_s_1080p", "(1-2 images)"),
-        ("veo_3_1_r2v_fast_landscape_ultra_4k", "(0-3 images)"),
-        ("veo_3_1_r2v_fast_landscape_ultra_1080p", "(0-3 images)"),
+        ("omni-1.2-flash-i2v-8s-landscape-4k", "(1-2 images)"),
+        ("omni-1.2-flash-i2v-8s-landscape-1080p", "(1-2 images)"),
+        ("omni-1.2-flash-8s-landscape-4k", "(0-3 images)"),
+        ("omni-1.2-flash-8s-landscape-1080p", "(0-3 images)"),
     ]:
         page.locator(f'.model-item[data-model="{model}"]').click()
         playwright_api.expect(page.locator("#imageUploadGroup")).to_be_visible()
@@ -596,9 +596,9 @@ def test_extend_requires_source_and_sends_backend_compatible_reference(browser_p
 
     page, base = browser_page
     models = [
-        "veo-3.1-fast-extend-8s-landscape",
-        "omni-1.1-flash-4s-landscape",
-        "veo-3.1-fast-8s-landscape",
+        "omni-1.2-flash-extend-8s-landscape",
+        "omni-1.2-flash-4s-landscape",
+        "veo-3.1-lite-8s-landscape",
     ]
     page.route(
         "**/v1/models",
@@ -716,4 +716,105 @@ def test_model_tester_displays_all_published_models(browser_page):
     playwright_api.expect(items).to_have_count(len(models))
     assert sorted(
         items.evaluate_all("items => items.map(item => item.dataset.model)")
+
     ) == sorted(model["id"] for model in models)
+
+def test_manage_browser_profile_dir_and_login_modal_binding(browser_page):
+    page, base = browser_page
+    login_requests = []
+    cancel_requests = []
+    page.route(
+        "**/api/tokens/browser-profiles",
+        lambda route: route.fulfill(
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "success": True,
+                    "profiles": [
+                        {
+                            "profile_dir": "profiles/alice",
+                            "bound_token_id": 1,
+                            "bound_email": "account@example.com",
+                            "has_cookies_db": True,
+                        }
+                    ],
+                }
+            ),
+        ),
+    )
+    page.route(
+        "**/api/tokens",
+        lambda route: route.fulfill(
+            content_type="application/json",
+            body=json.dumps(
+                [
+                    {
+                        "id": 1,
+                        "email": "account@example.com",
+                        "remark": "保存",
+                        "browser_profile_dir": "profiles/alice",
+                        "browser_profile_exists": True,
+                        "is_active": True,
+                        "protocol_mode": "protocol",
+                        "credits": 100,
+                        "image_enabled": True,
+                        "video_enabled": True,
+                    }
+                ]
+            ),
+        ),
+    )
+    page.route(
+        "**/api/tokens/browser-login/start",
+        lambda route: (
+            login_requests.append(route.request.post_data_json),
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "success": True,
+                        "session_id": f"sess-{len(login_requests)}",
+                        "status": "waiting",
+                        "browser_profile_dir": route.request.post_data_json.get(
+                            "browser_profile_dir"
+                        )
+                        or "",
+                        "message": "Waiting for login",
+                    }
+                ),
+            ),
+        )[-1],
+    )
+    page.route(
+        "**/api/tokens/browser-login/cancel/*",
+        lambda route: (
+            cancel_requests.append(route.request.url),
+            route.fulfill(content_type="application/json", body='{"success":true}'),
+        )[-1],
+    )
+    open_page(page, base + "/manage")
+    page.wait_for_selector("#tokenTableBody tr")
+    playwright_api.expect(page.locator("#tokenTableBody")).to_contain_text("profiles/alice")
+
+    page.evaluate("openEditModal(1)")
+    assert page.locator("#editTokenBrowserProfileDir").input_value() == "profiles/alice"
+    page.evaluate("closeEditModal()")
+
+    page.evaluate("openBrowserLoginModal({tokenId: 1})")
+    playwright_api.expect(page.locator("#browserLoginProfileDir")).to_have_value(
+        "profiles/alice"
+    )
+    playwright_api.expect(page.locator("#browserLoginProfileHint")).to_contain_text(
+        "Will reuse saved cookies and startup cache"
+    )
+    assert len(login_requests) == 1
+    assert login_requests[0]["token_id"] == 1
+    assert login_requests[0]["browser_profile_dir"] == "profiles/alice"
+    assert login_requests[0]["clean_login"] is False
+
+    page.locator("#browserLoginClean").check()
+    page.locator("#browserLoginStartBtn").click()
+    assert len(cancel_requests) == 1
+    assert len(login_requests) == 2
+    assert login_requests[1]["clean_login"] is True
+    page.evaluate("closeBrowserLoginModal(true)")

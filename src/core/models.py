@@ -43,7 +43,7 @@ class Token(BaseModel):
     # 打码代理（token 级，可覆盖全局浏览器打码代理）
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
-
+    browser_profile_dir: Optional[str] = ""
     # Google/Flow Cookie 刷新；保留旧字段名兼容已有数据
     protocol_mode: str = "session"  # session/protocol
     google_cookies: str = ""

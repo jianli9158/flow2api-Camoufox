@@ -9,7 +9,19 @@
     "登录": "登录",
     "登录中...": "登录中...",
     "登录失败": "登录失败",
-    "网络错误,请稍后重试": "网络错误,请稍后重试"
+    "网络错误,请稍后重试": "网络错误,请稍后重试",
+    "Google Flow 原生浏览器网关": "Google Flow 原生浏览器网关",
+    "在同一隔离指纹浏览器会话内执行打码、生图、生视频与 Creation Agent 流式交互，消除 TLS 与 Cookie 割裂。": "在同一隔离指纹浏览器会话内执行打码、生图、生视频与 Creation Agent 流式交互，消除 TLS 与 Cookie 割裂。",
+    "全协议兼容": "全协议兼容",
+    "OpenAI /v1/chat/completions、Gemini generateContent 与 /v1/flow/* 原生接口": "OpenAI /v1/chat/completions、Gemini generateContent 与 /v1/flow/* 原生接口",
+    "账号亲和槽位池": "账号亲和槽位池",
+    "固定 Windows 指纹隔离、自动风控冷却切换与后台无感 Cookie 续期": "固定 Windows 指纹隔离、自动风控冷却切换与后台无感 Cookie 续期",
+    "远程 LiveView 登录": "远程 LiveView 登录",
+    "无需桌面环境或 Xvfb，直接在控制台实时画面完成 Google 账号登录": "无需桌面环境或 Xvfb，直接在控制台实时画面完成 Google 账号登录",
+    "使用管理员凭证登录以管理账号槽位、系统配置与请求日志": "使用管理员凭证登录以管理账号槽位、系统配置与请求日志",
+    "切换主题": "切换主题",
+    "切换浅色/深色主题": "切换浅色/深色主题",
+    "显示密码": "显示密码"
   },
   "en": {
     "登录 - Flow2API": "Sign in - Flow2API",
@@ -21,6 +33,18 @@
     "登录": "Sign in",
     "登录中...": "Signing in...",
     "登录失败": "Sign-in failed",
-    "网络错误,请稍后重试": "Network error. Please try again later."
+    "网络错误,请稍后重试": "Network error. Please try again later.",
+    "Google Flow 原生浏览器网关": "Google Flow Native Browser Gateway",
+    "在同一隔离指纹浏览器会话内执行打码、生图、生视频与 Creation Agent 流式交互，消除 TLS 与 Cookie 割裂。": "Runs captcha solving, image/video generation, and Creation Agent streaming inside one isolated fingerprint browser session without TLS or cookie split-brain.",
+    "全协议兼容": "Multi-protocol API",
+    "OpenAI /v1/chat/completions、Gemini generateContent 与 /v1/flow/* 原生接口": "OpenAI /v1/chat/completions, Gemini generateContent, and native /v1/flow/* endpoints",
+    "账号亲和槽位池": "Account-affine slot pool",
+    "固定 Windows 指纹隔离、自动风控冷却切换与后台无感 Cookie 续期": "Persistent Windows fingerprint isolation, cooldown failover, and silent background cookie renewal",
+    "远程 LiveView 登录": "Remote LiveView Sign-in",
+    "无需桌面环境或 Xvfb，直接在控制台实时画面完成 Google 账号登录": "Complete Google sign-in from the console live stream with zero desktop or Xvfb required",
+    "使用管理员凭证登录以管理账号槽位、系统配置与请求日志": "Sign in with administrator credentials to manage account slots, system settings, and request logs",
+    "切换主题": "Toggle theme",
+    "切换浅色/深色主题": "Toggle light/dark theme",
+    "显示密码": "Show password"
   }
 }

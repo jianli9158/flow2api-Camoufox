@@ -5,14 +5,19 @@ from contextlib import asynccontextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 import os
+from pathlib import Path
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple, Union
 import uuid
 
 from ..core.config import config
 from ..core.logger import debug_logger
-from .camoufox_bidi import CamoufoxWorker
-
+from .camoufox_bidi import (
+    CamoufoxWorker,
+    get_profile_login_holder,
+    is_token_in_login_session,
+    resolve_account_profile_dir,
+)
 # Compatibility alias for callers/tests referencing TokenBrowser
 TokenBrowser = CamoufoxWorker
 
@@ -250,6 +255,15 @@ class BrowserCaptchaService:
             google_cookies = str(getattr(token, "google_cookies", "") or "").strip()
             session_token = str(getattr(token, "st", "") or "").strip()
             if not (google_cookies or session_token):
+                continue
+            if is_token_in_login_session(int(token_key)):
+                continue
+            acc_dir, _ = resolve_account_profile_dir(
+                Path(self.base_user_data_dir),
+                token_id=int(token_key),
+                profile_dir_name=getattr(token, "browser_profile_dir", None),
+            )
+            if get_profile_login_holder(acc_dir):
                 continue
             proxy_url = str(getattr(token, "captcha_proxy_url", "") or "").strip()
             specs.append((int(token_key), proxy_url or None))
@@ -948,6 +962,40 @@ class BrowserCaptchaService:
                 )
             return response
 
+    async def stream_flow_agent_chat(
+        self,
+        *,
+        project_id: str,
+        request_builder: Callable[[str], str],
+        timeout: int = 180,
+        token_id: Optional[int] = None,
+        browser_ref: Optional[Union[int, str]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        deadline = time.monotonic() + max(30.0, float(timeout or 180))
+        token_proxy_url = await self._resolve_token_proxy_url(token_id)
+        async with self._borrow_browser(
+            project_id,
+            token_id,
+            browser_ref=browser_ref,
+            wait_timeout=min(
+                self.QUEUE_WAIT_SECONDS, max(0.0, deadline - time.monotonic())
+            ),
+        ) as request:
+            streamer = getattr(request.browser, "stream_flow_agent_chat", None)
+            if not callable(streamer):
+                raise RuntimeError("Active browser worker does not support stream_flow_agent_chat")
+            remaining = max(30.0, deadline - time.monotonic())
+            async for chunk in streamer(
+                project_id=project_id,
+                request_builder=request_builder,
+                timeout=int(remaining),
+                token_id=token_id,
+                token_proxy_url=token_proxy_url,
+            ):
+                yield chunk
+            request.generation = getattr(request.browser, "_runtime_generation", 0)
+            request.fingerprint = deepcopy(request.browser.get_last_fingerprint())
+
     async def generate_native_image(
         self,
         *,
@@ -1202,6 +1250,65 @@ class BrowserCaptchaService:
             finally:
                 if reserved:
                     await self._release_slot_reservation(slot_id)
+
+    async def release_profile_browsers(
+        self, account_dir: Path, reason: str = "profile_relogin"
+    ) -> None:
+        try:
+            target_dir = account_dir.resolve()
+        except Exception:
+            target_dir = account_dir
+        async with self._browsers_lock:
+            candidates = list(self._browsers.items())
+
+        for slot_id, browser in candidates:
+            reserved = False
+            should_recycle = False
+            wait_deadline = time.monotonic() + 15.0
+            try:
+                async with self._slot_condition:
+                    while not self._closed and self._is_slot_busy_for_allocation(slot_id):
+                        remaining = wait_deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        try:
+                            await asyncio.wait_for(
+                                self._slot_condition.wait(), remaining
+                            )
+                        except asyncio.TimeoutError:
+                            break
+                    browser_dir = getattr(browser, "_account_dir", None)
+                    matches = False
+                    if isinstance(browser_dir, Path):
+                        try:
+                            matches = browser_dir.resolve() == target_dir
+                        except Exception:
+                            matches = browser_dir == target_dir
+                    if matches:
+                        self._reserve_slot_locked(slot_id)
+                        reserved = True
+                        should_recycle = True
+                        for ref, req in list(self._requests.items()):
+                            if req.slot_id == slot_id:
+                                self._requests.pop(ref, None)
+                                if req.owner and req.owner_callback:
+                                    try:
+                                        req.owner.remove_done_callback(
+                                            req.owner_callback
+                                        )
+                                    except Exception:
+                                        pass
+                if should_recycle:
+                    try:
+                        await browser.recycle_browser(
+                            reason=reason, rotate_profile=False
+                        )
+                    except Exception:
+                        pass
+            finally:
+                if reserved:
+                    await self._release_slot_reservation(slot_id)
+
     def get_stats(self):
         now = time.monotonic()
         states = []

@@ -376,7 +376,7 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
                     await self.client._current_generate_video(
                         project_id=PROJECT_ID,
                         prompt="an apple",
-                        model_key="veo_3_1_t2v_fast",
+                        model_key="veo_3_1_t2v_lite",
                         aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
                         mode="t2v",
                         token_id=7,
@@ -476,7 +476,7 @@ class ImageModelRolloutTests(unittest.IsolatedAsyncioTestCase):
                 "access",
                 PROJECT_ID,
                 "ocean waves",
-                "veo_3_1_t2v_fast",
+                "veo_3_1_t2v_lite",
                 "VIDEO_ASPECT_RATIO_LANDSCAPE",
                 use_v2_model_config=True,
                 token_id=7,

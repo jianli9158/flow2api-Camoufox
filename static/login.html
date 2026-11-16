@@ -1,88 +1,164 @@
 <!DOCTYPE html>
-<html data-i18n-page="login" lang="zh-CN" class="h-full">
+<html data-i18n-page="login" lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title data-i18n="登录 - Flow2API">登录 - Flow2API</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 28'%3E%3Crect x='2' y='2' width='24' height='24' rx='6' fill='%230d6e6e'/%3E%3Cpath d='M8 9.5h12L15.8 14 20 18.5H8l4.2-4.5L8 9.5Z' fill='%23fff'/%3E%3C/svg%3E">
     <script src="/static/i18n.js"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        :root {
-            --bg-canvas: #F8FAFC;
-            --bg-surface: #FFFFFF;
-            --border-subtle: #E2E8F0;
-            --ink-primary: #0F172A;
-            --ink-secondary: #475569;
-            --ink-muted: #64748B;
-            --accent: #2563EB;
-        }
-        body {
-            background-color: var(--bg-canvas);
-            color: var(--ink-primary);
-            font-family: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-            background-image: radial-gradient(#E2E8F0 1px, transparent 1px);
-            background-size: 24px 24px;
-        }
-        @keyframes slide-up {
-            from { transform: translateY(100%); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-        .animate-slide-up { animation: slide-up .25s cubic-bezier(0.16, 1, 0.3, 1); }
-        .login-card {
-            background: var(--bg-surface);
-            border: 1px solid var(--border-subtle);
-            box-shadow: 0 1px 3px rgba(15, 23, 42, 0.04), 0 8px 24px -4px rgba(15, 23, 42, 0.05);
-        }
-    </style>
-    <script>
-        tailwind.config={theme:{extend:{colors:{border:"hsl(214 32% 91%)",input:"hsl(214 32% 91%)",ring:"hsl(222 47% 11%)",background:"hsl(0 0% 100%)",foreground:"hsl(222 47% 11%)",primary:{DEFAULT:"hsl(222 47% 11%)",foreground:"hsl(210 40% 98%)"},secondary:{DEFAULT:"hsl(210 40% 96.1%)",foreground:"hsl(222 47% 11%)"},muted:{DEFAULT:"hsl(210 40% 96.1%)",foreground:"hsl(215 16% 47%)"},destructive:{DEFAULT:"hsl(0 84.2% 60.2%)",foreground:"hsl(210 40% 98%)"}}}}}
-    </script>
+    <link rel="stylesheet" href="/static/console.css">
 </head>
-<body class="h-full antialiased selection:bg-slate-900 selection:text-white">
-    <div class="fixed top-5 right-6 z-20">
-        <select data-language-select aria-label="Language" class="h-8 rounded-md border border-slate-200 bg-white px-2.5 text-xs font-medium text-slate-700 shadow-sm transition-colors hover:border-slate-300 focus:outline-none focus:ring-2 focus:ring-slate-900/10">
-            <option value="zh-CN">中文</option>
-            <option value="en">English</option>
-        </select>
-    </div>
-
-    <div class="flex min-h-full flex-col justify-center py-12 px-4 sm:px-6 lg:px-8">
-        <div class="sm:mx-auto sm:w-full sm:max-w-[400px]">
-            <div class="login-card rounded-xl p-8 sm:p-9">
-                <div class="mb-7">
-                    <div class="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-2.5 py-1 text-[11px] font-medium text-slate-600 mb-4">
-                        <span class="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
-                        <span>Camoufox + WebDriver BiDi</span>
-                    </div>
-                    <h1 class="text-2xl font-semibold tracking-tight text-slate-900">Flow2API</h1>
-                    <p class="mt-1 text-sm text-slate-500"><span data-i18n="管理员控制台">管理员控制台</span></p>
-                </div>
-
-                <form id="loginForm" method="post" action="/api/login" class="space-y-5">
-                    <div class="space-y-1.5">
-                        <label for="username" class="block text-xs font-medium uppercase tracking-wider text-slate-600"><span data-i18n="账户">账户</span></label>
-                        <input type="text" id="username" name="username" required autocomplete="username" class="flex h-10 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors focus:border-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900/10 disabled:opacity-50" placeholder="请输入账户" data-i18n-placeholder="请输入账户">
-                    </div>
-                    <div class="space-y-1.5">
-                        <label for="password" class="block text-xs font-medium uppercase tracking-wider text-slate-600"><span data-i18n="密码">密码</span></label>
-                        <input type="password" id="password" name="password" required autocomplete="current-password" class="flex h-10 w-full rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-sm text-slate-900 placeholder:text-slate-400 transition-colors focus:border-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-900/10 disabled:opacity-50" placeholder="请输入密码" data-i18n-placeholder="请输入密码">
-                    </div>
-                    <button type="submit" id="loginButton" class="inline-flex items-center justify-center rounded-lg text-sm font-medium transition-all bg-slate-900 text-white hover:bg-slate-800 active:scale-[0.99] h-10 w-full shadow-sm disabled:opacity-50"><span data-i18n="登录">登录</span></button>
-                </form>
-
-                <div class="mt-7 pt-5 border-t border-slate-100 flex items-center justify-between text-xs text-slate-400">
-                    <span>Flow2API Gateway</span>
-                    <span class="font-mono">v2.0</span>
+<body>
+    <main class="login-shell">
+        <section class="login-aside" aria-label="Product overview">
+            <div class="brand-link">
+                <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+                    <rect x="2" y="2" width="24" height="24" rx="6" stroke="currentColor" stroke-width="1.8"/>
+                    <path d="M8 9.5h12L15.8 14 20 18.5H8l4.2-4.5L8 9.5Z" fill="currentColor" fill-opacity="0.16" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                </svg>
+                <div class="brand-text">
+                    <span class="brand-name">Flow2API</span>
+                    <span class="brand-engine">Camoufox · WebDriver BiDi</span>
                 </div>
             </div>
-        </div>
-    </div>
+
+            <div class="login-aside-body">
+                <div>
+                    <div class="login-aside-title" data-i18n="Google Flow 原生浏览器网关">Google Flow 原生浏览器网关</div>
+                    <p class="login-lead" style="margin-top: 10px;" data-i18n="在同一隔离指纹浏览器会话内执行打码、生图、生视频与 Creation Agent 流式交互，消除 TLS 与 Cookie 割裂。">在同一隔离指纹浏览器会话内执行打码、生图、生视频与 Creation Agent 流式交互，消除 TLS 与 Cookie 割裂。</p>
+                </div>
+
+                <div class="login-specs">
+                    <div class="login-spec-item">
+                        <strong data-i18n="全协议兼容">全协议兼容</strong>
+                        <span data-i18n="OpenAI /v1/chat/completions、Gemini generateContent 与 /v1/flow/* 原生接口">OpenAI /v1/chat/completions、Gemini generateContent 与 /v1/flow/* 原生接口</span>
+                    </div>
+                    <div class="login-spec-item">
+                        <strong data-i18n="账号亲和槽位池">账号亲和槽位池</strong>
+                        <span data-i18n="固定 Windows 指纹隔离、自动风控冷却切换与后台无感 Cookie 续期">固定 Windows 指纹隔离、自动风控冷却切换与后台无感 Cookie 续期</span>
+                    </div>
+                    <div class="login-spec-item">
+                        <strong data-i18n="远程 LiveView 登录">远程 LiveView 登录</strong>
+                        <span data-i18n="无需桌面环境或 Xvfb，直接在控制台实时画面完成 Google 账号登录">无需桌面环境或 Xvfb，直接在控制台实时画面完成 Google 账号登录</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="freshness">Flow2API Gateway · Camoufox BiDi</div>
+        </section>
+
+        <section class="login-main">
+            <div class="login-topbar">
+                <div class="login-mobile-brand">
+                    <svg class="brand-mark" viewBox="0 0 28 28" fill="none" aria-hidden="true">
+                        <rect x="2" y="2" width="24" height="24" rx="6" stroke="currentColor" stroke-width="1.8"/>
+                        <path d="M8 9.5h12L15.8 14 20 18.5H8l4.2-4.5L8 9.5Z" fill="currentColor" fill-opacity="0.16" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/>
+                    </svg>
+                    <span>Flow2API</span>
+                </div>
+                <div class="topbar-actions">
+                    <button type="button" class="icon-btn" data-theme-toggle aria-label="切换主题" title="切换浅色/深色主题" data-i18n-aria-label="切换主题" data-i18n-title="切换浅色/深色主题">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                            <circle cx="12" cy="12" r="4"/>
+                            <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/>
+                        </svg>
+                    </button>
+                    <select data-language-select aria-label="Language" class="input sm">
+                        <option value="zh-CN">中文</option>
+                        <option value="en">English</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="login-panel">
+                <div class="login-panel-head">
+                    <h1 data-i18n="管理员控制台">管理员控制台</h1>
+                    <p data-i18n="使用管理员凭证登录以管理账号槽位、系统配置与请求日志">使用管理员凭证登录以管理账号槽位、系统配置与请求日志</p>
+                </div>
+
+                <form id="loginForm" method="post" action="/api/login" class="login-form">
+                    <div class="field">
+                        <label for="username" data-i18n="账户">账户</label>
+                        <input type="text" id="username" name="username" required autocomplete="username" class="input" placeholder="请输入账户" data-i18n-placeholder="请输入账户">
+                    </div>
+
+                    <div class="field">
+                        <label for="password" data-i18n="密码">密码</label>
+                        <div class="password-wrap">
+                            <input type="password" id="password" name="password" required autocomplete="current-password" class="input" placeholder="请输入密码" data-i18n-placeholder="请输入密码">
+                            <button type="button" id="togglePasswordBtn" class="password-toggle" aria-label="显示密码" data-i18n-aria-label="显示密码">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" width="16" height="16" aria-hidden="true">
+                                    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/>
+                                    <circle cx="12" cy="12" r="3"/>
+                                </svg>
+                            </button>
+                        </div>
+                    </div>
+
+                    <button type="submit" id="loginButton" class="btn primary login-submit" data-i18n="登录">登录</button>
+                </form>
+            </div>
+        </section>
+    </main>
 
     <script>
-        const form=document.getElementById('loginForm'),btn=document.getElementById('loginButton');
-        form.addEventListener('submit',async(e)=>{e.preventDefault();btn.disabled=true;I18n.setMessage(btn, I18n.t("登录中..."));try{const fd=new FormData(form),r=await fetch('/api/login',{method:'POST',credentials:'include',headers:{...I18n.headers(),'Content-Type':'application/json'},body:JSON.stringify({username:fd.get('username'),password:fd.get('password')})});const d=await r.json();if(d.success){location.href='/manage'}else showToast(d.message||d.detail||I18n.t("登录失败"),'error')}catch(e){showToast(I18n.t("网络错误,请稍后重试"),'error')}finally{btn.disabled=false;I18n.setMessage(btn, I18n.t("登录"))}});
-        function showToast(m,t='error'){const d=document.createElement('div'),bc={success:'bg-emerald-600',error:'bg-red-600',info:'bg-slate-900'};d.className=`fixed bottom-4 right-4 ${bc[t]||bc.error} text-white px-4 py-2.5 rounded-lg shadow-lg text-sm font-medium z-50 animate-slide-up`;I18n.setMessage(d, m);document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},2000)}
-        (()=>{fetch('/api/stats',{credentials:'include',headers:I18n.headers()}).then(r=>{if(r.ok)location.href='/manage'}).catch(()=>{})})();
+        const form = document.getElementById('loginForm');
+        const btn = document.getElementById('loginButton');
+        const pwdInput = document.getElementById('password');
+        const pwdToggle = document.getElementById('togglePasswordBtn');
+
+        if (pwdToggle && pwdInput) {
+            pwdToggle.addEventListener('click', () => {
+                pwdInput.type = pwdInput.type === 'password' ? 'text' : 'password';
+            });
+        }
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            btn.disabled = true;
+            I18n.setMessage(btn, I18n.t("登录中..."));
+            try {
+                const fd = new FormData(form);
+                const r = await fetch('/api/login', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: { ...I18n.headers(), 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        username: fd.get('username'),
+                        password: fd.get('password')
+                    })
+                });
+                const d = await r.json();
+                if (d.success) {
+                    location.href = '/manage';
+                } else {
+                    showToast(d.message || d.detail || I18n.t("登录失败"), 'error');
+                }
+            } catch (err) {
+                showToast(I18n.t("网络错误,请稍后重试"), 'error');
+            } finally {
+                btn.disabled = false;
+                I18n.setMessage(btn, I18n.t("登录"));
+            }
+        });
+
+        function showToast(m, t = 'error') {
+            const d = document.createElement('div');
+            d.className = `fixed bottom-4 toast ${t === 'success' ? 'success' : (t === 'info' ? 'info' : 'error')} animate-slide-up`;
+            I18n.setMessage(d, m);
+            document.body.appendChild(d);
+            setTimeout(() => {
+                d.style.opacity = '0';
+                d.style.transition = 'opacity .3s';
+                setTimeout(() => d.parentNode && document.body.removeChild(d), 300);
+            }, 2400);
+        }
+
+        (() => {
+            fetch('/api/stats', { credentials: 'include', headers: I18n.headers() })
+                .then(r => { if (r.ok) location.href = '/manage'; })
+                .catch(() => {});
+        })();
     </script>
 </body>
 </html>

@@ -176,7 +176,7 @@
     }
 
     function updateSelectors() {
-        document.querySelectorAll('[data-language-select]').forEach(select => {
+        document.querySelectorAll('[data-language-select], [data-language-mirror]').forEach(select => {
             select.value = locale;
             select.setAttribute('aria-label', t('界面语言'));
         });
@@ -228,7 +228,7 @@
         apply();
         updateSelectors();
         document.addEventListener('change', event => {
-            if (event.target.matches('[data-language-select]')) setLanguage(event.target.value);
+            if (event.target.matches('[data-language-select], [data-language-mirror]')) setLanguage(event.target.value);
         });
         const observer = new MutationObserver(records => {
             for (const record of records) {
@@ -240,9 +240,50 @@
         observer.observe(document.body, { childList: true, subtree: true });
     });
 
+    const themeKey = 'flow2api.theme';
+    function normalizeTheme(value) {
+        return value === 'dark' ? 'dark' : 'light';
+    }
+    function preferredTheme() {
+        try {
+            const saved = localStorage.getItem(themeKey);
+            if (saved === 'dark' || saved === 'light') return saved;
+        } catch (_) { /* Storage can be disabled by the browser. */ }
+        return 'light';
+    }
+    let currentTheme = preferredTheme();
+    document.documentElement.dataset.theme = currentTheme;
+    function setTheme(theme, persist = true) {
+        const next = normalizeTheme(theme);
+        const changed = next !== currentTheme;
+        currentTheme = next;
+        document.documentElement.dataset.theme = next;
+        if (persist) {
+            try { localStorage.setItem(themeKey, next); } catch (_) {}
+        }
+        document.querySelectorAll('[data-theme-toggle]').forEach(btn => {
+            btn.setAttribute('aria-pressed', next === 'dark' ? 'true' : 'false');
+            btn.dataset.currentTheme = next;
+        });
+        if (changed) window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    }
+    domReady.then(() => {
+        setTheme(currentTheme, false);
+        document.addEventListener('click', event => {
+            const trigger = event.target.closest('[data-theme-toggle]');
+            if (trigger) setTheme(currentTheme === 'dark' ? 'light' : 'dark');
+        });
+    });
+
     window.addEventListener('storage', event => {
         if (event.key === storageKey && event.newValue) setLanguage(event.newValue, false);
+        if (event.key === themeKey && event.newValue) setTheme(event.newValue, false);
     });
+    window.FlowTheme = {
+        get current() { return currentTheme; },
+        set: setTheme,
+        toggle: () => setTheme(currentTheme === 'dark' ? 'light' : 'dark'),
+    };
     window.I18n = {
         t, translateMessage, translateError, setText, setRawText, setMessage, apply, setLanguage, ready,
         escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({

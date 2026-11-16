@@ -49,7 +49,17 @@ def get_required_paygate_tier_for_model(model_name: Optional[str]) -> str:
     ):
         return PAYGATE_TIER_TWO
 
-    if normalized.endswith("-2k") or normalized.endswith("_1080p"):
+    if (
+        normalized.endswith("-2k")
+        or normalized.endswith("_1080p")
+        or normalized.endswith("-1080p")
+    ):
+        return PAYGATE_TIER_ONE
+
+    if ("omni-1.2-flash" in normalized or "macaron_cookie" in normalized) and (
+        "extend" in normalized
+        or any(f"{d}s" in normalized for d in (11, 12, 13, 14, 15))
+    ):
         return PAYGATE_TIER_ONE
 
     return PAYGATE_TIER_NOT_PAID

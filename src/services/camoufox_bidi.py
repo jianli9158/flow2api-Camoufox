@@ -35,7 +35,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 import uuid
 import zipfile
@@ -1494,7 +1494,19 @@ def write_camoufox_user_js(
         # Draw in parent process where bundled Resources/fonts are registered with CoreText
         prefs["layers.gpu-process.enabled"] = False
         prefs["webgl.allow-in-parent"] = True
-    # Proxy configuration
+    # Proxy configuration (always reset stale proxy keys so persistent profiles cleanly toggle proxy on/off)
+    prefs.update(
+        {
+            "network.proxy.type": 0,
+            "network.proxy.http": "",
+            "network.proxy.http_port": 0,
+            "network.proxy.ssl": "",
+            "network.proxy.ssl_port": 0,
+            "network.proxy.socks": "",
+            "network.proxy.socks_port": 0,
+            "network.proxy.no_proxies_on": "localhost, 127.0.0.1, ::1",
+        }
+    )
     if relay_addr is not None:
         r_host, r_port = relay_addr
         prefs.update(
@@ -1504,7 +1516,6 @@ def write_camoufox_user_js(
                 "network.proxy.socks_port": int(r_port),
                 "network.proxy.socks_version": 5,
                 "network.proxy.socks_remote_dns": True,
-                "network.proxy.no_proxies_on": "localhost, 127.0.0.1, ::1",
             }
         )
     elif proxy_url:
@@ -1515,7 +1526,6 @@ def write_camoufox_user_js(
         p_host = parsed.hostname or "127.0.0.1"
         p_port = parsed.port or (1080 if "socks" in scheme else 8080)
         prefs["network.proxy.type"] = 1
-        prefs["network.proxy.no_proxies_on"] = "localhost, 127.0.0.1, ::1"
         if "socks" in scheme:
             prefs["network.proxy.socks"] = p_host
             prefs["network.proxy.socks_port"] = int(p_port)
@@ -1550,6 +1560,7 @@ def write_camoufox_user_js(
                 'user_pref("network.dns.disablePrefetch"',
                 'user_pref("network.http.speculative-parallel-limit"',
                 'user_pref("network.prefetch-next"',
+                'user_pref("network.proxy.',
                 'user_pref("remote.prefs.recommended"',
                 'user_pref("browser.cache.disk.',
                 'user_pref("gfx.webrender.enable-subpixel-aa"',
@@ -1565,7 +1576,6 @@ def write_camoufox_user_js(
                 )
         except Exception:
             pass
-
 def _start_stdout_drain(
     proc: Optional[asyncio.subprocess.Process],
 ) -> Optional[asyncio.Task]:
@@ -1614,8 +1624,8 @@ class CamoufoxWorker:
         self._context_id: Optional[str] = None
         self._relay: Optional[LocalSocks5Relay] = None
         self._profile_dir: Optional[Path] = None
+        self._account_dir: Optional[Path] = None
         self._shared_browser_pid: Optional[int] = None
-        self._shared_proxy_url: Optional[str] = None
         self._shared_bound_token_id: Optional[int] = None
         self._shared_bound_cookie_signature: Optional[str] = None
         self._browser_proxy_active: bool = False
@@ -1738,18 +1748,35 @@ class CamoufoxWorker:
         finally:
             async with self._frame_lock:
                 self._frame_boosts = max(0, self._frame_boosts - 1)
-    def _resolve_account_dir(self, token_id: Optional[int]) -> Path:
-        """Resolve the shared account directory `browser_data_rt/token_<id>` so LoginSession and Worker share identical fingerprint, cache, and Firefox profile."""
+    def _get_user_data_root(self) -> Path:
         if re.match(r"^browser_\d+$", self.user_data_dir.name):
-            root_dir = self.user_data_dir.parent
-        elif self.user_data_dir.name.startswith("token_"):
+            return self.user_data_dir.parent
+        if self.user_data_dir.name.startswith("token_"):
+            return self.user_data_dir.parent
+        return self.user_data_dir
+
+    def _resolve_account_dir(
+        self,
+        token_id: Optional[int],
+        *,
+        profile_dir_name: Optional[str] = None,
+    ) -> Path:
+        """Resolve the fixed per-account directory under `browser_data_rt/`."""
+        if self.user_data_dir.name.startswith("token_") and not profile_dir_name:
             return self.user_data_dir
-        else:
-            root_dir = self.user_data_dir
-        if token_id:
-            account_dir = root_dir / f"token_{int(token_id)}"
-            legacy_dir = self.user_data_dir / f"token_{int(token_id)}"
-            if legacy_dir != account_dir and legacy_dir.is_dir():
+        root_dir = self._get_user_data_root()
+        if token_id or (profile_dir_name and str(profile_dir_name).strip()):
+            account_dir, _ = resolve_account_profile_dir(
+                root_dir,
+                token_id=token_id,
+                profile_dir_name=profile_dir_name,
+            )
+            legacy_dir = (
+                self.user_data_dir / f"token_{int(token_id)}"
+                if token_id
+                else None
+            )
+            if legacy_dir is not None and legacy_dir != account_dir and legacy_dir.is_dir():
                 account_dir.mkdir(parents=True, exist_ok=True)
                 for sub_name in ("camoufox-cache", "storage-state.json"):
                     src_item = legacy_dir / sub_name
@@ -1765,6 +1792,16 @@ class CamoufoxWorker:
             return account_dir
         return self.user_data_dir / "shared"
 
+    async def _get_token_profile_dir_name(self, token_id: Optional[int]) -> Optional[str]:
+        token_key = self._normalize_token_key(token_id)
+        if token_key is None or not self.db or not hasattr(self.db, "get_token"):
+            return None
+        try:
+            token = await self.db.get_token(token_key)
+        except Exception:
+            return None
+        return getattr(token, "browser_profile_dir", None) if token else None
+
     async def _launch_camoufox(
         self, token_proxy_url: Optional[str] = None, token_id: Optional[int] = None
     ) -> None:
@@ -1772,14 +1809,21 @@ class CamoufoxWorker:
         raw_proxy_url, _ = await self._resolve_proxy_runtime_config(token_proxy_url)
         self._browser_proxy_active = bool(raw_proxy_url)
 
-        account_dir = self._resolve_account_dir(token_id)
+        profile_dir_name = await self._get_token_profile_dir_name(token_id)
+        account_dir = self._resolve_account_dir(
+            token_id, profile_dir_name=profile_dir_name
+        )
+        login_holder = get_profile_login_holder(account_dir)
+        if login_holder:
+            raise RuntimeError(
+                f"账号浏览器资料目录 {account_dir.name} 正在进行登录会话 ({login_holder})，请先完成或关闭登录"
+            )
         account_dir.mkdir(parents=True, exist_ok=True)
         fp_config = load_or_create_account_camoufox_config(
             account_dir, CAMOUFOX_FIREFOX_MAJOR, "en-US", "America/New_York"
         )
 
         try:
-            # Start local SOCKS5 relay if upstream proxy has credentials or is SOCKS5
             relay_addr: Optional[Tuple[str, int]] = None
             if raw_proxy_url:
                 parsed_proxy = urlparse(raw_proxy_url)
@@ -2110,15 +2154,15 @@ class CamoufoxWorker:
             or hashlib.sha256(serialized.encode("utf-8")).hexdigest()
         )
 
-        # Update storage-state.json in account_dir and shared token_<id> dir
+        # Update storage-state.json in active bound account_dir
         dirs_to_update: List[Path] = []
         account_dir = getattr(self, "_account_dir", None)
         if isinstance(account_dir, Path) and account_dir.exists():
             dirs_to_update.append(account_dir)
-        if bound_id is not None:
-            shared_token_dir = self.user_data_dir.parent / f"token_{bound_id}"
-            if shared_token_dir.exists() and shared_token_dir not in dirs_to_update:
-                dirs_to_update.append(shared_token_dir)
+        elif bound_id is not None:
+            fallback_dir = self._resolve_account_dir(bound_id)
+            if fallback_dir.exists():
+                dirs_to_update.append(fallback_dir)
 
         primary_ss_exists = bool(
             dirs_to_update and (dirs_to_update[0] / "storage-state.json").is_file()
@@ -2169,7 +2213,7 @@ class CamoufoxWorker:
         if token_key is None:
             return None, None, None, None
         token = None
-        if self.db:
+        if self.db and hasattr(self.db, "get_token"):
             try:
                 token = await self.db.get_token(token_key)
             except Exception as exc:
@@ -2180,12 +2224,18 @@ class CamoufoxWorker:
         google_cookies = (
             str(getattr(token, "google_cookies", "") or "").strip() if token else ""
         )
+        profile_dir_name = (
+            str(getattr(token, "browser_profile_dir", "") or "").strip() if token else ""
+        )
         if not google_cookies and (
             session_token.startswith("{") or "=" in session_token
         ):
             google_cookies = session_token
         if not (google_cookies or session_token):
-            ss_path = self._resolve_account_dir(token_key) / "storage-state.json"
+            ss_path = (
+                self._resolve_account_dir(token_key, profile_dir_name=profile_dir_name)
+                / "storage-state.json"
+            )
             if ss_path.is_file():
                 try:
                     google_cookies = ss_path.read_text(encoding="utf-8").strip()
@@ -2629,6 +2679,7 @@ class CamoufoxWorker:
         context_id: str,
         project_id: Optional[str],
         action: str = "IMAGE_GENERATION",
+        force_reload: bool = False,
     ) -> bool:
         """Navigate or reuse the resident Flow page, warm up reCAPTCHA Enterprise, and suspend renderLayers when done."""
         if not self._bidi:
@@ -2650,11 +2701,20 @@ class CamoufoxWorker:
         except Exception:
             current_url = ""
 
-        needs_nav = not current_url.startswith(f"{FLOW_ORIGIN}/") or (
+        needs_nav = force_reload or not current_url.startswith(f"{FLOW_ORIGIN}/") or (
             bool(project_id) and f"/project/{project_id}" not in current_url
         )
 
         async with self._boost_frames():
+            if force_reload:
+                try:
+                    await self._bidi.evaluate(
+                        context_id,
+                        """(() => { try { localStorage.removeItem("_grecaptcha"); } catch (e) {} return true; })()""",
+                        await_promise=False,
+                    )
+                except Exception:
+                    pass
             if needs_nav:
                 try:
                     await self._bidi.command(
@@ -2662,7 +2722,7 @@ class CamoufoxWorker:
                         {
                             "context": context_id,
                             "url": target_url,
-                            "wait": "interactive",
+                            "wait": "complete" if force_reload else "interactive",
                         },
                         timeout=45.0,
                     )
@@ -2671,8 +2731,8 @@ class CamoufoxWorker:
                         debug_logger.log_warning(
                             f"[Camoufox] Slot-{self.token_id} 导航 {target_url} 异常: {nav_exc}"
                         )
-
-            # Wait for document ready and ensure hooks are installed
+                if force_reload:
+                    await asyncio.sleep(1.5)
             for _ in range(30):
                 try:
                     state = await self._bidi.evaluate(
@@ -2758,6 +2818,47 @@ class CamoufoxWorker:
                 pass
 
             await self._dismiss_flow_overlays(context_id)
+            try:
+                cookie_bar_rect = await self._bidi.evaluate(
+                    context_id,
+                    """(() => {
+                        const el = document.querySelector(".glue-cookie-notification-bar__accept");
+                        if (!el) return null;
+                        const r = el.getBoundingClientRect();
+                        const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
+                        const vh = window.innerHeight || document.documentElement.clientHeight || 720;
+                        if (r.width <= 0 || r.height <= 0 || r.left < 0 || r.top < 0 || r.right > vw || r.bottom > vh) return null;
+                        return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) };
+                    })()""",
+                    await_promise=False,
+                )
+                if isinstance(cookie_bar_rect, dict):
+                    await self._bidi.command(
+                        "input.performActions",
+                        {
+                            "context": context_id,
+                            "actions": [
+                                {
+                                    "type": "pointer",
+                                    "id": "mouse",
+                                    "parameters": {"pointerType": "mouse"},
+                                    "actions": [
+                                        {
+                                            "type": "pointerMove",
+                                            "x": int(cookie_bar_rect["x"]),
+                                            "y": int(cookie_bar_rect["y"]),
+                                            "duration": 160,
+                                        },
+                                        {"type": "pointerDown", "button": 0},
+                                        {"type": "pointerUp", "button": 0},
+                                    ],
+                                }
+                            ],
+                        },
+                    )
+                    await asyncio.sleep(0.2)
+            except Exception:
+                pass
             await self._send_trusted_gesture(context_id)
             ready = False
             for _ in range(30):
@@ -2834,8 +2935,12 @@ class CamoufoxWorker:
                         _, bidi, context_id = await self._get_or_create_shared_browser(
                             token_proxy_url=token_proxy_url, token_id=token_id
                         )
+                        used_force_reload = bool(attempt > 0 or self._consecutive_risk_failures > 0)
                         ready = await self._ensure_flow_page_ready(
-                            context_id, project_id, action=action
+                            context_id,
+                            project_id,
+                            action=action,
+                            force_reload=used_force_reload,
                         )
                         if not ready:
                             raise RuntimeError("Camoufox 页面 grecaptcha.enterprise 未就绪")
@@ -2860,6 +2965,8 @@ class CamoufoxWorker:
                             if token:
                                 self._solve_count += 1
                                 self._consecutive_browser_failures = 0
+                                if used_force_reload:
+                                    self._consecutive_risk_failures = 0
                                 session_id = (
                                     str(uuid.uuid4())
                                     if str(action or "").upper() == "CHAT_GENERATION"
@@ -3049,6 +3156,469 @@ class CamoufoxWorker:
                     "text": str(res.get("text") or ""),
                 }
             finally:
+                self._solve_inflight = max(0, self._solve_inflight - 1)
+                self.note_idle()
+
+    async def stream_flow_agent_chat(
+        self,
+        *,
+        project_id: str,
+        request_builder: Callable[[str], str],
+        timeout: int = 180,
+        token_id: Optional[int] = None,
+        token_proxy_url: Optional[str] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Execute Flow Creation Agent WebChannel (`streamCreationAgentChat/channel`) in-page and yield chunks."""
+        async with self._semaphore:
+            self._solve_inflight += 1
+            stream_id = f"agent_{uuid.uuid4().hex[:12]}"
+            active_bidi = None
+            active_context_id: Optional[str] = None
+            try:
+                cookie_fallback: Dict[str, str] = {}
+                try:
+                    storage_path = self.user_data_dir / "storage-state.json"
+                    if storage_path.exists():
+                        st_data = json.loads(storage_path.read_text(encoding="utf-8"))
+                        for c in st_data.get("cookies") or []:
+                            if isinstance(c, dict) and c.get("name") in {
+                                "SAPISID",
+                                "__Secure-1PAPISID",
+                                "__Secure-3PAPISID",
+                            } and c.get("value"):
+                                cookie_fallback[c["name"]] = str(c["value"])
+                except Exception:
+                    cookie_fallback = {}
+
+                for attempt in range(2):
+                    used_force_reload = bool(
+                        attempt > 0 or self._consecutive_risk_failures > 0
+                    )
+                    _, bidi, context_id = await self._get_or_create_shared_browser(
+                        token_proxy_url=token_proxy_url, token_id=token_id
+                    )
+                    active_bidi = bidi
+                    active_context_id = context_id
+                    ready = await self._ensure_flow_page_ready(
+                        context_id,
+                        project_id,
+                        action="CHAT_GENERATION",
+                        force_reload=used_force_reload,
+                    )
+                    if not ready and not used_force_reload:
+                        ready = await self._ensure_flow_page_ready(
+                            context_id,
+                            project_id,
+                            action="CHAT_GENERATION",
+                            force_reload=True,
+                        )
+                    if not ready:
+                        raise RuntimeError(
+                            "Camoufox 页面 grecaptcha.enterprise 未就绪 (CHAT_GENERATION)"
+                        )
+                    async with self._boost_frames():
+                        await self._perform_human_warmup(context_id, project_id)
+                        rec_script = build_recaptcha_execute_script(
+                            FLOW_WEBSITE_KEY, "CHAT_GENERATION", 25000
+                        )
+                        rec_res = await bidi.evaluate(
+                            context_id,
+                            rec_script,
+                            await_promise=True,
+                            user_activation=True,
+                            timeout=35.0,
+                        )
+                        if not isinstance(rec_res, dict) or not rec_res.get("ok"):
+                            err_detail = (
+                                rec_res.get("error")
+                                if isinstance(rec_res, dict)
+                                else str(rec_res)
+                            )
+                            raise RuntimeError(
+                                f"CHAT_GENERATION reCAPTCHA 获取失败: {err_detail}"
+                            )
+                        recaptcha_token = str(rec_res.get("token") or "").strip()
+                        if not recaptcha_token:
+                            raise RuntimeError("CHAT_GENERATION reCAPTCHA 返回空 token")
+                        if used_force_reload:
+                            self._consecutive_risk_failures = 0
+
+                        req_json = request_builder(recaptcha_token)
+                        start_fn = r"""
+                        async (cfg) => {
+                            let wiz = window.WIZ_global_data || {};
+                            const fetchBootstrap = async () => {
+                                const targetPath = `/project/${encodeURIComponent(cfg.projectId)}`;
+                                const pageResp = await fetch(targetPath, { credentials: 'include' });
+                                const html = await pageResp.text();
+                                const mY = html.match(/"YmyN0b"\s*:\s*"((?:\\.|[^"\\])+)"/);
+                                const mK = html.match(/"K21R3e"\s*:\s*"((?:\\.|[^"\\])+)"/);
+                                const mS = html.match(/"y83d5b"\s*:\s*"((?:\\.|[^"\\])+)"/);
+                                const dec = (v) => { try { return JSON.parse('"' + v + '"'); } catch (_) { return v; } };
+                                return {
+                                    YmyN0b: mY ? dec(mY[1]) : '',
+                                    K21R3e: mK ? dec(mK[1]) : '',
+                                    y83d5b: mS ? dec(mS[1]) : '',
+                                };
+                            };
+
+                            let endpointBase = wiz.YmyN0b || '';
+                            let apiKey = wiz.K21R3e || '';
+                            let serverToken = wiz.y83d5b || '';
+                            if (!endpointBase || !apiKey) {
+                                const boot = await fetchBootstrap();
+                                endpointBase = endpointBase || boot.YmyN0b;
+                                apiKey = apiKey || boot.K21R3e;
+                                serverToken = serverToken || boot.y83d5b;
+                            }
+                            endpointBase = (endpointBase || 'https://aisandbox-pa-webchannel.clients6.google.com').replace(/\/+$/, '');
+                            apiKey = apiKey || 'AIzaSyAMHMKiLZOSJmkvoi7q3r9m4rgvP1x10e8';
+                            const channelPath = `${endpointBase}/v1/flowCreationAgent/streamCreationAgentChat/channel`;
+
+                            const readCookie = (name) => {
+                                const m = document.cookie.match(new RegExp('(?:^|;\\s*)' + name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '=([^;]*)'));
+                                return m ? decodeURIComponent(m[1]) : '';
+                            };
+                            const sha1Hex = async (str) => {
+                                const buf = new TextEncoder().encode(str);
+                                const hash = await crypto.subtle.digest('SHA-1', buf);
+                                return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
+                            };
+                            const ts = Math.floor(Date.now() / 1000);
+                            const origin = location.origin || 'https://flow.google.com';
+                            const authParts = [];
+                            for (const [ck, scheme] of [['SAPISID', 'SAPISIDHASH'], ['__Secure-1PAPISID', 'SAPISID1PHASH'], ['__Secure-3PAPISID', 'SAPISID3PHASH']]) {
+                                const val = readCookie(ck) || (cfg.cookieFallback && cfg.cookieFallback[ck]) || '';
+                                if (val) {
+                                    authParts.push(`${scheme} ${ts}_${await sha1Hex(`${ts} ${val} ${origin}`)}`);
+                                }
+                            }
+
+                            const hdrLines = [];
+                            if (authParts.length) hdrLines.push(`Authorization:${authParts.join(' ')}`);
+                            if (apiKey) hdrLines.push(`X-Goog-Api-Key:${apiKey}`);
+                            hdrLines.push('X-Goog-AuthUser:0');
+                            if (serverToken) hdrLines.push(`X-Server-Token:${serverToken}`);
+                            hdrLines.push('X-WebChannel-Content-Type:application/json+protobuf');
+                            const httpHeadersParam = hdrLines.join('\r\n') + '\r\n';
+
+                            const randZx = () => Math.random().toString(36).slice(2, 14);
+                            const baseRid = Math.floor(10000 + Math.random() * 80000);
+
+                            const ac = new AbortController();
+                            if (!window.__flow2apiAgentStreams) {
+                                window.__flow2apiAgentStreams = {};
+                            }
+                            const entry = {
+                                status: 0,
+                                text: '',
+                                offset: 0,
+                                done: false,
+                                aborted: false,
+                                error: '',
+                                sid: '',
+                                gsid: '',
+                                channelPath,
+                                abort: () => {
+                                    if (entry.aborted) return;
+                                    entry.aborted = true;
+                                    entry.done = true;
+                                    try { ac.abort(); } catch (_) {}
+                                    if (entry.sid) {
+                                        try {
+                                            const termParams = new URLSearchParams();
+                                            termParams.set('VER', '8');
+                                            if (entry.gsid) termParams.set('gsessionid', entry.gsid);
+                                            termParams.set('SID', entry.sid);
+                                            termParams.set('TYPE', 'terminate');
+                                            termParams.set('zx', randZx());
+                                            fetch(`${entry.channelPath}?${termParams.toString()}`, {
+                                                method: 'POST',
+                                                credentials: 'include',
+                                                keepalive: true,
+                                            }).catch(() => {});
+                                        } catch (_) {}
+                                    }
+                                },
+                            };
+                            window.__flow2apiAgentStreams[cfg.streamId] = entry;
+
+                            const runWebChannel = async () => {
+                                try {
+                                    const hsUrl = `${channelPath}?VER=8&RID=${baseRid}&CVER=22&X-HTTP-Session-Id=gsessionid&%24httpHeaders=${encodeURIComponent(httpHeadersParam)}&zx=${randZx()}&t=1`;
+                                    const hsResp = await fetch(hsUrl, {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        signal: ac.signal,
+                                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                        body: 'count=0',
+                                    });
+                                    const hsText = await hsResp.text();
+                                    if (!hsResp.ok) {
+                                        entry.status = hsResp.status;
+                                        entry.error = `WebChannel handshake HTTP ${hsResp.status}: ${hsText.slice(0, 300)}`;
+                                        entry.done = true;
+                                        return;
+                                    }
+                                    const gsid = hsResp.headers.get('x-http-session-id') || '';
+                                    const sidMatch = hsText.match(/\["c"\s*,\s*"([^"]+)"/);
+                                    const sid = sidMatch ? sidMatch[1] : '';
+                                    if (!sid) {
+                                        entry.status = hsResp.status;
+                                        entry.error = `WebChannel handshake missing SID: ${hsText.slice(0, 300)}`;
+                                        entry.done = true;
+                                        return;
+                                    }
+                                    entry.sid = sid;
+                                    entry.gsid = gsid;
+
+                                    const rpcParams = new URLSearchParams();
+                                    if (gsid) rpcParams.set('gsessionid', gsid);
+                                    rpcParams.set('VER', '8');
+                                    rpcParams.set('RID', 'rpc');
+                                    rpcParams.set('SID', sid);
+                                    rpcParams.set('AID', '0');
+                                    rpcParams.set('CI', '0');
+                                    rpcParams.set('TYPE', 'xmlhttp');
+                                    rpcParams.set('zx', randZx());
+                                    rpcParams.set('t', '1');
+                                    const rpcUrl = `${channelPath}?${rpcParams.toString()}`;
+
+                                    const rpcPromise = (async () => {
+                                        const rpcResp = await fetch(rpcUrl, {
+                                            method: 'GET',
+                                            credentials: 'include',
+                                            signal: ac.signal,
+                                        });
+                                        entry.status = rpcResp.status;
+                                        if (!rpcResp.ok) {
+                                            const errBody = await rpcResp.text();
+                                            entry.error = `WebChannel GET HTTP ${rpcResp.status}: ${errBody.slice(0, 300)}`;
+                                            entry.done = true;
+                                            return;
+                                        }
+                                        if (!rpcResp.body || !rpcResp.body.getReader) {
+                                            entry.text = await rpcResp.text();
+                                            entry.done = true;
+                                            return;
+                                        }
+                                        const reader = rpcResp.body.getReader();
+                                        const decoder = new TextDecoder('utf-8');
+                                        while (true) {
+                                            const { value, done } = await reader.read();
+                                            if (value) {
+                                                entry.text += decoder.decode(value, { stream: !done });
+                                            }
+                                            if (done) {
+                                                const tail = decoder.decode();
+                                                if (tail) entry.text += tail;
+                                                entry.done = true;
+                                                break;
+                                            }
+                                        }
+                                    })();
+
+                                    const fwdParams = new URLSearchParams();
+                                    fwdParams.set('VER', '8');
+                                    if (gsid) fwdParams.set('gsessionid', gsid);
+                                    fwdParams.set('SID', sid);
+                                    fwdParams.set('RID', String(baseRid + 1));
+                                    fwdParams.set('AID', '0');
+                                    fwdParams.set('zx', randZx());
+                                    fwdParams.set('t', '1');
+                                    const fwdUrl = `${channelPath}?${fwdParams.toString()}`;
+                                    const fwdBody = new URLSearchParams();
+                                    fwdBody.set('count', '1');
+                                    fwdBody.set('ofs', '0');
+                                    fwdBody.set('req0___data__', cfg.reqJson);
+
+                                    const fwdResp = await fetch(fwdUrl, {
+                                        method: 'POST',
+                                        credentials: 'include',
+                                        signal: ac.signal,
+                                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                        body: fwdBody.toString(),
+                                    });
+                                    if (!fwdResp.ok) {
+                                        const fwdErr = await fwdResp.text();
+                                        entry.status = fwdResp.status;
+                                        entry.error = `WebChannel POST HTTP ${fwdResp.status}: ${fwdErr.slice(0, 300)}`;
+                                        entry.done = true;
+                                        return;
+                                    }
+                                    await rpcPromise;
+                                } catch (err) {
+                                    if (entry.aborted) {
+                                        entry.done = true;
+                                        return;
+                                    }
+                                    entry.error = String((err && err.message) || err || 'WebChannel fetch error');
+                                    entry.done = true;
+                                }
+                            };
+
+                            runWebChannel();
+                            return { ok: true };
+                        }
+                        """
+                        init_res = await bidi.call_function(
+                            context_id,
+                            start_fn,
+                            arguments=[
+                                _to_bidi_local_value(
+                                    {
+                                        "streamId": stream_id,
+                                        "projectId": project_id,
+                                        "reqJson": req_json,
+                                        "cookieFallback": cookie_fallback,
+                                    }
+                                )
+                            ],
+                            await_promise=True,
+                            user_activation=True,
+                            timeout=30.0,
+                        )
+                        if not isinstance(init_res, dict) or not init_res.get("ok"):
+                            err_msg = (
+                                init_res.get("error")
+                                if isinstance(init_res, dict)
+                                else str(init_res)
+                            )
+                            raise RuntimeError(f"Camoufox WebChannel 启动失败: {err_msg}")
+
+                        deadline = time.monotonic() + max(30.0, float(timeout or 180))
+                        buffer_all = ""
+                        sent_nonempty_delta = False
+                        should_retry_risk = False
+                        while time.monotonic() < deadline:
+                            poll = await bidi.call_function(
+                                context_id,
+                                """(sid) => {
+                                    const store = window.__flow2apiAgentStreams || {};
+                                    const entry = store[sid];
+                                    if (!entry) return { missing: true, done: true };
+                                    const delta = entry.text.slice(entry.offset);
+                                    entry.offset = entry.text.length;
+                                    return {
+                                        status: entry.status,
+                                        delta,
+                                        done: Boolean(entry.done),
+                                        error: entry.error || '',
+                                    };
+                                }""",
+                                arguments=[_to_bidi_local_value(stream_id)],
+                                await_promise=False,
+                                timeout=15.0,
+                            )
+                            if not isinstance(poll, dict) or poll.get("missing"):
+                                raise RuntimeError("Camoufox Agent WebChannel 状态丢失")
+                            delta = str(poll.get("delta") or "")
+                            done = bool(poll.get("done"))
+                            err = str(poll.get("error") or "")
+                            status = int(poll.get("status") or 0)
+                            if delta:
+                                buffer_all += delta
+                                if (
+                                    attempt == 0
+                                    and not sent_nonempty_delta
+                                    and (
+                                        "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in buffer_all
+                                        or "reCAPTCHA evaluation failed" in buffer_all
+                                    )
+                                ):
+                                    should_retry_risk = True
+                                    self.note_recaptcha_rejected()
+                                    break
+                                # Defer emitting pure noop heartbeat frames until payload/error/done arrives
+                                has_non_noop = bool(
+                                    re.sub(r'\d+\s*\[\[\s*\d+\s*,\s*\[\s*"noop"\s*\]\s*\]\]', "", buffer_all).strip()
+                                )
+                                if has_non_noop or done:
+                                    emit_chunk = buffer_all if not sent_nonempty_delta else delta
+                                    sent_nonempty_delta = True
+                                    yield {
+                                        "transport": "webchannel",
+                                        "status": status,
+                                        "delta": emit_chunk,
+                                        "done": done,
+                                        "error": err,
+                                    }
+                            elif done:
+                                if (
+                                    attempt == 0
+                                    and not sent_nonempty_delta
+                                    and (
+                                        "PUBLIC_ERROR_UNUSUAL_ACTIVITY" in buffer_all
+                                        or "reCAPTCHA evaluation failed" in buffer_all
+                                    )
+                                ):
+                                    should_retry_risk = True
+                                    self.note_recaptcha_rejected()
+                                    break
+                                emit_chunk = (
+                                    buffer_all
+                                    if (buffer_all and not sent_nonempty_delta)
+                                    else ""
+                                )
+                                yield {
+                                    "transport": "webchannel",
+                                    "status": status,
+                                    "delta": emit_chunk,
+                                    "done": True,
+                                    "error": err,
+                                }
+                            if err:
+                                raise RuntimeError(f"Camoufox Agent WebChannel 异常: {err}")
+                            if done:
+                                debug_logger.log_info(
+                                    f"[Camoufox Agent] WebChannel done status={status} len={len(buffer_all)} preview={buffer_all[:350]!r}"
+                                )
+                                return
+                            await asyncio.sleep(0.15)
+                        if should_retry_risk:
+                            try:
+                                await bidi.call_function(
+                                    context_id,
+                                    """(sid) => {
+                                        const store = window.__flow2apiAgentStreams;
+                                        if (!store) return;
+                                        const entry = store[sid];
+                                        if (entry && typeof entry.abort === 'function') entry.abort();
+                                        delete store[sid];
+                                    }""",
+                                    arguments=[_to_bidi_local_value(stream_id)],
+                                    await_promise=False,
+                                    timeout=5.0,
+                                )
+                            except Exception:
+                                pass
+                            await asyncio.sleep(1.2)
+                            continue
+                        raise RuntimeError(
+                            f"Camoufox Agent WebChannel 超时 ({int(timeout or 180)}s)"
+                        )
+            finally:
+                if active_bidi is not None and active_context_id:
+                    try:
+                        await active_bidi.call_function(
+                            active_context_id,
+                            """(sid) => {
+                                const store = window.__flow2apiAgentStreams;
+                                if (!store) return;
+                                const entry = store[sid];
+                                if (entry && typeof entry.abort === 'function') entry.abort();
+                                delete store[sid];
+                            }""",
+                            arguments=[_to_bidi_local_value(stream_id)],
+                            await_promise=False,
+                            timeout=5.0,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    await self._sync_live_cookies_to_db(token_id, update_db=True)
+                except Exception:
+                    pass
                 self._solve_inflight = max(0, self._solve_inflight - 1)
                 self.note_idle()
 
@@ -4105,6 +4675,166 @@ def _clear_stale_firefox_profile_locks(profile_dir: Path) -> None:
             pass
 
 
+_RESERVED_PROFILE_NAMES = {"shared", "pending"}
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+(?:/[A-Za-z0-9._@-]+)*$")
+_ACTIVE_PROFILE_LOGIN_LEASES: Dict[Path, str] = {}
+_ACTIVE_TOKEN_LOGIN_LEASES: Dict[int, str] = {}
+_PROFILE_LOGIN_LEASE_LOCK = threading.Lock()
+
+
+def normalize_browser_profile_dir(profile_dir: Optional[str]) -> str:
+    """Normalize a per-account browser profile directory key relative to `browser_data_rt/`."""
+    raw = str(profile_dir or "").strip().replace("\\", "/")
+    raw = raw.strip("/")
+    if not raw:
+        return ""
+    if raw.startswith("browser_data_rt/"):
+        raw = raw[len("browser_data_rt/") :].strip("/")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise ValueError("浏览器资料目录路径不合法")
+    cleaned = "/".join(parts)
+    if not _PROFILE_NAME_RE.fullmatch(cleaned):
+        raise ValueError("浏览器资料目录仅支持字母、数字及 . _ @ - / 字符")
+    first_seg = parts[0].lower()
+    if first_seg in _RESERVED_PROFILE_NAMES or re.match(r"^browser_\d+$", first_seg):
+        raise ValueError(f"浏览器资料目录不能使用保留名称: {parts[0]}")
+    if re.fullmatch(r"token_\d+", cleaned) or cleaned.startswith("profiles/"):
+        return cleaned
+    return f"profiles/{cleaned}"
+
+
+def resolve_account_profile_dir(
+    user_data_root: Path,
+    *,
+    token_id: Optional[int] = None,
+    profile_dir_name: Optional[str] = None,
+) -> Tuple[Path, str]:
+    """Resolve `(absolute_account_dir, canonical_profile_key)` under `user_data_root`."""
+    normalized = normalize_browser_profile_dir(profile_dir_name)
+    if normalized:
+        return user_data_root / normalized, normalized
+    if token_id is not None and int(token_id) > 0:
+        canonical = f"token_{int(token_id)}"
+        return user_data_root / canonical, canonical
+    return user_data_root / "pending", ""
+
+
+def _profile_dir_summary(profile_root: Path, canonical: str) -> Dict[str, Any]:
+    ff_dir = profile_root / "firefox-profile"
+    cookies_db = ff_dir / "cookies.sqlite"
+    fp_file = profile_root / "camoufox-fingerprint.json"
+    ss_file = profile_root / "storage-state.json"
+    mtime = 0.0
+    for candidate in (cookies_db, ss_file, fp_file, ff_dir, profile_root):
+        try:
+            if candidate.exists():
+                mtime = max(mtime, candidate.stat().st_mtime)
+        except Exception:
+            pass
+    return {
+        "profile_dir": canonical,
+        "has_firefox_profile": ff_dir.is_dir(),
+        "has_cookies_db": cookies_db.is_file(),
+        "has_fingerprint": fp_file.is_file(),
+        "has_storage_state": ss_file.is_file(),
+        "active_login": bool(get_profile_login_holder(profile_root)),
+        "updated_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        if mtime > 0
+        else None,
+    }
+
+
+def list_browser_profile_dirs(user_data_root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """List persistent account browser directories under `browser_data_rt/`."""
+    root = user_data_root or (
+        Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
+    )
+    if not root.is_dir():
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        for child in sorted(root.iterdir(), key=lambda p: p.name):
+            if not child.is_dir():
+                continue
+            if re.fullmatch(r"token_\d+", child.name):
+                entries.append(_profile_dir_summary(child, child.name))
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            for child in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
+                if child.is_dir():
+                    entries.append(_profile_dir_summary(child, f"profiles/{child.name}"))
+    except Exception:
+        pass
+    return entries
+
+
+def _canonical_lease_path(account_dir: Path) -> Path:
+    try:
+        return account_dir.resolve()
+    except Exception:
+        return account_dir
+
+
+def get_profile_login_holder(account_dir: Path) -> Optional[str]:
+    key = _canonical_lease_path(account_dir)
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        return _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
+
+
+def is_token_in_login_session(token_id: Optional[int]) -> bool:
+    if token_id is None:
+        return False
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        return int(token_id) in _ACTIVE_TOKEN_LOGIN_LEASES
+
+
+def acquire_profile_login_lease(
+    account_dir: Path, session_id: str, *, token_id: Optional[int] = None
+) -> None:
+    key = _canonical_lease_path(account_dir)
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        existing = _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
+        if existing and existing != session_id:
+            raise RuntimeError(f"浏览器资料目录 {account_dir.name} 已被登录会话 {existing} 占用")
+        _ACTIVE_PROFILE_LOGIN_LEASES[key] = session_id
+        if token_id is not None and int(token_id) > 0:
+            _ACTIVE_TOKEN_LOGIN_LEASES[int(token_id)] = session_id
+
+
+def release_profile_login_lease(
+    account_dir: Optional[Path], session_id: str, *, token_id: Optional[int] = None
+) -> None:
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        if account_dir is not None:
+            key = _canonical_lease_path(account_dir)
+            if _ACTIVE_PROFILE_LOGIN_LEASES.get(key) == session_id:
+                _ACTIVE_PROFILE_LOGIN_LEASES.pop(key, None)
+        if token_id is not None and int(token_id) > 0:
+            if _ACTIVE_TOKEN_LOGIN_LEASES.get(int(token_id)) == session_id:
+                _ACTIVE_TOKEN_LOGIN_LEASES.pop(int(token_id), None)
+
+
+def clear_site_cookies_in_profile(account_dir: Path) -> None:
+    """Clear site cookies while keeping hardware fingerprint, HTTP cache, and Firefox profile settings."""
+    ff_dir = account_dir / "firefox-profile"
+    for fname in ("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm"):
+        try:
+            p = ff_dir / fname
+            if p.exists():
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        ss_path = account_dir / "storage-state.json"
+        if ss_path.is_file():
+            ss_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def persist_account_login_artifacts(source_dir: Path, target_dir: Path) -> None:
     """Copy fingerprint, storage-state, startup cache, HTTP disk cache, and full Firefox profile from isolated login dir to account dir."""
     if not source_dir.exists() or source_dir.resolve() == target_dir.resolve():
@@ -4129,7 +4859,6 @@ def persist_account_login_artifacts(source_dir: Path, target_dir: Path) -> None:
             if dir_name == "firefox-profile":
                 _clear_stale_firefox_profile_locks(dst_dir)
 def has_display() -> bool:
-    """Check whether the host machine can display a native GUI browser window."""
     if sys.platform in ("darwin", "win32"):
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
@@ -4650,6 +5379,8 @@ class CamoufoxLoginSession:
         mode: str = "auto",
         proxy_url: Optional[str] = None,
         token_id: Optional[int] = None,
+        browser_profile_dir: Optional[str] = None,
+        clean_login: bool = False,
         auto_save_token: bool = True,
         remark: Optional[str] = None,
         project_id: Optional[str] = None,
@@ -4661,6 +5392,8 @@ class CamoufoxLoginSession:
         self.mode = mode  # "window" | "liveview" | "auto"
         self.proxy_url = (proxy_url or "").strip() or None
         self.token_id = token_id
+        self.browser_profile_dir = normalize_browser_profile_dir(browser_profile_dir)
+        self.clean_login = bool(clean_login)
         self.auto_save_token = auto_save_token
         self.remark = remark
         self.project_id = project_id
@@ -4682,6 +5415,10 @@ class CamoufoxLoginSession:
         self._bidi: Optional[BiDiClient] = None
         self._relay: Optional[LocalSocks5Relay] = None
         self._temp_account_dir: Optional[Path] = None
+        self._is_ephemeral_staging: bool = False
+        self._is_explicit_profile_dir: bool = bool(self.browser_profile_dir)
+        self._reused_existing_profile: bool = False
+        self._lease_account_dir: Optional[Path] = None
         self._profile_dir: Optional[Path] = None
         self._task: Optional[asyncio.Task] = None
         self._cancel_event = asyncio.Event()
@@ -4694,6 +5431,7 @@ class CamoufoxLoginSession:
         if status in ("completed", "failed", "cancelled") and self.finished_at is None:
             self.finished_at = time.time()
         self.live_view.set_status(status, message)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "session_id": self.session_id,
@@ -4704,6 +5442,9 @@ class CamoufoxLoginSession:
             "headless": self.headless,
             "has_display": has_display(),
             "token_id": self.token_id,
+            "browser_profile_dir": self.browser_profile_dir,
+            "reused_existing_profile": self._reused_existing_profile,
+            "clean_login": self.clean_login,
             "auto_save_token": self.auto_save_token,
             "result": self.result,
             "frame_seq": self.live_view.frame_seq,
@@ -4711,7 +5452,6 @@ class CamoufoxLoginSession:
             "page_title": (self.live_view.frame_meta or {}).get("title") or "",
             "dialog": self.live_view.dialog,
         }
-
     async def start(
         self,
         on_complete: Optional[Callable[["CamoufoxLoginSession", Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
@@ -4748,35 +5488,44 @@ class CamoufoxLoginSession:
                 # auto: use local visible window if display available, else headless liveview
                 self.headless = not has_display()
 
-            self._temp_account_dir = Path(
-                tempfile.mkdtemp(prefix="flow2api-camoufox-login-account-")
-            )
-            # If relogging an existing token, release any active worker holding its profile and reuse its persistent artifacts
-            if self.token_id:
-                try:
-                    from .browser_captcha import BrowserCaptchaService
-                    svc = BrowserCaptchaService._instance
-                    if svc is not None:
+            # Resolve fixed per-account startup directory directly (no ephemeral blank profile on relogin!)
+            if self.token_id or self.browser_profile_dir:
+                account_dir, canonical_profile_dir = resolve_account_profile_dir(
+                    self.user_data_root,
+                    token_id=self.token_id,
+                    profile_dir_name=self.browser_profile_dir,
+                )
+                self.browser_profile_dir = canonical_profile_dir
+                self._is_ephemeral_staging = False
+            else:
+                account_dir = self.user_data_root / "pending" / f"login_{self.session_id}"
+                self._is_ephemeral_staging = True
+
+            # Release any active runtime worker holding this token or profile directory before launching
+            try:
+                from .browser_captcha import BrowserCaptchaService
+                svc = BrowserCaptchaService._instance
+                if svc is not None:
+                    if self.token_id:
                         await svc.release_token_browsers(
                             int(self.token_id), reason="camoufox_relogin_start"
                         )
-                except Exception:
-                    pass
-                existing_dir = self.user_data_root / f"token_{self.token_id}"
-                if existing_dir.exists():
-                    # Copy only the account's hardware fingerprint & startupCache so login starts with a clean cookie state (AIStudio2API login.go)
-                    fp_file = existing_dir / "camoufox-fingerprint.json"
-                    if fp_file.is_file():
-                        shutil.copy2(fp_file, self._temp_account_dir / "camoufox-fingerprint.json")
-                    startup_dir = existing_dir / PROFILE_STARTUP_DIR_NAME
-                    if startup_dir.is_dir():
-                        shutil.copytree(
-                            startup_dir,
-                            self._temp_account_dir / PROFILE_STARTUP_DIR_NAME,
-                            dirs_exist_ok=True,
+                    if hasattr(svc, "release_profile_browsers"):
+                        await svc.release_profile_browsers(
+                            account_dir, reason="camoufox_relogin_start"
                         )
+            except Exception:
+                pass
+
+            acquire_profile_login_lease(
+                account_dir, self.session_id, token_id=self.token_id
+            )
+            self._lease_account_dir = account_dir
+            self._temp_account_dir = account_dir
+            account_dir.mkdir(parents=True, exist_ok=True)
+
             fp_config = load_or_create_account_camoufox_config(
-                self._temp_account_dir,
+                account_dir,
                 CAMOUFOX_FIREFOX_MAJOR,
                 "en-US",
                 "America/New_York",
@@ -4791,15 +5540,20 @@ class CamoufoxLoginSession:
                     self._relay = LocalSocks5Relay(self.proxy_url)
                     relay_addr = await self._relay.start()
 
-            self._profile_dir = self._temp_account_dir / "firefox-profile"
+            self._profile_dir = account_dir / "firefox-profile"
+            self._reused_existing_profile = (
+                self._profile_dir / "cookies.sqlite"
+            ).is_file() or (self._profile_dir / "prefs.js").is_file()
             self._profile_dir.mkdir(parents=True, exist_ok=True)
             _clear_stale_firefox_profile_locks(self._profile_dir)
-            await asyncio.to_thread(
-                restore_startup_cache, self._temp_account_dir, self._profile_dir
-            )
-            cache_dir = self._temp_account_dir / "camoufox-cache"
-
-            # Pass actual self.headless + live_view=True so macOS window mode disables separate GPU process
+            if self.clean_login:
+                clear_site_cookies_in_profile(account_dir)
+                self._reused_existing_profile = False
+            if not (self._profile_dir / "startupCache").exists():
+                await asyncio.to_thread(
+                    restore_startup_cache, account_dir, self._profile_dir
+                )
+            cache_dir = account_dir / "camoufox-cache"
             write_camoufox_user_js(
                 self._profile_dir,
                 fp_config,
@@ -4858,17 +5612,25 @@ class CamoufoxLoginSession:
             # Always attach LiveView so the Web UI can preview and interact even in window mode
             await self.live_view.attach(self._bidi, root_ctx)
 
+            profile_note = (
+                f"（已绑定并复用资料目录 {self.browser_profile_dir}）"
+                if self._reused_existing_profile and self.browser_profile_dir
+                else (
+                    f"（已绑定资料目录 {self.browser_profile_dir}）"
+                    if self.browser_profile_dir
+                    else ""
+                )
+            )
             if self.headless:
                 self.set_state(
                     "waiting",
-                    "请在下方远程浏览器画面中登录 Google 账号并进入 Flow 页面，登录成功后将自动拉取 Cookie 与缓存...",
+                    f"请在下方远程浏览器画面中登录 Google 账号并进入 Flow 页面{profile_note}，登录成功后将自动拉取 Cookie 与缓存...",
                 )
             else:
                 self.set_state(
                     "waiting",
-                    "已弹出 Camoufox 浏览器窗口（也可在下方画面直接操作），请完成 Google 登录进入 Flow，成功后将自动抓取 Cookie 与缓存...",
+                    f"已弹出 Camoufox 浏览器窗口{profile_note}（也可在下方画面直接操作），请完成 Google 登录进入 Flow，成功后将自动抓取 Cookie 与缓存...",
                 )
-
             try:
                 await self._bidi.command(
                     "browsingContext.navigate",
@@ -4897,20 +5659,14 @@ class CamoufoxLoginSession:
             # Close browser cleanly first so Firefox writes startupCache & cookies.sqlite to profile_dir
             await self._cleanup(save_cache=True)
 
-            # Persist to browser_data_rt/token_<id> BEFORE on_complete if token_id is already known
-            if self.token_id and self._temp_account_dir and self._temp_account_dir.exists():
-                early_target_dir = self.user_data_root / f"token_{self.token_id}"
-                await asyncio.to_thread(
-                    persist_account_login_artifacts,
-                    self._temp_account_dir,
-                    early_target_dir,
-                )
             if on_complete is not None:
                 saved_info = await on_complete(self, exported)
                 exported.update(saved_info or {})
 
-            # If a token_id was assigned/updated by on_complete, ensure login artifacts are persisted to browser_data_rt/token_<id>
             final_token_id = exported.get("token_id") or self.token_id
+            target_profile_hint = (
+                exported.get("browser_profile_dir") or self.browser_profile_dir
+            )
             if final_token_id and self._temp_account_dir and self._temp_account_dir.exists():
                 try:
                     from .browser_captcha import BrowserCaptchaService
@@ -4921,13 +5677,32 @@ class CamoufoxLoginSession:
                         )
                 except Exception:
                     pass
-                target_dir = self.user_data_root / f"token_{final_token_id}"
-                await asyncio.to_thread(
-                    persist_account_login_artifacts,
-                    self._temp_account_dir,
-                    target_dir,
+                target_dir, final_canonical = resolve_account_profile_dir(
+                    self.user_data_root,
+                    token_id=int(final_token_id),
+                    profile_dir_name=target_profile_hint,
                 )
+                if self._temp_account_dir.resolve() != target_dir.resolve():
+                    if self._is_ephemeral_staging and not target_dir.exists():
+                        target_dir.parent.mkdir(parents=True, exist_ok=True)
+                        await asyncio.to_thread(
+                            shutil.move, str(self._temp_account_dir), str(target_dir)
+                        )
+                        _clear_stale_firefox_profile_locks(target_dir / "firefox-profile")
+                        self._temp_account_dir = target_dir
+                        self._is_ephemeral_staging = False
+                    else:
+                        await asyncio.to_thread(
+                            persist_account_login_artifacts,
+                            self._temp_account_dir,
+                            target_dir,
+                        )
+                self.browser_profile_dir = final_canonical
+                exported["browser_profile_dir"] = final_canonical
                 exported["cache_persisted_dir"] = str(target_dir)
+            elif not self._is_ephemeral_staging and self._temp_account_dir:
+                exported["browser_profile_dir"] = self.browser_profile_dir
+                exported["cache_persisted_dir"] = str(self._temp_account_dir)
             self.result = exported
             self.set_state(
                 "completed",
@@ -4941,9 +5716,17 @@ class CamoufoxLoginSession:
             self.set_state("failed", f"浏览器登录失败: {exc}", error=str(exc))
         finally:
             await self._cleanup(save_cache=save_cache)
-            if self._temp_account_dir and self._temp_account_dir.exists():
+            release_profile_login_lease(
+                self._lease_account_dir, self.session_id, token_id=self.token_id
+            )
+            self._lease_account_dir = None
+            if (
+                self._is_ephemeral_staging
+                and self._temp_account_dir
+                and self._temp_account_dir.exists()
+                and self._temp_account_dir.parent.name == "pending"
+            ):
                 shutil.rmtree(self._temp_account_dir, ignore_errors=True)
-
     async def _wait_for_login(self) -> Dict[str, Any]:
         deadline = time.monotonic() + self.timeout_seconds
         origins: Dict[str, Any] = {}
@@ -5263,9 +6046,10 @@ class CamoufoxLoginSession:
                     save_startup_cache, profile_dir, temp_account_dir
                 )
                 _clear_stale_firefox_profile_locks(profile_dir)
-            else:
+            elif self._is_ephemeral_staging:
                 shutil.rmtree(profile_dir, ignore_errors=True)
-
+            else:
+                _clear_stale_firefox_profile_locks(profile_dir)
 class CamoufoxLoginManager:
     """Manages active Camoufox interactive login sessions for the Admin UI."""
 
@@ -5314,6 +6098,8 @@ class CamoufoxLoginManager:
         mode: str = "auto",
         proxy_url: Optional[str] = None,
         token_id: Optional[int] = None,
+        browser_profile_dir: Optional[str] = None,
+        clean_login: bool = False,
         auto_save_token: bool = True,
         remark: Optional[str] = None,
         project_id: Optional[str] = None,
@@ -5333,6 +6119,8 @@ class CamoufoxLoginManager:
                 mode=mode,
                 proxy_url=proxy_url,
                 token_id=token_id,
+                browser_profile_dir=browser_profile_dir,
+                clean_login=clean_login,
                 auto_save_token=auto_save_token,
                 remark=remark,
                 project_id=project_id,
@@ -5342,7 +6130,6 @@ class CamoufoxLoginManager:
             self._sessions[session_id] = session
             await session.start(on_complete=on_complete)
             return session
-
     async def cancel_session(self, session_id: str) -> bool:
         sess = self._sessions.get(session_id)
         if not sess:

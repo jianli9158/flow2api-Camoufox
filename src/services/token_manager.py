@@ -346,6 +346,7 @@ class TokenManager:
         video_concurrency: int = -1,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_profile_dir: Optional[str] = None,
         protocol_mode: str = "session",
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -482,6 +483,11 @@ class TokenManager:
             st = "frontend-" + hashlib.sha256(
                 google_cookies.encode("utf-8")
             ).hexdigest()[:32]
+        normalized_profile_dir = ""
+        if browser_profile_dir is not None and str(browser_profile_dir).strip():
+            from .camoufox_bidi import normalize_browser_profile_dir
+
+            normalized_profile_dir = normalize_browser_profile_dir(browser_profile_dir)
         token = Token(
             st=st,
             at=at,
@@ -500,6 +506,7 @@ class TokenManager:
             video_concurrency=video_concurrency,
             captcha_proxy_url=captcha_proxy_url,
             extension_route_key=extension_route_key,
+            browser_profile_dir=normalized_profile_dir,
             protocol_mode=self._normalize_protocol_mode(protocol_mode),
             google_cookies=(google_cookies or "").strip(),
             login_account=(login_account or "").strip(),
@@ -556,6 +563,7 @@ class TokenManager:
         video_concurrency: Optional[int] = None,
         captcha_proxy_url: Optional[str] = None,
         extension_route_key: Optional[str] = None,
+        browser_profile_dir: Optional[str] = None,
         protocol_mode: Optional[str] = None,
         google_cookies: Optional[str] = None,
         login_account: Optional[str] = None,
@@ -602,6 +610,11 @@ class TokenManager:
             update_fields["captcha_proxy_url"] = captcha_proxy_url
         if extension_route_key is not None:
             update_fields["extension_route_key"] = extension_route_key
+        if browser_profile_dir is not None:
+            from .camoufox_bidi import normalize_browser_profile_dir
+
+            normalized_profile_dir = normalize_browser_profile_dir(browser_profile_dir)
+            update_fields["browser_profile_dir"] = normalized_profile_dir or f"token_{token_id}"
         if protocol_mode is not None:
             update_fields["protocol_mode"] = self._normalize_protocol_mode(
                 protocol_mode

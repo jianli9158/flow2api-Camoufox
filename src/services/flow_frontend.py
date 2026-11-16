@@ -350,16 +350,24 @@ class FlowFrontendMixin:
         normalized = str(resolution or "").strip().upper()
         if not normalized:
             return None
-        if "4K" in normalized:
-            return 4
-        if "1080" in normalized:
-            return 3
-        if "720" in normalized:
-            return 2
         if "360" in normalized:
+            return 4
+        if "4K" in normalized:
+            return 3
+        if "1080" in normalized:
+            return 2
+        if "720" in normalized:
             return 1
         return None
 
+    @classmethod
+    def _frontend_video_resolution_message(
+        cls, resolution: Optional[str]
+    ) -> Optional[List[int]]:
+        resolution_value = cls._frontend_video_resolution(resolution)
+        if resolution_value and resolution_value != 1:
+            return [resolution_value]
+        return None
     @classmethod
     def _find_flow_content_url(cls, value: Any, media_kind: str) -> str:
         if isinstance(value, str):
@@ -444,6 +452,7 @@ class FlowFrontendMixin:
         aspect_value = self._map_frontend_video_aspect_ratio(aspect_ratio)
         metadata = self._frontend_generation_metadata(session_id)
         resolution_value = self._frontend_video_resolution(resolution)
+        resolution_message = self._frontend_video_resolution_message(resolution)
         normalized_mode = str(mode or "text").strip().lower()
 
         if normalized_mode == "references":
@@ -465,7 +474,7 @@ class FlowFrontendMixin:
                 output_spec,
                 None,
                 None,
-                resolution_value,
+                resolution_message,
             ]
         elif normalized_mode == "start_end":
             rpc_id = "nprQif"
@@ -492,7 +501,7 @@ class FlowFrontendMixin:
                 None,
                 None,
                 output_spec,
-                resolution_value,
+                resolution_message,
             ]
         elif normalized_mode == "extend":
             rpc_id = "fZytfe"
@@ -506,6 +515,8 @@ class FlowFrontendMixin:
                 None,
                 output_spec,
             ]
+            if resolution_message is not None:
+                request.extend([None, None, None, None, resolution_message])
         elif normalized_mode == "upsample":
             rpc_id = "p0UkFb"
             request = [
@@ -531,7 +542,7 @@ class FlowFrontendMixin:
                 metadata,
                 None,
                 output_spec,
-                resolution_value,
+                resolution_message,
             ]
         return rpc_id, [
             [request],

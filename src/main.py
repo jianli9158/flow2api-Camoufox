@@ -22,7 +22,8 @@ from .services.token_manager import TokenManager
 from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
-from .api import routes, admin
+from .services.flow_features import FlowFeatureService
+from .api import routes, admin, flow_routes
 
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
@@ -208,11 +209,19 @@ generation_handler = GenerationHandler(
     concurrency_manager,
     proxy_manager,  # 添加 proxy_manager 参数
 )
+flow_feature_service = FlowFeatureService(
+    flow_client,
+    token_manager,
+    load_balancer,
+    db,
+    generation_handler.file_cache,
+    proxy_manager,
+)
 
 # Set dependencies
 routes.set_generation_handler(generation_handler)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
-
+flow_routes.set_flow_feature_service(flow_feature_service)
 # Create FastAPI app
 app = FastAPI(
     title="Flow2API",
@@ -234,6 +243,7 @@ app.add_middleware(I18nMiddleware)
 # Include routers
 app.include_router(routes.router)
 app.include_router(admin.router)
+app.include_router(flow_routes.router)
 
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
@@ -265,6 +275,14 @@ async def i18n_script():
         media_type="application/javascript",
         headers=_STATIC_PAGE_NO_CACHE_HEADERS,
     )
+@app.get("/static/console.css", include_in_schema=False)
+async def console_stylesheet():
+    return FileResponse(
+        str(static_path / "console.css"),
+        media_type="text/css; charset=utf-8",
+        headers=_STATIC_PAGE_NO_CACHE_HEADERS,
+    )
+
 
 
 @app.get("/", response_class=HTMLResponse)

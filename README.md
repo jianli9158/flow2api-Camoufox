@@ -1,239 +1,242 @@
-# flow2api-Camoufox
+# Flow2API
 
-<div align="center">
+**基于 Camoufox + WebDriver BiDi 原生浏览器管线的 Google Flow OpenAI / Gemini / Flow 原生兼容网关**
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![FastAPI](https://img.shields.io/badge/fastapi-0.119.0-green.svg)](https://fastapi.tiangolo.com/)
-[![Camoufox](https://img.shields.io/badge/Camoufox-WebDriver_BiDi-0F172A.svg)](https://github.com/daijro/camoufox)
-
-**基于 Camoufox + WebDriver BiDi 原生浏览器管线的 Google Flow OpenAI / Gemini 兼容 API 服务**
-
-</div>
+Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDriver BiDi 协议直接驱动 `flow.google.com` 页面内原生交互与同源 RPC，将 Google Flow 的图像生成、视频生成（文生 / 图生 / 多图 / 续写 / 高清放大）、TTS 语音合成、持久化角色库、以及多轮 Creation Agent 统一封装为标准 OpenAI、Gemini 与 `/v1/flow/*` REST/SSE 接口。
 
 ---
 
-## ✨ 核心特性
+## 核心能力
 
-- 🦊 **Camoufox + WebDriver BiDi 原生引擎**：移植自 `AIStudio2API` 的反检测浏览器架构，内置 C++ 级 Windows 10/11 硬件指纹、WebGL 显卡特征、字体子集与音频上下文锁定，结合页面内同源 `batchexecute` RPC（`ogiZ0b` / `YhhmEf` / `fZytfe` / `p0UkFb`）与真实 `reCAPTCHA Enterprise` 打码，避免打码端与请求端 TLS/Cookie/Session 割裂。
-- 🛡️ **多账号风控冷却、自动故障转移与防重复提交**：`LoadBalancer` 与 `GenerationHandler` 支持在提交前遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` / `too much traffic` / `429` 时自动冷却当前账号（默认 180 秒）并无感切换下一个可用账号；检测到登录态失效时立即冒泡并自动禁用对应 Token；对生成类 RPC 超时严格标记 `submission_uncertain` 防止重复扣费。
-- 🖥️ **WebSocket LiveView 远程登录向导**：管理后台内置无头浏览器实时画面流（Canvas 帧流 + 键鼠转发），无需桌面环境或 Xvfb，直接在网页内完成 Google 账号登录并自动导出完整 Cookie 与持久化 Profile。
-- 🔄 **全自动无感 Cookie 续期**：服务启动时自动唤醒常驻 Camoufox 槽位，后台定时通过账号绑定的真实浏览器实例续期 `__Secure-1PSIDTS` / `SIDCC` / `OSID` 并同步写回 SQLite 与 `storage-state.json`。
-- 🪶 **极致精简与高性能工程化**：彻底移除旧版 `nodriver` / `playwright` 有头打码、Chrome 扩展目录（`extension/`）及 10 家第三方付费打码通道；内置持久化 SQLite 连接池、HTTP/TLS 连接复用与非阻塞异步媒体缓存。
-- 🧩 **双协议兼容**：同时支持 OpenAI `/v1/chat/completions`（流式/非流式）与 Gemini 官方 `/v1beta/models/{model}:generateContent` / `:streamGenerateContent`（及 `/models/...`）接口。
-- 📊 **全新管理控制台**：重构登录页、管理后台（`/manage`）与在线测试台（`/test`），支持多 Token 轮询、并发控制、实时积分查询、代理池配置及中英文无缝切换。
+- **Camoufox + WebDriver BiDi 单会话执行管线**：移植自 `AIStudio2API` 的浏览器运行时（`src/services/camoufox_bidi.py`），为每个账号槽位锁定持久化 Windows 10/11 指纹（`camoufox-fingerprint.json`）、WebGL/字体子集与独立 Firefox Profile（`browser_data_rt/token_<id>/`）。打码、表单交互、`StreamChat` 生成与同源 `batchexecute` RPC 全部在同一浏览器上下文完成，消除独立打码端与发包端 TLS/Cookie 割裂导致的 `PUBLIC_ERROR_UNUSUAL_ACTIVITY`。
+- **三协议 API 兼容**：
+  - **OpenAI 兼容**：`GET /v1/models`、`GET /v1/models/aliases`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式）。
+  - **Gemini 兼容**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`（及 `/models/...` 路径），支持 `generationConfig.imageConfig` 动态分辨率与比例解析。
+  - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
+- **多账号调度、风控冷却与自动续期**：
+  - `LoadBalancer` 支持随机负载优先与顺序轮询（`call_mode = "default" | "polling"`），按账号等级（Free / Pro / Ult）与图像/视频并发配额自动路由。
+  - 遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` / `403` / `429` 时自动冷却槽位并切换下一可用账号；生成类 RPC 超时严格保护以防重复扣费；后台定时任务通过真实 Camoufox 实例续期 Google/Flow Cookies（`__Secure-1PSIDTS`、`SIDCC`、`OSID`）并原子写回 SQLite 与 `storage-state.json`。
+- **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
+- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 语音与角色交互测试。
 
 ---
 
-## 🏗️ 架构概览
+## 系统架构
 
 ```mermaid
 flowchart LR
-    Client["OpenAI / Gemini 客户端"] --> API["FastAPI 路由层<br/>/v1/chat/completions<br/>/v1beta/models/*"]
-    API --> LB["LoadBalancer & TokenManager<br/>并发控制 / 风控冷却 / 故障转移 / 自动续期"]
-    LB --> BCS["BrowserCaptchaService<br/>账号亲和槽位池"]
-    BCS --> Worker["CamoufoxWorker<br/>WebDriver BiDi 持久会话"]
-    Worker --> Profile["browser_data_rt/token_{id}<br/>固定 Windows 指纹 + Firefox Profile"]
-    Worker --> Flow["flow.google.com<br/>页面内 reCAPTCHA + 同源 batchexecute"]
+    Client["客户端<br/>OpenAI / Gemini / Flow REST"] --> API["FastAPI 网关<br/>/v1/chat/completions · /v1beta/models/* · /v1/flow/*"]
+    API --> Core["TokenManager & LoadBalancer<br/>并发配额 / 等级鉴权 / 风控冷却 / 定时续期"]
+    Core --> Pool["BrowserCaptchaService<br/>账号亲和槽位池与恢复状态机"]
+    Pool --> Worker["CamoufoxWorker<br/>WebDriver BiDi · 局部 SOCKS5 认证中继"]
+    Worker --> Profile["browser_data_rt/token_{id}<br/>Windows 指纹 + Firefox Profile + storage-state.json"]
+    Worker --> Flow["flow.google.com<br/>reCAPTCHA Enterprise · 原生 UI StreamChat · batchexecute"]
 ```
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
-### 前置要求
+### 环境要求
 
-- Python 3.10+（推荐 3.11–3.13）
-- 无需预装 Chrome / Playwright / Xvfb：首次启动或开启浏览器登录时，服务会自动检测并按需下载对应平台（macOS `arm64`/`x86_64`、Linux `x86_64`/`arm64`、Windows `x86_64`）的 Camoufox 二进制包至 `.runtime/camoufox/`。
+- **Python**：3.10+（推荐 3.11–3.13）
+- **浏览器运行时**：无需手动安装 Chrome 或 Playwright；首次启动服务或打开浏览器登录时，`src/services/camoufox_bidi.py` 会按宿主机架构（macOS `arm64`/`x86_64`、Linux `x86_64`/`arm64`、Windows `x86_64`）自动下载并解压 Camoufox 至 `.runtime/camoufox/`（或复用本地 `CAMOUFOX_PATH`）。
 
-### 本地部署
+### 本地源码部署
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/jianli9158/flow2api-Camoufox.git
-cd flow2api-Camoufox
+git clone https://github.com/jianli9158/flow2api.git
+cd flow2api
 
-# 2. 创建并激活虚拟环境
+# 2. 创建虚拟环境并安装依赖
 python3 -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
-
-# 3. 安装依赖
 pip install -r requirements.txt
 
-# 4. 启动服务（首次启动会自动从 config/setting_example.toml 生成 config/setting.toml 与数据库）
+# 3. 启动服务（首次启动会自动从 config/setting_example.toml 生成 config/setting.toml 与 data/flow.db）
 python main.py
 ```
 
-### Docker 部署
+默认监听 `http://0.0.0.0:8000`（可在 `config/setting.toml` 中调整 `[server].port`）。
 
-```bash
-git clone https://github.com/jianli9158/flow2api-Camoufox.git
-cd flow2api-Camoufox
-cp -n config/setting_example.toml config/setting.toml
-docker compose up -d --build
-```
+### Docker Compose 部署
 
-> 容器镜像已内置无头 Camoufox 所需的 GTK3 / X11 / 音频共享库，并挂载 `./browser_data_rt` 与 `./data` 持久化账号指纹及 SQLite 数据。默认通过 `FLOW2API_SERVER_PORT=8000` 监听容器内 `8000` 端口。
+仓库提供三种 Compose 编排文件以适配不同部署环境：
 
-### 首次访问与添加账号
+1. **标准无头部署（推荐，`docker-compose.yml`）**
+   ```bash
+   cp -n config/setting_example.toml config/setting.toml
+   docker compose up -d --build
+   ```
+   容器内置 GTK3 / X11 / 音频共享库支持无头 Camoufox，持久化挂载 `./data`、`./tmp`、`./browser_data_rt` 与 `./config/setting.toml`，宿主机映射端口 **`38000:8000`**（访问 `http://localhost:38000`）。
 
-1. 打开管理后台：**`http://localhost:8000`**（若 `config/setting.toml` 修改了端口则以实际端口为准），默认账号密码为 `admin` / `admin`，首次登录后请在「系统配置」中修改密码与 API Key。
-2. 在 **Token 列表** 点击 **「浏览器登录」**：
-   - 弹窗内会直接显示无头 Camoufox 浏览器的实时画面，点击画面即可输入 Google 账号与密码完成登录。
-   - 当浏览器跳转到 `https://flow.google.com/projects` 后，系统会自动提取完整 Google/Flow Cookies、绑定专属 Windows 指纹并落盘到 `browser_data_rt/token_<id>/`。
-   - 也可以点击 **「新增 Token」** 直接粘贴 JSON Cookie 数组或 `Header String`。
+2. **搭配 WARP 代理容器部署（`docker-compose.proxy.yml`）**
+   ```bash
+   cp -n config/setting_example.toml config/setting_warp.toml
+   docker compose -f docker-compose.proxy.yml up -d --build
+   ```
+   同时拉起 `caomingjun/warp` 容器并在 `31080:1080` 暴露 SOCKS5 入口。
+
+3. **Xvfb 有头环境部署（`docker-compose.headed.yml`）**
+   ```bash
+   docker compose -f docker-compose.headed.yml up -d --build
+   ```
+   使用 `Dockerfile.headed` 启动虚拟显示 `DISPLAY=:99`（`1440x900x24`），端口映射 **`8000:8000`**。
+
+### 首次登录与账号接入
+
+1. 访问控制台 `http://localhost:8000`（Docker 标准部署为 `http://localhost:38000`），使用默认管理员凭证 `admin` / `admin` 登录，随后在「系统配置 -> 安全配置」修改管理员密码与 API Key。
+2. 在 **Token 管理** 点击 **「浏览器登录」**：
+   - 可选择 `auto`（本地弹窗 + 网页 LiveView）、`window`（本地可见窗口）或 `liveview`（纯无头网页远程画面，适合服务器与 Docker）。
+   - 登录 Google 账号并跳转至 `https://flow.google.com/projects` 后，系统自动保存 Cookie、Windows 指纹、StorageState 及初始项目 UUID。
+   - 如需通过浏览器扩展同步或手动导入，可使用「新增」或「导入」提交 JSON Cookie 导出或 `Cookie` 请求头字符串，或使用「系统配置 -> 插件连接配置」对接 Token Updater。
 
 ---
 
-## 📈 监控与管理接口
+## 模型目录与解析规则
 
-- `GET /health`：公开健康检查，返回服务存活状态、活跃 Token 数、即将过期 Token 数、已过期 Token 数、429 禁用数等摘要。
-- `GET /metrics`：Prometheus 指标接口。
-- `GET /api/tokens`：管理接口，返回 Token 状态、积分余额、订阅等级（Paygate Tier）、上次自动刷新时间与结果。
-- `GET /test`：内置模型在线测试台，支持分类选择图片/视频模型、上传参考图、实时查看流式进度与生成结果预览。
+服务在 `/v1/models` 与 `/v1beta/models` 公开 **102 个**标准模型（**45 个图像模型 + 57 个视频模型**），同时在内部维护 **550 个**兼容别名与上游 usage key 映射（定义于 `src/services/generation_handler.py` 与 `src/core/model_resolver.py`）。
 
----
+### 1. 图像生成（45 个公开变体）
 
-## 📋 支持的模型
+| 模型系列 | 公开前缀 | 简写别名（配合 `imageConfig`） | 上游引擎 | 比例与分辨率矩阵 |
+|---|---|---|---|---|
+| **Nano Banana 2.1** | `gemini-3.1-flash-image-*` | `gemini-3.1-flash-image`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
+| **Nano Banana 2 Lite** | `gemini-3.1-flash-lite-image-*` | `gemini-3.1-flash-lite-image`、`nano-banana-2-lite` | `HARBOR_SEAL` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
+| **Nano Banana Pro** | `gemini-3.0-pro-image-*` | `gemini-3.0-pro-image`、`nano-banana-pro` | `GEM_PIX_2` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
 
-### 1. 图片生成
+**支持的 5 种画面比例后缀**：`-landscape`（16:9）、`-portrait`（9:16）、`-square`（1:1）、`-four-three`（4:3）、`-three-four`（3:4），各自叠加可选后缀 `-2k` 或 `-4k`。所有图像模型支持传入 `0–5` 张参考图片进行图生图或风格参考。
 
-当前 `/v1/models` 与 Gemini `/models` 公开 **Nano Banana 2.1**（`BELUGA`）、**Nano Banana 2 Lite**（`HARBOR_SEAL`）与 **Nano Banana Pro**（`GEM_PIX_2`）三个图片系列，共 **45 个**比例与分辨率变体，并支持通过简写别名 + `generationConfig.imageConfig` 动态解析：
+### 2. 视频生成（57 个公开变体）
 
-| 图片系列 | 公开模型 ID 前缀 | 简写别名（支持 `aspectRatio` / `imageSize`） | 上游模型标识 |
+| 模型族 | 公开名称模式 | 能力说明 | 账号等级 |
 |---|---|---|---|
-| **Nano Banana 2.1** | `gemini-3.1-flash-image-*` | `gemini-3.1-flash-image`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` |
-| **Nano Banana 2 Lite** | `gemini-3.1-flash-lite-image-*` | `gemini-3.1-flash-lite-image`、`nano-banana-2-lite` | `HARBOR_SEAL` |
-| **Nano Banana Pro** | `gemini-3.0-pro-image-*` | `gemini-3.0-pro-image`、`nano-banana-pro` | `GEM_PIX_2` |
+| **Omni 1.2 Flash 默认别名** | `omni-1.2-flash`、`omni-1.2-flash-360p`、`omni-1.2-flash-{1080p,4k}` | 默认 8s 横屏，可选 0–3 张参考图（兼容 `omni` / `macaron` 别名） | Free / Pro / Ult |
+| **Omni 1.2 Flash T2V / R2V** | `omni-1.2-flash-{4,6,8,10,15}s-{landscape,portrait}`（含 `-360p` / `-1080p` / `-4k`） | 文本或 0–3 张参考图生视频；别名支持完整 `3s–15s` 时长 | Free / Pro / Ult |
+| **Omni 1.2 Flash I2V** | `omni-1.2-flash-i2v-{4,6,8,10,15}s-{landscape,portrait}`（含放大后缀） | 首帧 / 首尾帧视频（`11s–15s` 仅接受单首帧） | Free / Pro / Ult |
+| **Omni 1.2 Flash Extend** | `omni-1.2-flash-extend-8s-{landscape,portrait}`（别名支持 `3s–10s`） | 基于 `extend://<mediaGenerationId>` 续写视频 | Pro / Ult |
+| **Veo 3.1 Lite** | `veo-3.1-lite`、`veo-3.1-lite-{4,6,8}s-{landscape,portrait}`（及 `i2v` / `r2v` / `extend` / `1080p` / `4k`） | 轻量高速 Veo 3.1 模型族（R2V 最多 3 张图） | Free / Pro / Ult |
 
-每个系列均包含以下 15 个比例与分辨率后缀（以下以 `gemini-3.1-flash-image-*` 为例）：
+> 注：OpenAI `/v1/chat/completions` 请求可通过 `size`（如 `1024x1792`）、`quality`（`medium` -> `2k`，`high`/`hd`/`ultra` -> `4k`）自动解析；Gemini 接口可通过 `generationConfig.imageConfig.aspectRatio`（如 `"16:9"`、`"9:16"`、`"1:1"`、`"4:3"`、`"3:4"`）与 `imageSize`（`"1K"`/`"2K"`/`"4K"`/`"360p"`/`"1080p"`）自动路由。
 
-| 当前公开名称 | 分辨率 | 比例 |
-|---|---:|---:|
-| `gemini-3.1-flash-image-landscape` | 默认 | 横屏 16:9 |
-| `gemini-3.1-flash-image-portrait` | 默认 | 竖屏 9:16 |
-| `gemini-3.1-flash-image-square` | 默认 | 方图 1:1 |
-| `gemini-3.1-flash-image-four-three` | 默认 | 横屏 4:3 |
-| `gemini-3.1-flash-image-three-four` | 默认 | 竖屏 3:4 |
-| `gemini-3.1-flash-image-landscape-2k` | 2K | 横屏 16:9 |
-| `gemini-3.1-flash-image-portrait-2k` | 2K | 竖屏 9:16 |
-| `gemini-3.1-flash-image-square-2k` | 2K | 方图 1:1 |
-| `gemini-3.1-flash-image-four-three-2k` | 2K | 横屏 4:3 |
-| `gemini-3.1-flash-image-three-four-2k` | 2K | 竖屏 3:4 |
-| `gemini-3.1-flash-image-landscape-4k` | 4K | 横屏 16:9 |
-| `gemini-3.1-flash-image-portrait-4k` | 4K | 竖屏 9:16 |
-| `gemini-3.1-flash-image-square-4k` | 4K | 方图 1:1 |
-| `gemini-3.1-flash-image-four-three-4k` | 4K | 横屏 4:3 |
-| `gemini-3.1-flash-image-three-four-4k` | 4K | 竖屏 3:4 |
+---
 
-Nano Banana 2 Lite 与 Nano Banana Pro 分别使用 `gemini-3.1-flash-lite-image-*` 和 `gemini-3.0-pro-image-*`，比例及分辨率后缀与上表完全一致（例如 `gemini-3.1-flash-lite-image-landscape`、`gemini-3.0-pro-image-portrait-2k`）。
+## API 接口参考
 
-### 2. 视频生成
+所有业务接口均通过 `Authorization: Bearer <api_key>` 或 `x-goog-api-key: <api_key>` 鉴权（默认 `han1234`）。
 
-| 当前公开名称 | 上游模型族 | 能力 |
+### OpenAI 与 Gemini 生成接口
+
+- **`POST /v1/chat/completions`**（支持 `stream: true` 实时推流进度）
+  ```bash
+  curl -X POST "http://localhost:8000/v1/chat/completions" \
+    -H "Authorization: Bearer han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "gemini-3.1-flash-image-landscape",
+      "messages": [{"role": "user", "content": "雨夜赛博朋克街道，霓虹水面倒影，电影胶片质感"}],
+      "stream": true
+    }'
+  ```
+- **图生图 / 图生视频**：在 `messages[].content` 传入 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` 或图片 URL。
+- **视频续写**：传入 `{"type": "image_url", "image_url": {"url": "extend://<source_mediaGenerationId>"}}`。
+- **`POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent`**（同时挂载在 `/models/...`）：
+  ```bash
+  curl -X POST "http://localhost:8000/v1beta/models/gemini-3.1-flash-image:generateContent" \
+    -H "x-goog-api-key: han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "contents": [{"role": "user", "parts": [{"text": "棚拍极简玻璃茶壶，柔和自然光"}]}],
+      "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}}
+    }'
+  ```
+
+### Flow 原生特征接口 (`/v1/flow/*`)
+
+| 类别 | 方法与路径 | 说明 |
 |---|---|---|
-| `veo-3.1-lite` / `veo-3.1-fast` / `veo-3.1-quality` / `omni-1.1-flash` | 默认别名 | 8 秒横屏文生视频 |
-| `veo-3.1-lite-{4,6,8}s-{landscape,portrait}` | Veo 3.1 - Lite | 文生视频 |
-| `veo-3.1-fast-{4,6,8}s-{landscape,portrait}` | Veo 3.1 - Fast | 文生视频 |
-| `veo-3.1-quality-{4,6,8}s-{landscape,portrait}` | Veo 3.1 - Quality | 文生视频 |
-| `omni-1.1-flash-{4,6,8,10}s-{landscape,portrait}` | Omni 1.1 Flash (`abra`) | 文生 / 参考图视频 |
-| `veo-3.1-{lite,fast,quality}-i2v-{4,6}s-{landscape,portrait}` | Veo 3.1 | 首帧 / 首尾帧视频 |
-| `veo-3.1-{lite,fast}-r2v-8s-{landscape,portrait}` | Veo 3.1 | 多参考图视频（最多 3 张） |
-| `veo-3.1-{lite,fast,quality}-extend-8s-{landscape,portrait}` | Veo 3.1 | 视频续写 |
+| **项目与资产** | `GET /v1/flow/projects/{project_id}` | 读取指定 Flow 项目详情与媒体/语音/角色资产列表 |
+| | `GET /v1/flow/assets/{media_id}` | 解析资产签名下载地址与元数据 |
+| | `POST /v1/flow/assets` | 上传参考图（JSON `image_base64`/`image_url` 或 multipart 文件）返回 `mediaId` |
+| **语音与 TTS** | `GET /v1/flow/voices` / `GET /v1/flow/voices/{voice_ref}` | 列出内置音色与项目自定义语音 / 获取单个音色 |
+| | `POST /v1/flow/voices` | TTS 合成；支持 `response_format` 为 `json`、`wav` 或 `pcm`，及 `cache_audio` |
+| | `DELETE /v1/flow/voices/{voice_ref}` | 删除自定义语音 |
+| **角色管理** | `GET /v1/flow/characters` / `GET /v1/flow/characters/{character_id}` | 列出或查询角色设定 |
+| | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建、更新（名称/音色/设定/收藏）或删除角色 |
+| **Creation Agent** | `POST /v1/flow/agent/chat` | 发起或继续 Agent 对话（`stream: true` 输出 SSE：`session` / `thinking` / `text` / `a2ui` / `media` / `permission` / `done` / `error`） |
+| | `POST /v1/flow/agent/sessions/{session_id}/approve` | 批准（`approved`）或拒绝（`denied`）Agent 扣费/生成确认卡片 |
+| | `GET /v1/flow/agent/sessions` / `GET` / `PATCH` / `DELETE .../{session_id}` | 查询会话列表、读取历史轮次、重命名或删除会话 |
+| **偏好与设置** | `GET` / `PATCH /v1/flow/user/preferences` | 读取或更新 Flow 用户全局偏好（自动清框、水印开关等） |
+| | `GET` / `PATCH /v1/flow/projects/{project_id}/settings` | 读取或更新项目面板与默认生图/生视频配置 |
 
-> 同时向后兼容全部旧版下划线模型名（如 `veo_3_1_t2v_fast_landscape`、`veo_3_1_i2v_s_fast_fl`、`veo_3_1_r2v_fast_landscape` 及 `*_1080p` / `*_4k` 视频超分模型）。
+### 控制台与监控端点
+
+- `GET /login`、`GET /manage`、`GET /test`：登录页、管理控制台、模型/Agent/语音工作台
+- `GET /health`：返回服务状态及活跃 / 即将过期 / 已过期 / 禁用账号统计
+- `GET /metrics`：Prometheus 监控指标输出
+- `GET /api/captcha/browser-stats` & `POST /api/captcha/score-test`：Camoufox 槽位实时状态与站点 reCAPTCHA 分数实测
+- `POST /api/tokens/browser-login/start` & `WS /api/tokens/browser-login/ws/{session_id}`：启动 LiveView 远程登录会话与帧流转发
 
 ---
 
-## 📡 API 调用示例
+## Worker 直连模式（Direct Mode）
 
-### 1. OpenAI 兼容格式 — 文生图
+除通过 HTTP 网关调用外，也可以在 Python 进程内直接实例化 `CamoufoxWorker` 调用页面内原生 `StreamChat` 生图或生视频流水线（适用于脚本批处理或调试原生 UI 响应）：
 
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.1-flash-image-landscape",
-    "messages": [
-      {
-        "role": "user",
-        "content": "一只可爱的猫咪在花园里玩耍，自然晨光"
-      }
-    ],
-    "stream": true
-  }'
-```
+```python
+import asyncio
+from src.services.camoufox_bidi import CamoufoxWorker
 
-### 2. OpenAI 兼容格式 — 图生图
+async def main():
+    worker = CamoufoxWorker(
+        token_id=1,
+        profile_dir="browser_data_rt/token_1",
+    )
+    try:
+        image_res = await worker.generate_native_image(
+            project_id="<flow_project_uuid>",
+            prompt="晨雾中的雪山木屋，柔和金色日光",
+            aspect_ratio="IMAGE_ASPECT_RATIO_LANDSCAPE",
+            model_name="BELUGA",
+            token_id=1,
+        )
+        print("Image media:", image_res)
 
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gemini-3.1-flash-image-landscape",
-    "messages": [
-      {
-        "role": "user",
-        "content": [
-          { "type": "text", "text": "将这张图片转换为吉卜力水彩画风格" },
-          {
-            "type": "image_url",
-            "image_url": { "url": "data:image/jpeg;base64,<base64_encoded_image>" }
-          }
-        ]
-      }
-    ],
-    "stream": true
-  }'
-```
+        video_res = await worker.generate_native_video(
+            project_id="<flow_project_uuid>",
+            prompt="镜头缓慢推进木屋，炊烟升起",
+            aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+            model_key="veo_3_1_t2v_fast_landscape",
+            token_id=1,
+        )
+        print("Video media:", video_res)
+    finally:
+        await worker.close()
 
-### 3. OpenAI 兼容格式 — 文生视频
-
-```bash
-curl -X POST "http://localhost:8000/v1/chat/completions" \
-  -H "Authorization: Bearer han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "veo-3.1-fast-8s-landscape",
-    "messages": [
-      {
-        "role": "user",
-        "content": "一只小猫在草地上追逐蝴蝶，电影级景深"
-      }
-    ],
-    "stream": true
-  }'
-```
-
-### 4. Gemini 官方 `generateContent` 格式
-
-```bash
-curl -X POST "http://localhost:8000/models/gemini-3.1-flash-image:generateContent" \
-  -H "x-goog-api-key: han1234" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "contents": [
-      {
-        "role": "user",
-        "parts": [
-          { "text": "一颗放在木桌上的红苹果，棚拍光线，极简背景" }
-        ]
-      }
-    ],
-    "generationConfig": {
-      "responseModalities": ["IMAGE"],
-      "imageConfig": {
-        "aspectRatio": "1:1",
-        "imageSize": "1K"
-      }
-    }
-  }'
+asyncio.run(main())
 ```
 
 ---
 
-## 📄 许可证
+## 配置参考（`config/setting.toml`）
 
-本项目采用 [MIT 许可证](LICENSE)。
+核心配置项均在 `config/setting_example.toml` 提供默认值，并可通过管理后台实时持久化到 SQLite（`data/flow.db`）：
+
+| 配置节 | 关键字段 | 默认值 | 说明 |
+|---|---|---|---|
+| `[global]` | `api_key`、`admin_username`、`admin_password` | `"han1234"` / `"admin"` | API 密钥与后台管理员凭证 |
+| `[server]` | `host`、`port` | `"0.0.0.0"` / `8000` | 服务监听地址（支持环境变量 `FLOW2API_SERVER_PORT` 覆盖） |
+| `[captcha]` | `captcha_method`、`browser_engine` | `"camoufox"` | 浏览器引擎；`browser_in_page_rpc = true` 开启页面内 XHR/StreamChat |
+| `[captcha]` | `browser_count`、`browser_personal_fresh_restart_every_n_solves` | `1` / `10` | 常驻 Camoufox 槽位数量与每 N 次成功求解后轮换重启阈值（`0` 为禁用） |
+| `[captcha]` | `browser_flow_page_warmup_seconds`、`personal_project_pool_size` | `6.0` / `4` | Flow 页面预热等待时间与单账号默认项目池大小 |
+| `[generation]` | `image_timeout`、`video_timeout` | `300` / `1500` | 图像与视频生成超时上限（秒） |
+| `[call_logic]` | `call_mode` | `"default"` | `"default"`（负载均衡）或 `"polling"`（稳定顺序轮询） |
+| `[cache]` | `enabled`、`timeout`、`base_url` | `false` / `7200` / `""` | 本地媒体文件缓存、过期清理时间（`0` 永不过期）与外链访问域名 |
+| `[proxy]` | `proxy_enabled`、`proxy_url` | `false` / `""` | 协议回退与下载代理（支持 `http://` 与 `socks5://`） |
+
+---
+
+## 许可证
+
+本项目基于 [MIT 许可证](LICENSE) 开源。

@@ -88,6 +88,10 @@ MODEL_SUPPORTED_SIZES = {
 
 # imageSize 归一化映射
 IMAGE_SIZE_MAP = {
+    "360p": "360p",
+    "360P": "360p",
+    "720p": "720p",
+    "720P": "720p",
     "1k": "1k",
     "1K": "1k",
     "2k": "2k",
@@ -186,79 +190,7 @@ def _infer_aspect_ratio_from_images(
 # 视频模型简化名映射
 # ──────────────────────────────────────────────
 VIDEO_BASE_MODELS = {
-    # T2V models
-    "veo_3_1_t2v_fast": {
-        "landscape": "veo_3_1_t2v_fast_landscape",
-        "portrait": "veo_3_1_t2v_fast_portrait",
-    },
-    "veo_3_1_t2v_fast_4s": {
-        "landscape": "veo_3_1_t2v_fast_4s",
-        "portrait": "veo_3_1_t2v_fast_portrait_4s",
-    },
-    "veo_3_1_t2v_fast_6s": {
-        "landscape": "veo_3_1_t2v_fast_6s",
-        "portrait": "veo_3_1_t2v_fast_portrait_6s",
-    },
-    "veo_3_1_t2v_fast_8s": {
-        "landscape": "veo_3_1_t2v_fast_8s",
-        "portrait": "veo_3_1_t2v_fast_portrait_8s",
-    },
-    "veo_3_1_t2v_fast_ultra": {
-        "landscape": "veo_3_1_t2v_fast_ultra",
-        "portrait": "veo_3_1_t2v_fast_portrait_ultra",
-    },
-    "veo_3_1_t2v_fast_ultra_relaxed": {
-        "landscape": "veo_3_1_t2v_fast_ultra_relaxed",
-        "portrait": "veo_3_1_t2v_fast_portrait_ultra_relaxed",
-    },
-    "veo_3_1_t2v": {
-        "landscape": "veo_3_1_t2v_landscape",
-        "portrait": "veo_3_1_t2v_portrait",
-    },
-    "veo_3_1_t2v_4s": {
-        "landscape": "veo_3_1_t2v_4s",
-        "portrait": "veo_3_1_t2v_portrait_4s",
-    },
-    "veo_3_1_t2v_6s": {
-        "landscape": "veo_3_1_t2v_6s",
-        "portrait": "veo_3_1_t2v_portrait_6s",
-    },
-    "veo_3_1_t2v_8s": {
-        "landscape": "veo_3_1_t2v_8s",
-        "portrait": "veo_3_1_t2v_portrait_8s",
-    },
-    "veo_3_1_t2v_4s_4k": {
-        "landscape": "veo_3_1_t2v_4s_4k",
-        "portrait": "veo_3_1_t2v_portrait_4s_4k",
-    },
-    "veo_3_1_t2v_4s_1080p": {
-        "landscape": "veo_3_1_t2v_4s_1080p",
-        "portrait": "veo_3_1_t2v_portrait_4s_1080p",
-    },
-    "veo_3_1_t2v_6s_4k": {
-        "landscape": "veo_3_1_t2v_6s_4k",
-        "portrait": "veo_3_1_t2v_portrait_6s_4k",
-    },
-    "veo_3_1_t2v_6s_1080p": {
-        "landscape": "veo_3_1_t2v_6s_1080p",
-        "portrait": "veo_3_1_t2v_portrait_6s_1080p",
-    },
-    "veo_3_1_t2v_8s_4k": {
-        "landscape": "veo_3_1_t2v_8s_4k",
-        "portrait": "veo_3_1_t2v_portrait_8s_4k",
-    },
-    "veo_3_1_t2v_8s_1080p": {
-        "landscape": "veo_3_1_t2v_8s_1080p",
-        "portrait": "veo_3_1_t2v_portrait_8s_1080p",
-    },
-    "veo_3_1_t2v_4k": {
-        "landscape": "veo_3_1_t2v_4k",
-        "portrait": "veo_3_1_t2v_portrait_4k",
-    },
-    "veo_3_1_t2v_1080p": {
-        "landscape": "veo_3_1_t2v_1080p",
-        "portrait": "veo_3_1_t2v_portrait_1080p",
-    },
+    # T2V models (Veo 3.1 Lite & Omni 1.2 Flash)
     "veo_3_1_t2v_lite": {
         "landscape": "veo_3_1_t2v_lite_landscape",
         "portrait": "veo_3_1_t2v_lite_portrait",
@@ -279,79 +211,153 @@ VIDEO_BASE_MODELS = {
         "landscape": "omni",
         "portrait": "omni_portrait",
     },
-    # I2V models
-    "veo_3_1_i2v_s_fast_fl": {
-        "landscape": "veo_3_1_i2v_s_fast_fl",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_fl",
+    "omni-1.2-flash": {
+        "landscape": "omni-1.2-flash-8s-landscape",
+        "portrait": "omni-1.2-flash-8s-portrait",
     },
-    "veo_3_1_i2v_s_fast_4s_fl": {
-        "landscape": "veo_3_1_i2v_s_fast_4s_fl",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_4s_fl",
+    "omni-1.2-flash-360p": {
+        "landscape": "omni-1.2-flash-8s-landscape-360p",
+        "portrait": "omni-1.2-flash-8s-portrait-360p",
     },
-    "veo_3_1_i2v_s_fast_6s_fl": {
-        "landscape": "veo_3_1_i2v_s_fast_6s_fl",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_6s_fl",
+    "omni-1.2-flash-1080p": {
+        "landscape": "omni-1.2-flash-8s-landscape-1080p",
+        "portrait": "omni-1.2-flash-8s-portrait-1080p",
     },
-    "veo_3_1_i2v_s_fast_8s_fl": {
-        "landscape": "veo_3_1_i2v_s_fast_8s_fl",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_8s_fl",
+    "omni-1.2-flash-4k": {
+        "landscape": "omni-1.2-flash-8s-landscape-4k",
+        "portrait": "omni-1.2-flash-8s-portrait-4k",
     },
-    "veo_3_1_i2v_s_fast_ultra_fl": {
-        "landscape": "veo_3_1_i2v_s_fast_ultra_fl",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_ultra_fl",
+    **{
+        f"omni-1.2-flash-{d}s": {
+            "landscape": f"omni-1.2-flash-{d}s-landscape",
+            "portrait": f"omni-1.2-flash-{d}s-portrait",
+        }
+        for d in range(3, 16)
     },
-    "veo_3_1_i2v_s_fast_ultra_relaxed": {
-        "landscape": "veo_3_1_i2v_s_fast_ultra_relaxed",
-        "portrait": "veo_3_1_i2v_s_fast_portrait_ultra_relaxed",
+    **{
+        f"omni-1.2-flash-{d}s-{res}": {
+            "landscape": f"omni-1.2-flash-{d}s-landscape-{res}",
+            "portrait": f"omni-1.2-flash-{d}s-portrait-{res}",
+        }
+        for d in range(3, 16)
+        for res in ("360p", "1080p", "4k")
     },
-    "veo_3_1_i2v_s": {
-        "landscape": "veo_3_1_i2v_s_landscape",
-        "portrait": "veo_3_1_i2v_s_portrait",
+    "omni-1.2-flash-i2v": {
+        "landscape": "omni-1.2-flash-i2v-8s-landscape",
+        "portrait": "omni-1.2-flash-i2v-8s-portrait",
     },
-    "veo_3_1_i2v_s_4s": {
-        "landscape": "veo_3_1_i2v_s_4s",
-        "portrait": "veo_3_1_i2v_s_portrait_4s",
+    **{
+        f"omni-1.2-flash-i2v-{res}": {
+            "landscape": f"omni-1.2-flash-i2v-8s-landscape-{res}",
+            "portrait": f"omni-1.2-flash-i2v-8s-portrait-{res}",
+        }
+        for res in ("360p", "1080p", "4k")
     },
-    "veo_3_1_i2v_s_6s": {
-        "landscape": "veo_3_1_i2v_s_6s",
-        "portrait": "veo_3_1_i2v_s_portrait_6s",
+    **{
+        f"omni-1.2-flash-i2v-{d}s": {
+            "landscape": f"omni-1.2-flash-i2v-{d}s-landscape",
+            "portrait": f"omni-1.2-flash-i2v-{d}s-portrait",
+        }
+        for d in range(3, 16)
     },
-    "veo_3_1_i2v_s_8s": {
-        "landscape": "veo_3_1_i2v_s_8s",
-        "portrait": "veo_3_1_i2v_s_portrait_8s",
+    **{
+        f"omni-1.2-flash-i2v-{d}s-{res}": {
+            "landscape": f"omni-1.2-flash-i2v-{d}s-landscape-{res}",
+            "portrait": f"omni-1.2-flash-i2v-{d}s-portrait-{res}",
+        }
+        for d in range(3, 16)
+        for res in ("360p", "1080p", "4k")
     },
-    "veo_3_1_i2v_s_4s_4k": {
-        "landscape": "veo_3_1_i2v_s_4s_4k",
-        "portrait": "veo_3_1_i2v_s_portrait_4s_4k",
+    "omni-1.2-flash-extend": {
+        "landscape": "omni-1.2-flash-extend-8s-landscape",
+        "portrait": "omni-1.2-flash-extend-8s-portrait",
     },
-    "veo_3_1_i2v_s_4s_1080p": {
-        "landscape": "veo_3_1_i2v_s_4s_1080p",
-        "portrait": "veo_3_1_i2v_s_portrait_4s_1080p",
+    **{
+        f"omni-1.2-flash-extend-{res}": {
+            "landscape": f"omni-1.2-flash-extend-8s-landscape-{res}",
+            "portrait": f"omni-1.2-flash-extend-8s-portrait-{res}",
+        }
+        for res in ("360p", "1080p", "4k")
     },
-    "veo_3_1_i2v_s_6s_4k": {
-        "landscape": "veo_3_1_i2v_s_6s_4k",
-        "portrait": "veo_3_1_i2v_s_portrait_6s_4k",
+    **{
+        f"omni-1.2-flash-extend-{d}s": {
+            "landscape": f"omni-1.2-flash-extend-{d}s-landscape",
+            "portrait": f"omni-1.2-flash-extend-{d}s-portrait",
+        }
+        for d in range(3, 11)
     },
-    "veo_3_1_i2v_s_6s_1080p": {
-        "landscape": "veo_3_1_i2v_s_6s_1080p",
-        "portrait": "veo_3_1_i2v_s_portrait_6s_1080p",
+    **{
+        f"omni-1.2-flash-extend-{d}s-{res}": {
+            "landscape": f"omni-1.2-flash-extend-{d}s-landscape-{res}",
+            "portrait": f"omni-1.2-flash-extend-{d}s-portrait-{res}",
+        }
+        for d in range(3, 11)
+        for res in ("360p", "1080p", "4k")
     },
-    "veo_3_1_i2v_s_8s_4k": {
-        "landscape": "veo_3_1_i2v_s_8s_4k",
-        "portrait": "veo_3_1_i2v_s_portrait_8s_4k",
+    "veo-3.1-lite": {
+        "landscape": "veo-3.1-lite-8s-landscape",
+        "portrait": "veo-3.1-lite-8s-portrait",
     },
-    "veo_3_1_i2v_s_8s_1080p": {
-        "landscape": "veo_3_1_i2v_s_8s_1080p",
-        "portrait": "veo_3_1_i2v_s_portrait_8s_1080p",
+    **{
+        f"veo-3.1-lite-{res}": {
+            "landscape": f"veo-3.1-lite-8s-landscape-{res}",
+            "portrait": f"veo-3.1-lite-8s-portrait-{res}",
+        }
+        for res in ("1080p", "4k")
     },
-    "veo_3_1_i2v_s_4k": {
-        "landscape": "veo_3_1_i2v_s_4k",
-        "portrait": "veo_3_1_i2v_s_portrait_4k",
+    **{
+        f"veo-3.1-lite-{d}s": {
+            "landscape": f"veo-3.1-lite-{d}s-landscape",
+            "portrait": f"veo-3.1-lite-{d}s-portrait",
+        }
+        for d in (4, 6, 8)
     },
-    "veo_3_1_i2v_s_1080p": {
-        "landscape": "veo_3_1_i2v_s_1080p",
-        "portrait": "veo_3_1_i2v_s_portrait_1080p",
+    **{
+        f"veo-3.1-lite-{d}s-{res}": {
+            "landscape": f"veo-3.1-lite-{d}s-landscape-{res}",
+            "portrait": f"veo-3.1-lite-{d}s-portrait-{res}",
+        }
+        for d in (4, 6, 8)
+        for res in ("1080p", "4k")
     },
+    **{
+        f"veo-3.1-lite-i2v-{d}s": {
+            "landscape": f"veo-3.1-lite-i2v-{d}s-landscape",
+            "portrait": f"veo-3.1-lite-i2v-{d}s-portrait",
+        }
+        for d in (4, 6, 8)
+    },
+    **{
+        f"veo-3.1-lite-i2v-{d}s-{res}": {
+            "landscape": f"veo-3.1-lite-i2v-{d}s-landscape-{res}",
+            "portrait": f"veo-3.1-lite-i2v-{d}s-portrait-{res}",
+        }
+        for d in (4, 6, 8)
+        for res in ("1080p", "4k")
+    },
+    "veo-3.1-lite-r2v-8s": {
+        "landscape": "veo-3.1-lite-r2v-8s-landscape",
+        "portrait": "veo-3.1-lite-r2v-8s-portrait",
+    },
+    **{
+        f"veo-3.1-lite-r2v-8s-{res}": {
+            "landscape": f"veo-3.1-lite-r2v-8s-landscape-{res}",
+            "portrait": f"veo-3.1-lite-r2v-8s-portrait-{res}",
+        }
+        for res in ("1080p", "4k")
+    },
+    "veo-3.1-lite-extend-8s": {
+        "landscape": "veo-3.1-lite-extend-8s-landscape",
+        "portrait": "veo-3.1-lite-extend-8s-portrait",
+    },
+    **{
+        f"veo-3.1-lite-extend-8s-{res}": {
+            "landscape": f"veo-3.1-lite-extend-8s-landscape-{res}",
+            "portrait": f"veo-3.1-lite-extend-8s-portrait-{res}",
+        }
+        for res in ("1080p", "4k")
+    },
+    # I2V Lite legacy aliases
     "veo_3_1_i2v_lite": {
         "landscape": "veo_3_1_i2v_lite_landscape",
         "portrait": "veo_3_1_i2v_lite_portrait",
@@ -383,36 +389,6 @@ VIDEO_BASE_MODELS = {
     "veo_3_1_interpolation_lite_8s": {
         "landscape": "veo_3_1_interpolation_lite_8s_landscape",
         "portrait": "veo_3_1_interpolation_lite_8s_portrait",
-    },
-    # R2V models
-    "veo_3_1_r2v_fast": {
-        "landscape": "veo_3_1_r2v_fast",
-        "portrait": "veo_3_1_r2v_fast_portrait",
-    },
-    "veo_3_1_r2v_fast_8s": {
-        "landscape": "veo_3_1_r2v_fast_8s",
-        "portrait": "veo_3_1_r2v_fast_portrait_8s",
-    },
-    "veo_3_1_r2v_fast_ultra": {
-        "landscape": "veo_3_1_r2v_fast_ultra",
-        "portrait": "veo_3_1_r2v_fast_portrait_ultra",
-    },
-    "veo_3_1_r2v_fast_ultra_8s": {
-        "landscape": "veo_3_1_r2v_fast_ultra_8s",
-        "portrait": "veo_3_1_r2v_fast_portrait_ultra_8s",
-    },
-    "veo_3_1_r2v_fast_ultra_relaxed": {
-        "landscape": "veo_3_1_r2v_fast_ultra_relaxed",
-        "portrait": "veo_3_1_r2v_fast_portrait_ultra_relaxed",
-    },
-    "veo_3_1_r2v_fast_ultra_relaxed_8s": {
-        "landscape": "veo_3_1_r2v_fast_ultra_relaxed_8s",
-        "portrait": "veo_3_1_r2v_fast_portrait_ultra_relaxed_8s",
-    },
-    # Extend models (视频续写)
-    "veo_3_1_extend": {
-        "landscape": "veo_3_1_extend",
-        "portrait": "veo_3_1_extend_portrait",
     },
 }
 
@@ -571,7 +547,7 @@ def _extract_generation_params(request) -> Tuple[Optional[str], Optional[str]]:
             )
         if not image_size:
             image_size = _normalize_image_size(
-                _read_value(gen_config, "imageSize", "image_size")
+                _read_value(gen_config, "imageSize", "image_size", "resolution")
             )
 
         if not aspect_ratio:
@@ -610,7 +586,9 @@ def _extract_generation_params(request) -> Tuple[Optional[str], Optional[str]]:
                 )
             if image_size is None:
                 image_size = _normalize_image_size(
-                    gen_config_raw.get("imageSize") or gen_config_raw.get("image_size")
+                    gen_config_raw.get("imageSize")
+                    or gen_config_raw.get("image_size")
+                    or gen_config_raw.get("resolution")
                 )
 
             if aspect_ratio is None:
@@ -637,7 +615,9 @@ def _extract_generation_params(request) -> Tuple[Optional[str], Optional[str]]:
             )
         if image_size is None:
             image_size = _normalize_image_size(
-                extra.get("image_size") or extra.get("imageSize")
+                extra.get("image_size")
+                or extra.get("imageSize")
+                or extra.get("resolution")
             )
 
     return aspect_ratio, image_size
@@ -723,11 +703,11 @@ def resolve_model_name(
         if not aspect_ratio or aspect_ratio not in ("landscape", "portrait"):
             aspect_ratio = "landscape"
 
-        if (
-            image_size in ("4k", "1080p")
-            and f"{model}_{image_size}" in VIDEO_BASE_MODELS
-        ):
-            model = f"{model}_{image_size}"
+        if image_size in ("4k", "1080p", "360p"):
+            if f"{model}-{image_size}" in VIDEO_BASE_MODELS:
+                model = f"{model}-{image_size}"
+            elif f"{model}_{image_size}" in VIDEO_BASE_MODELS:
+                model = f"{model}_{image_size}"
 
         orientation_map = VIDEO_BASE_MODELS[model]
         resolved = orientation_map.get(aspect_ratio)
@@ -745,13 +725,22 @@ def resolve_model_name(
         )
         return model
 
-    # 如果已经是有效的 MODEL_CONFIG key，直接返回
+    # 如果已经是有效的 MODEL_CONFIG key，检查是否可通过 generationConfig.imageSize 切换分辨率
     if model_config and model in model_config:
+        _, image_size = (
+            _extract_generation_params(request) if request else (None, None)
+        )
+        if image_size in ("4k", "1080p", "360p") and not (
+            model.endswith(f"-{image_size}") or model.endswith(f"_{image_size}")
+        ):
+            for sep in ("-", "_"):
+                candidate = f"{model}{sep}{image_size}"
+                if candidate in model_config:
+                    return candidate
         return model
 
     # 未知模型名，原样返回（由下游 MODEL_CONFIG 校验报错）
     return model
-
 
 def get_base_model_aliases() -> Dict[str, str]:
     """返回所有简化模型名（别名）及其描述，用于 /v1/models 接口展示。"""

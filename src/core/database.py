@@ -566,6 +566,7 @@ class Database:
                     ("video_concurrency", "INTEGER DEFAULT -1"),
                     ("captcha_proxy_url", "TEXT"),  # token级打码代理
                     ("extension_route_key", "TEXT"),  # extension 模式路由键
+                    ("browser_profile_dir", "TEXT DEFAULT ''"),  # 绑定 Camoufox 浏览器固定启动目录
                     ("protocol_mode", "TEXT DEFAULT 'session'"),  # ST 刷新模式
                     ("google_cookies", "TEXT DEFAULT ''"),  # 协议登录 Google Cookies
                     ("login_account", "TEXT DEFAULT ''"),  # 协议登录账号提示
@@ -588,7 +589,13 @@ class Database:
                             print(f"  ✓ Added column '{col_name}' to tokens table")
                         except Exception as e:
                             print(f"  ✗ Failed to add column '{col_name}': {e}")
-
+                try:
+                    await db.execute(
+                        "UPDATE tokens SET browser_profile_dir = 'token_' || id "
+                        "WHERE COALESCE(TRIM(browser_profile_dir), '') = ''"
+                    )
+                except Exception:
+                    pass
             # Check and add missing columns to admin_config table
             if await self._table_exists(db, "admin_config"):
                 if not await self._column_exists(
@@ -813,6 +820,7 @@ class Database:
                     video_concurrency INTEGER DEFAULT -1,
                     captcha_proxy_url TEXT,
                     extension_route_key TEXT,
+                    browser_profile_dir TEXT DEFAULT '',
                     protocol_mode TEXT DEFAULT 'session',
                     google_cookies TEXT DEFAULT '',
                     login_account TEXT DEFAULT '',
@@ -1045,7 +1053,13 @@ class Database:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_token_stats_token_id ON token_stats(token_id)"
             )
-
+            try:
+                await db.execute(
+                    "UPDATE tokens SET browser_profile_dir = 'token_' || id "
+                    "WHERE COALESCE(TRIM(browser_profile_dir), '') = ''"
+                )
+            except Exception:
+                pass
             await db.commit()
             self._request_logs_columns_cache = None
 
@@ -1155,6 +1169,29 @@ class Database:
         if await cursor.fetchone():
             raise ValueError(f"账号已存在: {identities[0]}")
 
+    async def _ensure_browser_profile_dir_available(
+        self,
+        db,
+        *,
+        browser_profile_dir: Optional[str] = None,
+        exclude_token_id: Optional[int] = None,
+    ) -> None:
+        normalized = str(browser_profile_dir or "").strip()
+        if not normalized:
+            return
+        query = "SELECT id, email FROM tokens WHERE browser_profile_dir = ? COLLATE NOCASE"
+        params: List[Any] = [normalized]
+        if exclude_token_id is not None:
+            query += " AND id != ?"
+            params.append(exclude_token_id)
+        query += " LIMIT 1"
+        cursor = await db.execute(query, params)
+        row = await cursor.fetchone()
+        if row:
+            owner_email = row["email"] if isinstance(row, aiosqlite.Row) else row[1]
+            raise ValueError(
+                f"浏览器资料目录已被账号 {owner_email or row[0]} 绑定: {normalized}"
+            )
     # Token operations
     async def add_token(self, token: Token) -> int:
         """Add a new token"""
@@ -1165,16 +1202,21 @@ class Database:
                 email=token.email,
                 login_account=token.login_account,
             )
+            profile_dir_val = str(getattr(token, "browser_profile_dir", "") or "").strip()
+            await self._ensure_browser_profile_dir_available(
+                db,
+                browser_profile_dir=profile_dir_val,
+            )
             cursor = await db.execute(
                 """
                 INSERT INTO tokens (st, at, at_expires, email, name, remark, is_active,
                                    credits, user_paygate_tier, current_project_id, current_project_name,
                                    image_enabled, video_enabled, image_concurrency, video_concurrency,
-                                   captcha_proxy_url, extension_route_key,
+                                   captcha_proxy_url, extension_route_key, browser_profile_dir,
                                    protocol_mode, google_cookies, login_account, login_password,
                                    proxy_url, auto_refresh_enabled, refresh_interval_minutes,
                                    last_st_refresh_at, last_st_refresh_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
                 (
                     token.st,
@@ -1194,6 +1236,7 @@ class Database:
                     token.video_concurrency,
                     token.captcha_proxy_url,
                     token.extension_route_key,
+                    profile_dir_val,
                     token.protocol_mode,
                     token.google_cookies,
                     token.login_account,
@@ -1205,10 +1248,15 @@ class Database:
                     token.last_st_refresh_result,
                 ),
             )
-            await db.commit()
             token_id = cursor.lastrowid
-
-            # Create stats entry
+            if not profile_dir_val and token_id:
+                default_profile_dir = f"token_{token_id}"
+                await db.execute(
+                    "UPDATE tokens SET browser_profile_dir = ? WHERE id = ?",
+                    (default_profile_dir, token_id),
+                )
+                token.browser_profile_dir = default_profile_dir
+            await db.commit()
             await db.execute(
                 """
                 INSERT INTO token_stats (token_id) VALUES (?)
@@ -1377,17 +1425,27 @@ class Database:
     async def update_token(self, token_id: int, **kwargs):
         """Update token fields"""
         async with self._connect(write=True) as db:
-            if "email" in kwargs or "login_account" in kwargs:
+            if (
+                "email" in kwargs
+                or "login_account" in kwargs
+                or "browser_profile_dir" in kwargs
+            ):
                 await db.execute("BEGIN IMMEDIATE")
-                await self._ensure_token_identity_available(
-                    db,
-                    email=kwargs.get("email"),
-                    login_account=kwargs.get("login_account"),
-                    exclude_token_id=token_id,
-                )
+                if "email" in kwargs or "login_account" in kwargs:
+                    await self._ensure_token_identity_available(
+                        db,
+                        email=kwargs.get("email"),
+                        login_account=kwargs.get("login_account"),
+                        exclude_token_id=token_id,
+                    )
+                if "browser_profile_dir" in kwargs:
+                    await self._ensure_browser_profile_dir_available(
+                        db,
+                        browser_profile_dir=kwargs.get("browser_profile_dir"),
+                        exclude_token_id=token_id,
+                    )
             updates = []
             params = []
-
             for key, value in kwargs.items():
                 updates.append(f"{key} = ?")
                 params.append(value)

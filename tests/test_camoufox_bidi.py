@@ -10,20 +10,30 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from src.core.config import config
+from src.core.database import Database
+from src.core.models import Token
 from src.services.browser_captcha import BrowserCaptchaService, TokenBrowser
 from src.services.camoufox_bidi import (
     BiDiClient,
     CAMOUFOX_FIREFOX_MAJOR,
+    CamoufoxLoginManager,
     CamoufoxLoginSession,
     CamoufoxWorker,
     LocalSocks5Relay,
     _from_bidi_remote_value,
     _to_bidi_local_value,
+    acquire_profile_login_lease,
     build_camoufox_env,
     build_camoufox_fingerprint_config,
     find_camoufox_executable,
+    get_profile_login_holder,
+    is_token_in_login_session,
+    list_browser_profile_dirs,
     load_or_create_account_camoufox_config,
+    normalize_browser_profile_dir,
     persist_account_login_artifacts,
+    release_profile_login_lease,
+    resolve_account_profile_dir,
     restore_startup_cache,
     save_startup_cache,
     write_camoufox_user_js,
@@ -305,6 +315,223 @@ class CamoufoxBiDiUnitTests(unittest.IsolatedAsyncioTestCase):
             token_dir = Path(tmp_root) / "token_99"
             self.assertTrue((token_dir / "camoufox-fingerprint.json").is_file())
             self.assertTrue((token_dir / "storage-state.json").is_file())
+
+    def test_normalize_and_resolve_account_profile_dir(self):
+        with tempfile.TemporaryDirectory() as tmp_root:
+            root = Path(tmp_root)
+            self.assertEqual(normalize_browser_profile_dir(None), "")
+            self.assertEqual(normalize_browser_profile_dir("alice"), "profiles/alice")
+            self.assertEqual(
+                normalize_browser_profile_dir("browser_data_rt/profiles/team_a/"),
+                "profiles/team_a",
+            )
+            self.assertEqual(normalize_browser_profile_dir("token_9"), "token_9")
+
+            for bad in ("../escape", "profiles/../x", "shared", "pending", "browser_0", "bad name!"):
+                with self.assertRaises(ValueError):
+                    normalize_browser_profile_dir(bad)
+
+            dir1, key1 = resolve_account_profile_dir(root, token_id=7, profile_dir_name=None)
+            self.assertEqual((dir1, key1), (root / "token_7", "token_7"))
+            dir2, key2 = resolve_account_profile_dir(root, token_id=7, profile_dir_name="alice")
+            self.assertEqual((dir2, key2), (root / "profiles" / "alice", "profiles/alice"))
+            dir3, key3 = resolve_account_profile_dir(root, token_id=None, profile_dir_name=None)
+            self.assertEqual((dir3, key3), (root / "pending", ""))
+
+    def test_profile_login_lease_and_directory_discovery(self):
+        with tempfile.TemporaryDirectory() as tmp_root:
+            root = Path(tmp_root)
+            t1 = root / "token_1"
+            (t1 / "firefox-profile").mkdir(parents=True)
+            (t1 / "firefox-profile" / "cookies.sqlite").write_bytes(b"db")
+            (t1 / "camoufox-fingerprint.json").write_text("{}", encoding="utf-8")
+            alice = root / "profiles" / "alice"
+            (alice / "firefox-profile").mkdir(parents=True)
+            (alice / "storage-state.json").write_text("{}", encoding="utf-8")
+            # Ignored internal directories
+            (root / "shared").mkdir()
+            (root / "pending").mkdir()
+            (root / "browser_0").mkdir()
+
+            acquire_profile_login_lease(alice, "sess-1", token_id=42)
+            try:
+                self.assertEqual(get_profile_login_holder(alice), "sess-1")
+                self.assertTrue(is_token_in_login_session(42))
+                with self.assertRaises(RuntimeError):
+                    acquire_profile_login_lease(alice, "sess-2", token_id=42)
+
+                entries = list_browser_profile_dirs(root)
+                self.assertEqual(
+                    [e["profile_dir"] for e in entries], ["token_1", "profiles/alice"]
+                )
+                by_dir = {e["profile_dir"]: e for e in entries}
+                self.assertTrue(by_dir["profiles/alice"]["active_login"])
+                self.assertTrue(by_dir["profiles/alice"]["has_storage_state"])
+                self.assertFalse(by_dir["token_1"]["active_login"])
+                self.assertTrue(by_dir["token_1"]["has_cookies_db"])
+                self.assertTrue(by_dir["token_1"]["has_fingerprint"])
+            finally:
+                release_profile_login_lease(alice, "sess-1", token_id=42)
+            self.assertIsNone(get_profile_login_holder(alice))
+            self.assertFalse(is_token_in_login_session(42))
+
+    async def test_database_browser_profile_dir_backfill_and_uniqueness(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db = Database(db_path=str(Path(tmp_dir) / "test.db"))
+            await db.init_db()
+            try:
+                t1_id = await db.add_token(
+                    Token(
+                        st="frontend-1",
+                        at="at-1",
+                        email="one@example.com",
+                        google_cookies="SID=1",
+                    )
+                )
+                t2_id = await db.add_token(
+                    Token(
+                        st="frontend-2",
+                        at="at-2",
+                        email="two@example.com",
+                        google_cookies="SID=2",
+                        browser_profile_dir="profiles/alice",
+                    )
+                )
+                t1 = await db.get_token(t1_id)
+                t2 = await db.get_token(t2_id)
+                self.assertEqual(t1.browser_profile_dir, f"token_{t1_id}")
+                self.assertEqual(t2.browser_profile_dir, "profiles/alice")
+
+                with self.assertRaises(ValueError):
+                    await db.add_token(
+                        Token(
+                            st="frontend-3",
+                            at="at-3",
+                            email="three@example.com",
+                            google_cookies="SID=3",
+                            browser_profile_dir="PROFILES/ALICE",
+                        )
+                    )
+                with self.assertRaises(ValueError):
+                    await db.update_token(t1_id, browser_profile_dir="profiles/alice")
+            finally:
+                await db.close()
+
+    async def test_warmup_skips_tokens_in_active_profile_login_lease(self):
+        with tempfile.TemporaryDirectory() as tmp_root:
+            root = Path(tmp_root)
+            db_stub = types.SimpleNamespace(
+                get_active_tokens=AsyncMock(
+                    return_value=[
+                        Token(
+                            id=1,
+                            st="frontend-1",
+                            email="a@example.com",
+                            google_cookies="SID=1",
+                            browser_profile_dir="profiles/alice",
+                            captcha_proxy_url="http://127.0.0.1:8080",
+                        ),
+                        Token(
+                            id=2,
+                            st="frontend-2",
+                            email="b@example.com",
+                            google_cookies="SID=2",
+                            browser_profile_dir="token_2",
+                        ),
+                    ]
+                )
+            )
+            svc = BrowserCaptchaService(db=db_stub)
+            svc._browser_count = 2
+            svc.base_user_data_dir = str(root)
+            alice_dir = root / "profiles" / "alice"
+            acquire_profile_login_lease(alice_dir, "sess-busy", token_id=1)
+            try:
+                specs = await svc._get_warmup_token_specs()
+                self.assertEqual(specs, [(2, None)])
+            finally:
+                release_profile_login_lease(alice_dir, "sess-busy", token_id=1)
+
+    async def test_admin_browser_profile_list_and_login_start_binding(self):
+        from src.api import admin as admin_api
+        from fastapi import HTTPException
+
+        with tempfile.TemporaryDirectory() as tmp_root:
+            root = Path(tmp_root)
+            tok1 = Token(
+                id=1,
+                st="frontend-1",
+                email="owner@example.com",
+                google_cookies="SID=1",
+                browser_profile_dir="profiles/alice",
+                captcha_proxy_url="http://127.0.0.1:9000",
+                is_active=True,
+            )
+            tok2 = Token(
+                id=2,
+                st="frontend-2",
+                email="second@example.com",
+                google_cookies="SID=2",
+                browser_profile_dir="token_2",
+                is_active=True,
+            )
+            fake_tm = types.SimpleNamespace(
+                get_all_tokens=AsyncMock(return_value=[tok1, tok2]),
+                get_token=AsyncMock(side_effect=lambda tid: {1: tok1, 2: tok2}.get(tid)),
+            )
+            fake_db = types.SimpleNamespace(get_captcha_config=AsyncMock(return_value=None))
+            captured_calls = []
+
+            class FakeMgr:
+                async def start_session(self, **kwargs):
+                    captured_calls.append(kwargs)
+                    return types.SimpleNamespace(
+                        to_dict=lambda: {
+                            "session_id": "s-1",
+                            "status": "starting",
+                            "mode": kwargs["mode"],
+                            "headless": True,
+                            "token_id": kwargs["token_id"],
+                            "browser_profile_dir": kwargs["browser_profile_dir"] or "",
+                            "clean_login": kwargs["clean_login"],
+                            "reused_existing_profile": False,
+                            "message": "ok",
+                            "error": None,
+                            "page_url": "",
+                            "result": None,
+                        }
+                    )
+
+            with (
+                patch.object(admin_api, "token_manager", fake_tm),
+                patch.object(admin_api, "db", fake_db),
+                patch.object(
+                    CamoufoxLoginManager, "get_instance", return_value=FakeMgr()
+                ),
+            ):
+                res = await admin_api.start_browser_login(
+                    admin_api.BrowserLoginStartRequest(
+                        mode="liveview",
+                        browser_profile_dir="alice",
+                        clean_login=True,
+                    ),
+                    _admin_token="ok",
+                )
+                self.assertEqual(res["token_id"], 1)
+                self.assertEqual(res["browser_profile_dir"], "profiles/alice")
+                self.assertTrue(captured_calls[-1]["clean_login"])
+                self.assertEqual(captured_calls[-1]["proxy_url"], "http://127.0.0.1:9000")
+
+                with self.assertRaises(HTTPException) as ctx:
+                    await admin_api.start_browser_login(
+                        admin_api.BrowserLoginStartRequest(
+                            token_id=2,
+                            browser_profile_dir="profiles/alice",
+                        ),
+                        _admin_token="ok",
+                    )
+                self.assertEqual(ctx.exception.status_code, 400)
+
 
 if __name__ == "__main__":
     unittest.main()

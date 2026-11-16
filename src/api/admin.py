@@ -265,6 +265,7 @@ class AddTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_profile_dir: Optional[str] = None
     image_enabled: bool = True
     video_enabled: bool = True
     image_concurrency: int = -1
@@ -298,6 +299,7 @@ class UpdateTokenRequest(BaseModel):
     remark: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
     extension_route_key: Optional[str] = None
+    browser_profile_dir: Optional[str] = None
     image_enabled: Optional[bool] = None
     video_enabled: Optional[bool] = None
     image_concurrency: Optional[int] = None
@@ -733,13 +735,61 @@ async def change_password(
 # ========== Token Management ==========
 
 
+@router.get("/api/tokens/browser-profiles")
+async def list_browser_profiles(_admin_token: str = Depends(verify_admin_token)):
+    """列出所有 Camoufox 持久化浏览器资料启动目录及其账号绑定关系。"""
+    from ..services.camoufox_bidi import (
+        list_browser_profile_dirs,
+        resolve_account_profile_dir,
+    )
+
+    root_dir = Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
+    disk_entries = {
+        entry["profile_dir"]: dict(entry)
+        for entry in list_browser_profile_dirs(root_dir)
+    }
+    if token_manager:
+        for tok in await token_manager.get_all_tokens():
+            _, canonical = resolve_account_profile_dir(
+                root_dir,
+                token_id=tok.id,
+                profile_dir_name=getattr(tok, "browser_profile_dir", None),
+            )
+            item = disk_entries.setdefault(
+                canonical,
+                {
+                    "profile_dir": canonical,
+                    "has_firefox_profile": False,
+                    "has_cookies_db": False,
+                    "has_fingerprint": False,
+                    "has_storage_state": False,
+                    "active_login": False,
+                    "updated_at": None,
+                },
+            )
+            item["bound_token_id"] = tok.id
+            item["bound_email"] = tok.email or tok.login_account or ""
+            item["is_active"] = bool(tok.is_active)
+    result = sorted(
+        disk_entries.values(),
+        key=lambda e: (0 if e.get("bound_token_id") else 1, str(e.get("profile_dir") or "")),
+    )
+    return {"success": True, "profiles": result}
+
+
 @router.get("/api/tokens")
 async def get_tokens(token: str = Depends(verify_admin_token)):
     """Get all tokens with statistics"""
+    from ..services.camoufox_bidi import (
+        get_profile_login_holder,
+        is_token_in_login_session,
+        resolve_account_profile_dir,
+    )
+
+    root_dir = Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
     token_rows = await db.get_all_tokens_with_stats()
     to_iso = lambda value: value.isoformat() if hasattr(value, "isoformat") else value
     now = datetime.now(timezone.utc)
-
     def normalize_dt(value):
         if not value:
             return None
@@ -751,6 +801,25 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         if getattr(value, "tzinfo", None) is None:
             return value.replace(tzinfo=timezone.utc)
         return value.astimezone(timezone.utc)
+    def build_profile_meta(row_obj):
+        tid = row_obj.get("id")
+        try:
+            acc_dir, canonical = resolve_account_profile_dir(
+                root_dir,
+                token_id=tid,
+                profile_dir_name=row_obj.get("browser_profile_dir"),
+            )
+        except Exception:
+            canonical = f"token_{tid}" if tid else ""
+            acc_dir = root_dir / canonical if canonical else root_dir
+        return {
+            "browser_profile_dir": canonical,
+            "browser_profile_exists": bool(canonical and (acc_dir / "firefox-profile").is_dir()),
+            "browser_login_active": bool(
+                is_token_in_login_session(tid)
+                or (canonical and get_profile_login_holder(acc_dir))
+            ),
+        }
 
     return [
         {
@@ -787,6 +856,7 @@ async def get_tokens(token: str = Depends(verify_admin_token)):
         "current_project_name": row.get("current_project_name"),  # 🆕 项目名称
         "captcha_proxy_url": row.get("captcha_proxy_url") or "",
         "extension_route_key": row.get("extension_route_key") or "",
+        **build_profile_meta(row),
         "protocol_mode": row.get("protocol_mode") or "session",
         "google_cookies": row.get("google_cookies") or "",
         "login_account": row.get("login_account") or "",
@@ -834,6 +904,7 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
             extension_route_key=request.extension_route_key.strip()
             if request.extension_route_key is not None
             else None,
+            browser_profile_dir=request.browser_profile_dir,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -864,6 +935,7 @@ async def add_token(request: AddTokenRequest, token: str = Depends(verify_admin_
                 "credits": new_token.credits,
                 "project_id": new_token.current_project_id,
                 "project_name": new_token.current_project_name,
+                "browser_profile_dir": new_token.browser_profile_dir or f"token_{new_token.id}",
             },
         }
     except ValueError as e:
@@ -917,6 +989,7 @@ async def update_token(
             extension_route_key=request.extension_route_key.strip()
             if request.extension_route_key is not None
             else None,
+            browser_profile_dir=request.browser_profile_dir,
             image_enabled=request.image_enabled,
             video_enabled=request.video_enabled,
             image_concurrency=request.image_concurrency,
@@ -937,6 +1010,18 @@ async def update_token(
             await token_manager.mark_cookie_validated(
                 token_id, request.login_account
             )
+
+        if request.browser_profile_dir is not None and existing:
+            old_dir = str(getattr(existing, "browser_profile_dir", "") or "").strip()
+            new_dir = str(request.browser_profile_dir or "").strip()
+            if old_dir != new_dir:
+                mod = sys.modules.get("src.services.browser_captcha")
+                svc = getattr(mod, "BrowserCaptchaService", None) if mod else None
+                svc_inst = getattr(svc, "_instance", None) if svc else None
+                if svc_inst is not None and hasattr(svc_inst, "release_token_browsers"):
+                    await svc_inst.release_token_browsers(
+                        token_id, reason="browser_profile_dir_updated"
+                    )
 
         # 热更新并发限制，确保管理台修改立即生效
         if concurrency_manager:
@@ -1221,6 +1306,8 @@ async def import_tokens(
 class BrowserLoginStartRequest(BaseModel):
     mode: Literal["auto", "window", "liveview"] = "auto"
     token_id: Optional[int] = None
+    browser_profile_dir: Optional[str] = None
+    clean_login: bool = False
     auto_save_token: bool = True
     proxy_url: Optional[str] = None
     captcha_proxy_url: Optional[str] = None
@@ -1228,7 +1315,6 @@ class BrowserLoginStartRequest(BaseModel):
     project_id: Optional[str] = None
     project_name: Optional[str] = None
     timeout_seconds: int = 300
-
 
 async def _resolve_browser_login_proxy(
     explicit_proxy: Optional[str], token_id: Optional[int]
@@ -1263,13 +1349,60 @@ async def _resolve_browser_login_proxy(
 async def start_browser_login(
     request: BrowserLoginStartRequest, _admin_token: str = Depends(verify_admin_token)
 ):
-    """启动隔离的 Camoufox 浏览器进行 Google Flow 登录，登录完成后自动导出 Cookie、StorageState 与启动缓存。"""
-    from ..services.camoufox_bidi import CamoufoxLoginManager, CamoufoxLoginSession
-
-    effective_proxy = await _resolve_browser_login_proxy(
-        request.captcha_proxy_url or request.proxy_url, request.token_id
+    """启动绑定固定资料目录的 Camoufox 浏览器进行 Google Flow 登录，复用历史浏览器资料并自动同步 Cookie 与缓存。"""
+    from ..services.camoufox_bidi import (
+        CamoufoxLoginManager,
+        CamoufoxLoginSession,
+        normalize_browser_profile_dir,
+        persist_account_login_artifacts,
+        resolve_account_profile_dir,
     )
 
+    effective_token_id = request.token_id
+    try:
+        requested_profile_dir = normalize_browser_profile_dir(request.browser_profile_dir)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    effective_profile_dir = requested_profile_dir
+    if token_manager:
+        all_tokens = await token_manager.get_all_tokens()
+        if effective_token_id:
+            target_tok = await token_manager.get_token(effective_token_id)
+            if target_tok is None:
+                raise HTTPException(status_code=404, detail=f"账号不存在: {effective_token_id}")
+            if effective_profile_dir:
+                for item in all_tokens:
+                    if item.id != effective_token_id:
+                        _, item_profile = resolve_account_profile_dir(
+                            Path(__file__).resolve().parent.parent.parent / "browser_data_rt",
+                            token_id=item.id,
+                            profile_dir_name=getattr(item, "browser_profile_dir", None),
+                        )
+                        if item_profile.lower() == effective_profile_dir.lower():
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"浏览器资料目录已被账号 {item.email or item.id} 绑定: {effective_profile_dir}",
+                            )
+            else:
+                effective_profile_dir = (
+                    str(getattr(target_tok, "browser_profile_dir", "") or "").strip()
+                    or f"token_{target_tok.id}"
+                )
+        elif effective_profile_dir:
+            for item in all_tokens:
+                _, item_profile = resolve_account_profile_dir(
+                    Path(__file__).resolve().parent.parent.parent / "browser_data_rt",
+                    token_id=item.id,
+                    profile_dir_name=getattr(item, "browser_profile_dir", None),
+                )
+                if item_profile.lower() == effective_profile_dir.lower():
+                    effective_token_id = item.id
+                    break
+
+    effective_proxy = await _resolve_browser_login_proxy(
+        request.captcha_proxy_url or request.proxy_url, effective_token_id
+    )
     async def _on_login_complete(
         sess: CamoufoxLoginSession, exported: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -1305,19 +1438,40 @@ async def start_browser_login(
         st_val = f"frontend-{cookie_hash[:32]}"
 
         if target_token is not None:
-            from ..services.camoufox_bidi import persist_account_login_artifacts
+            bound_profile_hint = (
+                sess.browser_profile_dir
+                if (sess._is_explicit_profile_dir and sess.browser_profile_dir)
+                else (
+                    str(getattr(target_token, "browser_profile_dir", "") or "").strip()
+                    or f"token_{target_token.id}"
+                )
+            )
+            target_dir, bound_profile_dir = resolve_account_profile_dir(
+                sess.user_data_root,
+                token_id=target_token.id,
+                profile_dir_name=bound_profile_hint,
+            )
 
             mod = sys.modules.get("src.services.browser_captcha")
             svc = getattr(mod, "BrowserCaptchaService", None) if mod else None
             svc_inst = getattr(svc, "_instance", None) if svc else None
-            if svc_inst is not None and hasattr(svc_inst, "release_token_browsers"):
-                await svc_inst.release_token_browsers(
-                    target_token.id, reason="browser_relogin_updated"
-                )
-            if sess._temp_account_dir and sess._temp_account_dir.exists():
+            if svc_inst is not None:
+                if hasattr(svc_inst, "release_token_browsers"):
+                    await svc_inst.release_token_browsers(
+                        target_token.id, reason="browser_relogin_updated"
+                    )
+                if hasattr(svc_inst, "release_profile_browsers"):
+                    await svc_inst.release_profile_browsers(
+                        target_dir, reason="browser_relogin_updated"
+                    )
+            if (
+                sess._temp_account_dir
+                and sess._temp_account_dir.exists()
+                and sess._temp_account_dir.resolve() != target_dir.resolve()
+            ):
                 persist_account_login_artifacts(
                     sess._temp_account_dir,
-                    sess.user_data_root / f"token_{target_token.id}",
+                    target_dir,
                 )
             at_val = "flow-frontend-cookie"
             at_expires = datetime.now() + timedelta(minutes=55)
@@ -1340,6 +1494,7 @@ async def start_browser_login(
                     if request.proxy_url is not None
                     else target_token.proxy_url
                 ),
+                browser_profile_dir=bound_profile_dir,
                 protocol_mode="protocol",
                 google_cookies=google_cookies,
                 login_account=email or target_token.login_account,
@@ -1370,6 +1525,7 @@ async def start_browser_login(
                 "project_id": (
                     refreshed.current_project_id if refreshed else detected_project_id
                 ),
+                "browser_profile_dir": bound_profile_dir,
             }
 
         new_tok = await token_manager.add_token(
@@ -1383,6 +1539,7 @@ async def start_browser_login(
                 else None
             ),
             proxy_url=request.proxy_url.strip() if request.proxy_url else None,
+            browser_profile_dir=sess.browser_profile_dir or None,
             protocol_mode="protocol",
             google_cookies=google_cookies,
             login_account=email or None,
@@ -1402,13 +1559,16 @@ async def start_browser_login(
             "email": new_tok.email,
             "credits": new_tok.credits,
             "project_id": new_tok.current_project_id,
+            "browser_profile_dir": new_tok.browser_profile_dir or f"token_{new_tok.id}",
         }
 
     manager = CamoufoxLoginManager.get_instance()
     session = await manager.start_session(
         mode=request.mode,
         proxy_url=effective_proxy,
-        token_id=request.token_id,
+        token_id=effective_token_id,
+        browser_profile_dir=effective_profile_dir,
+        clean_login=request.clean_login,
         auto_save_token=request.auto_save_token,
         remark=request.remark,
         project_id=request.project_id,
