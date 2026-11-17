@@ -175,6 +175,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"Browser profile prune error: {e}")
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
+    token_manager.start_protocol_refresher()
 
     print("Database initialized")
     print(f"Total tokens: {len(tokens)}")

@@ -17,7 +17,7 @@ import base64
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
@@ -702,12 +702,22 @@ class CamoufoxWorker:
 
         if update_db and bound_id is not None and self.db is not None:
             try:
+                now_utc = datetime.now(timezone.utc)
+                interval_minutes = 30
+                if hasattr(self.db, "get_token"):
+                    tok_snapshot = await self.db.get_token(bound_id)
+                    if tok_snapshot and getattr(tok_snapshot, "refresh_interval_minutes", None):
+                        try:
+                            interval_minutes = max(1, int(tok_snapshot.refresh_interval_minutes))
+                        except Exception:
+                            interval_minutes = 30
                 new_st = "frontend-" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
                 await self.db.update_token(
                     bound_id,
                     google_cookies=serialized,
                     st=new_st,
-                    last_st_refresh_at=datetime.now(timezone.utc),
+                    at_expires=now_utc + timedelta(minutes=max(55, interval_minutes + 15)),
+                    last_st_refresh_at=now_utc,
                     last_st_refresh_result="success",
                 )
             except Exception as exc:

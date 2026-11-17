@@ -1068,14 +1068,34 @@ class TokenManager:
             "st": session_token,
         }
 
+    def _compute_cookie_session_expiry(
+        self,
+        token: Optional[Token] = None,
+        parsed_expires: Optional[datetime] = None,
+    ) -> datetime:
+        now = datetime.now(timezone.utc)
+        interval = self._normalize_refresh_interval(
+            getattr(token, "refresh_interval_minutes", None)
+            if token is not None
+            else None
+        )
+        min_expiry = now + timedelta(minutes=max(55, interval + 15))
+        aware = self._as_utc(parsed_expires) if parsed_expires is not None else None
+        if aware is not None and aware > min_expiry:
+            return aware
+        return min_expiry
+
     async def mark_cookie_validated(
         self, token_id: int, email: Optional[str] = None
     ) -> None:
         """Record that the current Cookie snapshot was just validated upstream."""
+        token = await self.db.get_token(token_id)
         updates: Dict[str, Any] = {
             "last_st_refresh_at": datetime.now(timezone.utc),
             "last_st_refresh_result": "success",
         }
+        if token is None or self._is_frontend_session_at(token) or not str(token.at or "").strip():
+            updates["at_expires"] = self._compute_cookie_session_expiry(token)
         normalized_email = str(email or "").strip().lower()
         if normalized_email:
             updates["email"] = normalized_email
@@ -1113,17 +1133,25 @@ class TokenManager:
 
         new_st = "frontend-" + hashlib.sha256(cookies.encode("utf-8")).hexdigest()[:32]
         candidate = token.model_copy(update={"google_cookies": cookies, "st": new_st})
-        session = await self._st_to_at_for_token(candidate, new_st)
+        session = await asyncio.wait_for(
+            self._st_to_at_for_token(candidate, new_st), timeout=45.0
+        )
         new_at = str(session.get("access_token") or "").strip()
         if not new_at:
             raise RuntimeError("Flow 登录态验证响应缺少 access_token")
         cookies = session.get("google_cookies") or cookies
         new_st = "frontend-" + hashlib.sha256(cookies.encode("utf-8")).hexdigest()[:32]
+        parsed_expires = self._parse_at_expires(session.get("expires"))
+        effective_expires = (
+            self._compute_cookie_session_expiry(token, parsed_expires)
+            if new_at == str(getattr(self.flow_client, "FRONTEND_ACCESS_TOKEN", "") or "").strip()
+            else parsed_expires
+        )
         updates = {
             "google_cookies": cookies,
             "st": new_st,
             "at": new_at,
-            "at_expires": self._parse_at_expires(session.get("expires")),
+            "at_expires": effective_expires,
             "last_st_refresh_at": datetime.now(timezone.utc),
             "last_st_refresh_result": "success",
         }
@@ -1186,8 +1214,16 @@ class TokenManager:
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 协议刷新失败 - {exc}")
             return None
 
-    async def _try_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
-        """Refresh full current-Flow Cookies, with an account-bound browser fallback."""
+    async def _try_refresh_st(
+        self,
+        token_id: int,
+        token: Token,
+        *,
+        prefer_http_when_cold: bool = False,
+    ) -> Optional[str]:
+        """Refresh full current-Flow Cookies, avoiding unnecessary Camoufox slot evictions."""
+        camoufox_svc = None
+        use_camoufox = False
         try:
             from .browser_captcha import BrowserCaptchaService as _CamoufoxCaptchaService
             use_camoufox = (
@@ -1199,10 +1235,33 @@ class TokenManager:
                 .lower()
                 == "camoufox"
             )
+            if use_camoufox:
+                camoufox_svc = _CamoufoxCaptchaService._instance
         except Exception:
             use_camoufox = False
 
         if use_camoufox:
+            warm_idle_hit = False
+            if prefer_http_when_cold and camoufox_svc is not None:
+                get_warm = getattr(camoufox_svc, "get_warm_bound_token_ids", None)
+                if callable(get_warm):
+                    try:
+                        warm_ids = get_warm(idle_only=True)
+                        if isinstance(warm_ids, set):
+                            warm_idle_hit = int(token_id) in warm_ids
+                    except Exception:
+                        warm_idle_hit = False
+
+            # Cold/busy background refreshes try fast curl_cffi HTTP first so 9+ accounts
+            # never thrash 3 warm Camoufox browser slots every 30 minutes.
+            if prefer_http_when_cold and not warm_idle_hit:
+                refreshed = await self._try_protocol_refresh_st(token_id, token)
+                if refreshed:
+                    return refreshed
+                latest = await self.db.get_token(token_id)
+                if not latest or latest.google_cookies != token.google_cookies:
+                    return None
+
             try:
                 service = await _CamoufoxCaptchaService.get_instance(self.db)
                 result = await asyncio.wait_for(
@@ -1218,6 +1277,14 @@ class TokenManager:
                 debug_logger.log_warning(
                     f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}"
                 )
+                if (
+                    not (prefer_http_when_cold and not warm_idle_hit)
+                    and "登录已失效" not in error
+                    and "登录态已失效" not in error
+                ):
+                    refreshed = await self._try_protocol_refresh_st(token_id, token)
+                    if refreshed:
+                        return refreshed
                 return None
 
         refreshed = await self._try_protocol_refresh_st(token_id, token)
@@ -1280,7 +1347,7 @@ class TokenManager:
             if not (latest.google_cookies or "").strip():
                 return
             # Cookie and AT metadata are committed together after current RPC validation.
-            if not await self._try_refresh_st(token_id, latest):
+            if not await self._try_refresh_st(token_id, latest, prefer_http_when_cold=True):
                 refreshed_snapshot = await self.db.get_token(token_id)
                 if refreshed_snapshot and (
                     "登录已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
@@ -1314,9 +1381,23 @@ class TokenManager:
                     or 30
                 )
                 interval_minutes = self._normalize_refresh_interval(interval_minutes)
+                last_result = str(token.last_st_refresh_result or "").strip().lower()
+                effective_interval = (
+                    min(interval_minutes, 5)
+                    if last_result not in {"", "success"}
+                    else interval_minutes
+                )
                 last_refresh = self._as_utc(token.last_st_refresh_at)
-                if last_refresh and now - last_refresh < timedelta(
-                    minutes=interval_minutes
+                at_expires_utc = self._as_utc(token.at_expires)
+                is_display_expired = (
+                    at_expires_utc is not None
+                    and at_expires_utc <= now
+                    and last_result in {"", "success"}
+                )
+                if (
+                    not is_display_expired
+                    and last_refresh
+                    and now - last_refresh < timedelta(minutes=effective_interval)
                 ):
                     continue
 
@@ -1327,8 +1408,10 @@ class TokenManager:
                 )
 
     async def _protocol_refresh_loop(self) -> None:
+        first_tick = True
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(5 if first_tick else 60)
+            first_tick = False
             try:
                 await self.run_protocol_refresh_once()
             except asyncio.CancelledError:
