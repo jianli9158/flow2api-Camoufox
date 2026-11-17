@@ -60,6 +60,7 @@ class _FlowClientBase(FlowFrontendMixin):
         self._user_agent_cache = {}
         self._http_sessions: Dict[Tuple[int, str, str, bool], Any] = {}
         self._http_session_locks: Dict[int, asyncio.Lock] = {}
+        self._http_session_last_used: Dict[Tuple[int, str, str, bool], float] = {}
         self._frontend_bootstrap_cache: Dict[str, Tuple[float, Dict[str, str]]] = {}
         self._request_fingerprint_ctx: contextvars.ContextVar[
             Optional[Dict[str, Any]]
@@ -120,8 +121,14 @@ class _FlowClientBase(FlowFrontendMixin):
             str(proxy_url or ""),
             bool(flag),
         )
+        last_used_map = getattr(self, "_http_session_last_used", None)
+        if last_used_map is None:
+            last_used_map = {}
+            self._http_session_last_used = last_used_map
+        now = time.monotonic()
         existing = sessions.get(key)
-        if existing is not None:
+        if existing is not None and (now - last_used_map.get(key, now)) < 300.0:
+            last_used_map[key] = now
             return key, existing
 
         lock = locks.get(loop_id)
@@ -129,24 +136,44 @@ class _FlowClientBase(FlowFrontendMixin):
             lock = asyncio.Lock()
             locks[loop_id] = lock
 
+        stale_sessions: list[Any] = []
         async with lock:
+            now = time.monotonic()
+            for k, sess in list(sessions.items()):
+                if k[0] == loop_id and (now - last_used_map.get(k, now)) >= 300.0:
+                    sessions.pop(k, None)
+                    last_used_map.pop(k, None)
+                    stale_sessions.append(sess)
             existing = sessions.get(key)
             if existing is not None:
-                return key, existing
-            created = AsyncSession(
-                trust_env=False,
-                impersonate=normalized_impersonate,
-            )
-            aenter = getattr(created, "__aenter__", None)
-            if callable(aenter):
-                entered = aenter()
-                if inspect.isawaitable(entered):
-                    entered = await entered
-                if entered is not None:
-                    created = entered
-            sessions[key] = created
-            return key, created
+                last_used_map[key] = now
+                chosen = existing
+            else:
+                if len(sessions) >= 32:
+                    oldest_k = min(
+                        sessions.keys(),
+                        key=lambda item_k: last_used_map.get(item_k, 0.0),
+                    )
+                    stale_sessions.append(sessions.pop(oldest_k))
+                    last_used_map.pop(oldest_k, None)
+                created = AsyncSession(
+                    trust_env=False,
+                    impersonate=normalized_impersonate,
+                )
+                aenter = getattr(created, "__aenter__", None)
+                if callable(aenter):
+                    entered = aenter()
+                    if inspect.isawaitable(entered):
+                        entered = await entered
+                    if entered is not None:
+                        created = entered
+                sessions[key] = created
+                last_used_map[key] = now
+                chosen = created
 
+        for stale in stale_sessions:
+            await self._close_http_session(stale)
+        return key, chosen
     async def _evict_http_session(
         self,
         key: Tuple[int, str, str, bool],
@@ -155,6 +182,8 @@ class _FlowClientBase(FlowFrontendMixin):
         sessions, _ = self._ensure_http_session_pool()
         if sessions.get(key) is session:
             sessions.pop(key, None)
+        if hasattr(self, "_http_session_last_used"):
+            self._http_session_last_used.pop(key, None)
         await self._close_http_session(session)
 
     async def close(self) -> None:
@@ -163,6 +192,8 @@ class _FlowClientBase(FlowFrontendMixin):
         pooled = list(sessions.values())
         sessions.clear()
         locks.clear()
+        if hasattr(self, "_http_session_last_used"):
+            self._http_session_last_used.clear()
         for session in pooled:
             await self._close_http_session(session)
 

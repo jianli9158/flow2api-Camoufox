@@ -27,6 +27,7 @@ from .models import (
 
 class Database:
     """SQLite database manager"""
+    READ_POOL_SIZE = 4
 
     def __init__(self, db_path: str = None):
         if db_path is None:
@@ -42,6 +43,9 @@ class Database:
         )
         self._conn: Optional[aiosqlite.Connection] = None
         self._read_conn: Optional[aiosqlite.Connection] = None
+        self._read_pool: Optional[asyncio.LifoQueue] = None
+        self._read_pool_sem: Optional[asyncio.Semaphore] = None
+        self._read_pool_conns: List[aiosqlite.Connection] = []
         self._conn_loop: Optional[asyncio.AbstractEventLoop] = None
         self._conn_lock: Optional[asyncio.Lock] = None
         self._read_lock: Optional[asyncio.Lock] = None
@@ -113,10 +117,16 @@ class Database:
     async def close(self) -> None:
         """Close persistent SQLite connection(s) if open."""
         conn, read_conn = self._conn, self._read_conn
+        pooled_reads = list(self._read_pool_conns)
         self._conn = None
         self._read_conn = None
+        self._read_pool = None
+        self._read_pool_sem = None
+        self._read_pool_conns = []
         self._conn_loop = None
         self._request_logs_columns_cache = None
+        for rconn in pooled_reads:
+            await self._close_conn_instance(rconn)
         await self._close_conn_instance(read_conn)
         await self._close_conn_instance(conn)
 
@@ -126,24 +136,32 @@ class Database:
 
     @asynccontextmanager
     async def _connect(self, *, write: bool = False):
-        """Provide a persistent event-loop-aware SQLite connection."""
+        """Provide a persistent event-loop-aware SQLite connection (pooled for concurrent WAL reads)."""
         running_loop = asyncio.get_running_loop()
         old_conn = None
         old_read_conn = None
+        old_pool_conns: List[aiosqlite.Connection] = []
         if (
             self._conn_loop is not running_loop
             or self._conn_lock is None
-            or self._read_lock is None
+            or self._read_pool is None
+            or self._read_pool_sem is None
         ):
             old_conn = self._conn
             old_read_conn = self._read_conn
+            old_pool_conns = list(self._read_pool_conns)
             self._conn = None
             self._read_conn = None
+            self._read_pool = asyncio.LifoQueue()
+            self._read_pool_sem = asyncio.Semaphore(self.READ_POOL_SIZE)
+            self._read_pool_conns = []
             self._conn_loop = running_loop
             self._conn_lock = asyncio.Lock()
             self._write_lock = self._conn_lock
             self._read_lock = asyncio.Lock()
 
+        for stale_r in old_pool_conns:
+            await self._close_conn_instance(stale_r)
         if old_read_conn is not None:
             await self._close_conn_instance(old_read_conn)
         if old_conn is not None:
@@ -169,20 +187,37 @@ class Database:
                     raise
             return
 
-        async with self._read_lock:
-            if not self._is_conn_usable(self._read_conn):
-                await self._close_conn_instance(self._read_conn)
-                self._read_conn = await self._open_connection(query_only=True)
-            conn = self._read_conn
+        pool = self._read_pool
+        async with self._read_pool_sem:
+            conn: Optional[aiosqlite.Connection] = None
+            while True:
+                try:
+                    candidate = pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if self._is_conn_usable(candidate):
+                    conn = candidate
+                    break
+                if candidate in self._read_pool_conns:
+                    self._read_pool_conns.remove(candidate)
+                await self._close_conn_instance(candidate)
+
+            if conn is None:
+                conn = await self._open_connection(query_only=True)
+                self._read_pool_conns.append(conn)
             conn.row_factory = aiosqlite.Row
             try:
                 yield conn
             except BaseException:
+                if conn in self._read_pool_conns:
+                    self._read_pool_conns.remove(conn)
                 await self._close_conn_instance(conn)
-                if self._read_conn is conn:
-                    self._read_conn = None
                 raise
-
+            else:
+                if self._conn_loop is running_loop and self._read_pool is pool:
+                    pool.put_nowait(conn)
+                else:
+                    await self._close_conn_instance(conn)
     async def _table_exists(self, db, table_name: str) -> bool:
         """Check if a table exists in the database"""
         cursor = await db.execute(
@@ -1057,6 +1092,13 @@ class Database:
                 await db.execute(
                     "UPDATE tokens SET browser_profile_dir = 'token_' || id "
                     "WHERE COALESCE(TRIM(browser_profile_dir), '') = ''"
+                )
+            except Exception:
+                pass
+            try:
+                await db.execute(
+                    "UPDATE request_logs SET status_code = 499, status_text = 'interrupted' "
+                    "WHERE status_code = 102"
                 )
             except Exception:
                 pass
@@ -2164,7 +2206,29 @@ class Database:
             if db.in_transaction or deleted_total > 0:
                 await db.commit()
 
+        if deleted_total > 0 and not self._is_memory_db:
+            try:
+                await self.run_maintenance_pragmas()
+            except Exception:
+                pass
+
         return deleted_total
+
+    async def run_maintenance_pragmas(self) -> Dict[str, Any]:
+        """Run non-blocking SQLite planner optimization and passive WAL checkpoint."""
+        if self._is_memory_db:
+            return {"checkpointed": False}
+        async with self._connect(write=True) as db:
+            await db.execute("PRAGMA optimize")
+            cursor = await db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            row = await cursor.fetchone()
+            await db.commit()
+            return {
+                "checkpointed": True,
+                "busy": int(row[0]) if row and len(row) > 0 else 0,
+                "log_frames": int(row[1]) if row and len(row) > 1 else 0,
+                "checkpointed_frames": int(row[2]) if row and len(row) > 2 else 0,
+            }
 
     async def clear_all_logs(self):
         """Clear all request logs"""

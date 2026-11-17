@@ -19,6 +19,8 @@ from ..core.logger import debug_logger
 class LoadBalancer:
     """Token load balancer with load-aware selection"""
 
+    WARM_AFFINITY_EPOCH_MULTIPLIER = 6
+
     def __init__(
         self, token_manager, concurrency_manager: Optional[ConcurrencyManager] = None
     ):
@@ -33,6 +35,11 @@ class LoadBalancer:
             "default": None,
         }
         self._rr_lock = asyncio.Lock()
+        self._warm_rr_hits: Dict[str, int] = {
+            "image": 0,
+            "video": 0,
+            "default": 0,
+        }
         self._token_cooldowns: Dict[int, float] = {}
 
     def mark_token_cooldown(
@@ -169,6 +176,30 @@ class LoadBalancer:
             self._round_robin_state[scenario] = selected["token"].id
         return selected
 
+
+    def _get_browser_slot_affinity(self) -> tuple[Set[int], Set[int], bool]:
+        """Return (warm_idle_token_ids, warm_bound_token_ids, has_free_unbound_slot)."""
+        try:
+            if (
+                str(getattr(config, "captcha_method", "") or "").strip().lower()
+                not in {"browser", "camoufox"}
+            ):
+                return set(), set(), True
+            from .browser_captcha import BrowserCaptchaService
+
+            svc = BrowserCaptchaService._instance
+            if svc is None or getattr(svc, "_closed", False):
+                return set(), set(), True
+            get_warm = getattr(svc, "get_warm_bound_token_ids", None)
+            has_unbound = getattr(svc, "has_empty_or_unbound_slot", None)
+            if not callable(get_warm):
+                return set(), set(), True
+            warm_idle = set(get_warm(idle_only=True) or set())
+            warm_bound = set(get_warm(idle_only=False) or set())
+            free_unbound = bool(has_unbound()) if callable(has_unbound) else False
+            return warm_idle, warm_bound, free_unbound
+        except Exception:
+            return set(), set(), True
     async def select_token(
         self,
         for_image_generation: bool = False,
@@ -178,6 +209,7 @@ class LoadBalancer:
         enforce_concurrency_filter: bool = True,
         track_pending: bool = False,
         excluded_token_ids: Optional[Set[int]] = None,
+        prefer_warm_browser: bool = True,
     ) -> Optional[Token]:
         """
         Select a token using load-aware balancing
@@ -259,11 +291,13 @@ class LoadBalancer:
             )
             available_tokens.append(
                 {
-                "token": token,
-                "inflight": inflight,
-                "remaining": remaining,
-                "needs_refresh": self.token_manager.needs_at_refresh(token),
-                "in_cooldown": self.is_token_in_cooldown(token.id),
+                    "token": token,
+                    "inflight": inflight,
+                    "remaining": remaining,
+                    "needs_refresh": self.token_manager.needs_at_refresh(token),
+                    "in_cooldown": self.is_token_in_cooldown(token.id),
+                    "warm_idle": False,
+                    "warm_bound": False,
                     "random": random.random(),
                 }
             )
@@ -279,7 +313,18 @@ class LoadBalancer:
             )
             return None
 
-        # 最低 in-flight 优先；有并发上限时，剩余槽位更多的 token 优先；最后随机打散
+        warm_idle_ids, warm_bound_ids, has_free_unbound_slot = (
+            self._get_browser_slot_affinity()
+            if prefer_warm_browser
+            else (set(), set(), True)
+        )
+        if warm_idle_ids or warm_bound_ids:
+            for item in available_tokens:
+                tid = item["token"].id
+                item["warm_idle"] = tid in warm_idle_ids
+                item["warm_bound"] = tid in warm_bound_ids
+
+        # 最低 in-flight 优先；同负载下优先复用已预热的 Camoufox 热槽位；最后按剩余配额与随机打散
         call_mode = config.call_logic_mode
         if call_mode == "polling":
             scenario = "default"
@@ -291,14 +336,44 @@ class LoadBalancer:
             non_cooled = [item for item in available_tokens if not item["in_cooldown"]]
             cooled = [item for item in available_tokens if item["in_cooldown"]]
             rr_pool = non_cooled or cooled
+            primary_rr_pool = rr_pool
+            if (
+                prefer_warm_browser
+                and warm_bound_ids
+                and not has_free_unbound_slot
+            ):
+                warm_rr = [
+                    item
+                    for item in rr_pool
+                    if item["warm_idle"]
+                    or (item["warm_bound"] and item["inflight"] == 0)
+                ]
+                cold_rr = [item for item in rr_pool if item not in warm_rr]
+                if warm_rr and cold_rr:
+                    epoch_limit = max(
+                        self.WARM_AFFINITY_EPOCH_MULTIPLIER,
+                        len(warm_rr) * self.WARM_AFFINITY_EPOCH_MULTIPLIER,
+                    )
+                    hits = int(self._warm_rr_hits.get(scenario, 0))
+                    if hits < epoch_limit:
+                        self._warm_rr_hits[scenario] = hits + 1
+                        primary_rr_pool = warm_rr
+                    else:
+                        self._warm_rr_hits[scenario] = 0
+                        primary_rr_pool = cold_rr
+
             ordered_candidates = []
-            first_candidate = await self._select_round_robin(rr_pool, scenario)
+            first_candidate = await self._select_round_robin(primary_rr_pool, scenario)
             if first_candidate is not None:
                 ordered_candidates.append(first_candidate)
                 ordered_candidates.extend(
                     item
                     for item in sorted(
-                        rr_pool, key=lambda item: item["token"].id or 0
+                        rr_pool,
+                        key=lambda item: (
+                            0 if item["warm_idle"] else (1 if item["warm_bound"] else 2),
+                            item["token"].id or 0,
+                        ),
                     )
                     if item["token"].id != first_candidate["token"].id
                 )
@@ -313,6 +388,7 @@ class LoadBalancer:
                     1 if item["in_cooldown"] else 0,
                     1 if item["needs_refresh"] else 0,
                     item["inflight"],
+                    0 if item["warm_idle"] else (1 if item["warm_bound"] else 2),
                     0 if item["remaining"] is None else 1,
                     -(item["remaining"] or 0),
                     item["random"],

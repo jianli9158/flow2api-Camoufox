@@ -340,6 +340,37 @@ class BrowserCaptchaService:
         except (TypeError, ValueError):
             return None
 
+
+    def get_warm_bound_token_ids(self, *, idle_only: bool = False) -> set[int]:
+        """Return token IDs currently bound to warmed, healthy Camoufox browser slots."""
+        if self._closed:
+            return set()
+        warm_ids: set[int] = set()
+        for slot_id in range(self._browser_count):
+            state = self._slot_recovery.get(slot_id)
+            if state and (state.phase not in {"ready", "probe"} or state.needs_recycle):
+                continue
+            if not self._has_warmed_browser_for_allocation(slot_id):
+                continue
+            if idle_only and self._is_slot_busy_for_allocation(slot_id):
+                continue
+            bound_id = self._slot_bound_token_id(slot_id)
+            if bound_id is not None:
+                warm_ids.add(bound_id)
+        return warm_ids
+
+    def has_empty_or_unbound_slot(self) -> bool:
+        """Return True if at least one non-busy slot is empty or unbound (no eviction needed)."""
+        if self._closed:
+            return False
+        for slot_id in range(self._browser_count):
+            if self._is_slot_busy_for_allocation(slot_id):
+                continue
+            if self._browsers.get(slot_id) is None:
+                return True
+            if self._slot_bound_token_id(slot_id) is None:
+                return True
+        return False
     def _reserve_slot_locked(self, slot_id: int):
         self._slot_reservations[slot_id] = self._slot_reservations.get(slot_id, 0) + 1
 

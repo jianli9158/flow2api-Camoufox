@@ -54,6 +54,53 @@ captcha_runtime_prepare_tasks: Dict[str, asyncio.Task] = {}
 active_admin_tokens = set()
 revoked_admin_tokens: Dict[str, float] = {}
 ADMIN_SESSION_COOKIE_NAME = "admin_session"
+
+_LOGIN_RATE_WINDOW_SECONDS = 300.0
+_LOGIN_MAX_FAILURES = 8
+_login_failure_tracker: Dict[str, List[float]] = {}
+
+
+def _resolve_client_ip(raw_request: Optional[Request]) -> str:
+    if raw_request is None:
+        return "local"
+    xff = (raw_request.headers.get("x-forwarded-for") or "").split(",")[0].strip()
+    if xff:
+        return xff
+    client = getattr(raw_request, "client", None)
+    return str(getattr(client, "host", "") or "unknown")
+
+
+def _check_login_rate_limit(client_ip: str, now: Optional[float] = None) -> None:
+    ts = time.monotonic() if now is None else now
+    cutoff = ts - _LOGIN_RATE_WINDOW_SECONDS
+    if len(_login_failure_tracker) > 4096:
+        stale_ips = [
+            ip
+            for ip, hits in list(_login_failure_tracker.items())
+            if not hits or hits[-1] <= cutoff
+        ]
+        for ip in stale_ips:
+            _login_failure_tracker.pop(ip, None)
+    recent = [t for t in _login_failure_tracker.get(client_ip, []) if t > cutoff]
+    if recent:
+        _login_failure_tracker[client_ip] = recent
+    else:
+        _login_failure_tracker.pop(client_ip, None)
+    if len(recent) >= _LOGIN_MAX_FAILURES:
+        retry_after = max(1, int(_LOGIN_RATE_WINDOW_SECONDS - (ts - recent[0])))
+        raise HTTPException(
+            status_code=429,
+            detail="登录尝试过于频繁，请稍后再试",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+
+def _record_login_failure(client_ip: str, now: Optional[float] = None) -> None:
+    ts = time.monotonic() if now is None else now
+    cutoff = ts - _LOGIN_RATE_WINDOW_SECONDS
+    recent = [t for t in _login_failure_tracker.get(client_ip, []) if t > cutoff]
+    recent.append(ts)
+    _login_failure_tracker[client_ip] = recent
 ADMIN_SESSION_TTL_SECONDS = 86400
 _ADMIN_SESSION_SECRET_PATH = (
     Path(__file__).resolve().parent.parent.parent / "data" / ".session_secret"
@@ -567,6 +614,27 @@ def _revoke_admin_session_token(token: Optional[str]) -> None:
     active_admin_tokens.discard(normalized)
 
 
+def _is_same_origin_cookie_request(request: Request) -> bool:
+    """Reject cross-origin state-mutating requests that rely solely on ambient session cookies."""
+    method = (request.method or "GET").upper()
+    if method in {"GET", "HEAD", "OPTIONS"}:
+        return True
+    origin = (request.headers.get("origin") or "").strip()
+    if not origin:
+        return True
+    if origin.lower() == "null":
+        return False
+    parsed_origin = urlparse(origin)
+    origin_host = (parsed_origin.netloc or "").strip().lower()
+    expected_host = (
+        (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        or (request.headers.get("host") or "").strip()
+    ).lower()
+    if not expected_host:
+        return True
+    return origin_host == expected_host
+
+
 async def verify_admin_token(request: Request, authorization: str = Header(None)):
     """Verify admin session token (NOT API key)"""
     header_token = ""
@@ -579,13 +647,17 @@ async def verify_admin_token(request: Request, authorization: str = Header(None)
         return header_token
 
     if cookie_token and is_admin_session_token_valid(cookie_token):
+        if not _is_same_origin_cookie_request(request):
+            raise HTTPException(
+                status_code=403,
+                detail="Cross-origin cookie authentication rejected",
+            )
         return cookie_token
 
     if header_token or cookie_token:
         raise HTTPException(status_code=401, detail="Invalid or expired admin token")
 
     raise HTTPException(status_code=401, detail="Missing authorization")
-
 
 def get_admin_token_from_cookie(request: Request) -> Optional[str]:
     token = str(request.cookies.get(ADMIN_SESSION_COOKIE_NAME) or "").strip()
@@ -628,8 +700,15 @@ def is_admin_session_token_valid(token: Optional[str]) -> bool:
 
 
 @router.post("/api/admin/login")
-async def admin_login(request: LoginRequest, response: Response):
+async def admin_login(
+    request: LoginRequest,
+    response: Response,
+    raw_request: Request = None,
+):
     """Admin login - returns session token (NOT API key)"""
+    client_ip = _resolve_client_ip(raw_request)
+    _check_login_rate_limit(client_ip)
+
     admin_config = await db.get_admin_config() if db else None
     stored_username = admin_config.username if admin_config else config.admin_username
     stored_password = (
@@ -652,14 +731,24 @@ async def admin_login(request: LoginRequest, response: Response):
         stored_password,
     )
     if not (username_ok and password_ok):
+        _record_login_failure(client_ip)
         raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    _login_failure_tracker.pop(client_ip, None)
 
     # Generate HMAC-SHA256 signed session token with 24h TTL
     session_token = _create_signed_admin_token()
 
-    # Store in active tokens for backward compatibility
+    # Prune expired legacy/cached tokens before inserting
+    if len(active_admin_tokens) >= 512:
+        now_ts = time.time()
+        expired_cached = [
+            t for t in list(active_admin_tokens)
+            if _extract_admin_token_expiry(t, now_ts + 1) <= now_ts
+        ]
+        for t in expired_cached:
+            active_admin_tokens.discard(t)
     active_admin_tokens.add(session_token)
-
     response.set_cookie(
         key=ADMIN_SESSION_COOKIE_NAME,
         value=session_token,
@@ -1469,7 +1558,8 @@ async def start_browser_login(
                 and sess._temp_account_dir.exists()
                 and sess._temp_account_dir.resolve() != target_dir.resolve()
             ):
-                persist_account_login_artifacts(
+                await asyncio.to_thread(
+                    persist_account_login_artifacts,
                     sess._temp_account_dir,
                     target_dir,
                 )

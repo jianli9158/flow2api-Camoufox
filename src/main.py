@@ -137,8 +137,21 @@ async def lifespan(app: FastAPI):
     # Initialize concurrency manager
     await concurrency_manager.initialize(tokens)
     # Start 429 auto-unban task
+    from .services.camoufox_bidi import prune_camoufox_profile_bloat
+
     async def auto_unban_task():
-        """定时任务：每小时检查并解禁429被禁用的token，并清理过期请求日志"""
+        """定时任务：每小时检查并解禁429被禁用的token、清理过期日志并裁剪空闲浏览器缓存"""
+        try:
+            await asyncio.to_thread(
+                prune_camoufox_profile_bloat, browser_service.base_user_data_dir
+            )
+        except Exception as e:
+            print(f"Initial browser profile prune warning: {e}")
+        try:
+            if hasattr(db, "run_maintenance_pragmas"):
+                await db.run_maintenance_pragmas()
+        except Exception as e:
+            print(f"Initial DB maintenance warning: {e}")
         while True:
             await asyncio.sleep(3600)  # 每小时执行一次
             try:
@@ -150,8 +163,18 @@ async def lifespan(app: FastAPI):
                     await db.cleanup_old_request_logs()
             except Exception as e:
                 print(f"Request log cleanup error: {e}")
+            try:
+                if hasattr(db, "run_maintenance_pragmas"):
+                    await db.run_maintenance_pragmas()
+            except Exception as e:
+                print(f"DB maintenance error: {e}")
+            try:
+                await asyncio.to_thread(
+                    prune_camoufox_profile_bloat, browser_service.base_user_data_dir
+                )
+            except Exception as e:
+                print(f"Browser profile prune error: {e}")
     auto_unban_task_handle = asyncio.create_task(auto_unban_task())
-    token_manager.start_protocol_refresher()
 
     print("Database initialized")
     print(f"Total tokens: {len(tokens)}")

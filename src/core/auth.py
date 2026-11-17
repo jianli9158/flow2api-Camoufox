@@ -1,5 +1,6 @@
 """Authentication module"""
 
+import asyncio
 import hmac
 import bcrypt
 from typing import Optional
@@ -21,6 +22,21 @@ def verify_admin_password(plain_password: str, stored_password: str) -> bool:
         plain_password.encode("utf-8"), stored_password.encode("utf-8")
     )
 
+
+
+async def verify_admin_password_async(
+    plain_password: str, stored_password: str
+) -> bool:
+    """Verify admin password asynchronously, offloading bcrypt CPU work to a thread."""
+    if plain_password is None or stored_password is None:
+        return False
+    if stored_password.startswith(("$2b$", "$2a$", "$2y$")):
+        return await asyncio.to_thread(
+            AuthManager.verify_password, plain_password, stored_password
+        )
+    return hmac.compare_digest(
+        plain_password.encode("utf-8"), stored_password.encode("utf-8")
+    )
 
 class AuthManager:
     """Authentication manager"""
@@ -49,6 +65,17 @@ class AuthManager:
             username.encode("utf-8"), config.admin_username.encode("utf-8")
         )
         password_ok = verify_admin_password(password, config.admin_password)
+        return username_ok and password_ok
+
+    @staticmethod
+    async def verify_admin_async(username: str, password: str) -> bool:
+        """Verify admin credentials asynchronously without blocking the event loop."""
+        if username is None or config.admin_username is None:
+            return False
+        username_ok = hmac.compare_digest(
+            username.encode("utf-8"), config.admin_username.encode("utf-8")
+        )
+        password_ok = await verify_admin_password_async(password, config.admin_password)
         return username_ok and password_ok
 
     @staticmethod

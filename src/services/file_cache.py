@@ -7,8 +7,9 @@ import hashlib
 import time
 import uuid
 import mimetypes
+import inspect
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.config import config
@@ -42,6 +43,110 @@ class FileCache:
         self._download_locks: Dict[str, asyncio.Lock] = {}
         self._download_lock_users: Dict[str, int] = {}
 
+        self._http_sessions: Dict[Tuple[int, str, str, bool], Tuple[float, Any]] = {}
+        self._http_session_locks: Dict[int, asyncio.Lock] = {}
+
+    async def _close_http_session(self, session: Any) -> None:
+        if session is None:
+            return
+        aexit = getattr(session, "__aexit__", None)
+        if callable(aexit):
+            try:
+                res = aexit(None, None, None)
+                if inspect.isawaitable(res):
+                    await res
+                return
+            except BaseException:
+                pass
+        close_fn = getattr(session, "close", None)
+        if callable(close_fn):
+            try:
+                res = close_fn()
+                if inspect.isawaitable(res):
+                    await res
+            except BaseException:
+                pass
+
+    async def get_http_session(
+        self,
+        *,
+        impersonate: str = "chrome120",
+        proxy_url: Optional[str] = None,
+        verify: bool = True,
+    ) -> Tuple[Tuple[int, str, str, bool], Any]:
+        """Borrow a pooled stateless AsyncSession keyed by (loop, impersonate, proxy, verify)."""
+        loop_id = id(asyncio.get_running_loop())
+        key: Tuple[int, str, str, bool] = (
+            loop_id,
+            str(impersonate or "chrome120"),
+            str(proxy_url or ""),
+            bool(verify),
+        )
+        now = time.monotonic()
+        existing = self._http_sessions.get(key)
+        if existing is not None:
+            last_used, session = existing
+            if now - last_used < 300.0:
+                self._http_sessions[key] = (now, session)
+                return key, session
+
+        lock = self._http_session_locks.get(loop_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._http_session_locks[loop_id] = lock
+
+        stale_to_close: list[Any] = []
+        async with lock:
+            now = time.monotonic()
+            for k, (ts, sess) in list(self._http_sessions.items()):
+                if k[0] == loop_id and now - ts >= 300.0:
+                    self._http_sessions.pop(k, None)
+                    stale_to_close.append(sess)
+            existing = self._http_sessions.get(key)
+            if existing is not None:
+                _, session = existing
+                self._http_sessions[key] = (now, session)
+            else:
+                if len(self._http_sessions) >= 24:
+                    oldest_key = min(
+                        self._http_sessions.keys(),
+                        key=lambda item_k: self._http_sessions[item_k][0],
+                    )
+                    _, evicted = self._http_sessions.pop(oldest_key)
+                    stale_to_close.append(evicted)
+                created = AsyncSession(
+                    trust_env=False,
+                    impersonate=str(impersonate or "chrome120"),
+                    verify=bool(verify),
+                )
+                aenter = getattr(created, "__aenter__", None)
+                if callable(aenter):
+                    entered = aenter()
+                    if inspect.isawaitable(entered):
+                        entered = await entered
+                    if entered is not None:
+                        created = entered
+                self._http_sessions[key] = (now, created)
+                session = created
+
+        for old_sess in stale_to_close:
+            await self._close_http_session(old_sess)
+        return key, session
+
+    async def evict_http_session(
+        self, key: Tuple[int, str, str, bool], session: Any
+    ) -> None:
+        entry = self._http_sessions.get(key)
+        if entry is not None and entry[1] is session:
+            self._http_sessions.pop(key, None)
+        await self._close_http_session(session)
+
+    async def close_http_sessions(self) -> None:
+        pooled = [sess for _, sess in self._http_sessions.values()]
+        self._http_sessions.clear()
+        self._http_session_locks.clear()
+        for sess in pooled:
+            await self._close_http_session(sess)
     def _is_cleanup_disabled(self) -> bool:
         return self.default_timeout <= 0
 
@@ -276,6 +381,7 @@ class FileCache:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
+        await self.close_http_sessions()
 
     async def refresh_cleanup_task(self) -> bool:
         """Apply the latest timeout setting to the cleanup background task."""
@@ -406,31 +512,39 @@ class FileCache:
                 )
 
                 # Try method 1: curl_cffi with browser impersonation
+                pool_key = None
+                pooled_session = None
                 try:
-                    async with AsyncSession() as session:
-                        response = await session.get(
-                            url,
-                            timeout=60,
-                            proxy=proxy_url,
-                            headers=headers,
-                            impersonate="chrome120",
-                            verify=False,
-                        )
+                    pool_key, pooled_session = await self.get_http_session(
+                        impersonate="chrome120",
+                        proxy_url=proxy_url,
+                        verify=False,
+                    )
+                    response = await pooled_session.get(
+                        url,
+                        timeout=60,
+                        proxy=proxy_url,
+                        headers=headers,
+                        impersonate="chrome120",
+                        verify=False,
+                    )
 
-                        if response.status_code == 200 and response.content:
-                            content_bytes = response.content
-                            await asyncio.to_thread(
-                                self._write_cached_content, file_path, content_bytes
-                            )
-                            debug_logger.log_info(
-                                f"File cached (curl_cffi): {filename} ({len(content_bytes)} bytes)"
-                            )
-                            return filename
-                        debug_logger.log_warning(
-                            f"curl_cffi failed with HTTP {response.status_code}, trying wget..."
+                    if response.status_code == 200 and response.content:
+                        content_bytes = response.content
+                        await asyncio.to_thread(
+                            self._write_cached_content, file_path, content_bytes
                         )
+                        debug_logger.log_info(
+                            f"File cached (curl_cffi): {filename} ({len(content_bytes)} bytes)"
+                        )
+                        return filename
+                    debug_logger.log_warning(
+                        f"curl_cffi failed with HTTP {response.status_code}, trying wget..."
+                    )
 
                 except Exception as e:
+                    if pool_key is not None and pooled_session is not None:
+                        await self.evict_http_session(pool_key, pooled_session)
                     debug_logger.log_warning(
                         f"curl_cffi failed: {str(e)}, trying wget..."
                     )

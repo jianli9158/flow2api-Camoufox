@@ -1,0 +1,352 @@
+"""Persistent browser profile directories, startup cache, login leases, and disk cache maintenance."""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+import os
+from pathlib import Path
+import re
+import shutil
+import threading
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+from ..core.logger import debug_logger
+
+
+PROFILE_STARTUP_DIR_NAME = "profile-startup"
+STARTUP_CACHE_ENTRIES = ("compatibility.ini", "startupCache")
+
+_RESERVED_PROFILE_NAMES = {"shared", "pending"}
+_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+(?:/[A-Za-z0-9._@-]+)*$")
+_ACTIVE_PROFILE_LOGIN_LEASES: Dict[Path, str] = {}
+_ACTIVE_TOKEN_LOGIN_LEASES: Dict[int, str] = {}
+_PROFILE_LOGIN_LEASE_LOCK = threading.Lock()
+
+
+def restore_startup_cache(account_dir: Path, profile_dir: Path) -> None:
+    """Copy cached `compatibility.ini` and `startupCache` from `account_dir/profile-startup` into `profile_dir`."""
+    source_root = account_dir / PROFILE_STARTUP_DIR_NAME
+    if not source_root.exists():
+        return
+    try:
+        _copy_startup_cache_entries(source_root, profile_dir)
+    except Exception as exc:
+        debug_logger.log_warning(f"[Camoufox] 恢复启动缓存失败: {exc}")
+
+
+def save_startup_cache(profile_dir: Path, account_dir: Path) -> None:
+    """Persist `compatibility.ini` and `startupCache` from `profile_dir` back to `account_dir/profile-startup`."""
+    if not (profile_dir / "startupCache").exists():
+        return
+    target = account_dir / PROFILE_STARTUP_DIR_NAME
+    staging = account_dir / f"{PROFILE_STARTUP_DIR_NAME}.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        _copy_startup_cache_entries(profile_dir, staging)
+        shutil.rmtree(target, ignore_errors=True)
+        staging.rename(target)
+    except Exception as exc:
+        shutil.rmtree(staging, ignore_errors=True)
+        debug_logger.log_warning(f"[Camoufox] 保存启动缓存失败: {exc}")
+
+
+def _copy_startup_cache_entries(source: Path, target: Path) -> None:
+    for entry_name in STARTUP_CACHE_ENTRIES:
+        src_entry = source / entry_name
+        if not src_entry.exists():
+            continue
+        dst_entry = target / entry_name
+        if src_entry.is_dir():
+            shutil.copytree(src_entry, dst_entry, dirs_exist_ok=True)
+        else:
+            dst_entry.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_entry, dst_entry)
+
+
+def _clear_stale_firefox_profile_locks(profile_dir: Path) -> None:
+    """Remove stale Firefox profile lock files after a clean or forced exit."""
+    for lock_name in (".parentlock", "lock", "parent.lock"):
+        lock_path = profile_dir / lock_name
+        try:
+            if lock_path.exists() or lock_path.is_symlink():
+                lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def normalize_browser_profile_dir(profile_dir: Optional[str]) -> str:
+    """Normalize a per-account browser profile directory key relative to `browser_data_rt/`."""
+    raw = str(profile_dir or "").strip().replace("\\", "/")
+    raw = raw.strip("/")
+    if not raw:
+        return ""
+    if raw.startswith("browser_data_rt/"):
+        raw = raw[len("browser_data_rt/") :].strip("/")
+    if not raw:
+        return ""
+    parts = [p for p in raw.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise ValueError("浏览器资料目录路径不合法")
+    cleaned = "/".join(parts)
+    if not _PROFILE_NAME_RE.fullmatch(cleaned):
+        raise ValueError("浏览器资料目录仅支持字母、数字及 . _ @ - / 字符")
+    first_seg = parts[0].lower()
+    if first_seg in _RESERVED_PROFILE_NAMES or re.match(r"^browser_\d+$", first_seg):
+        raise ValueError(f"浏览器资料目录不能使用保留名称: {parts[0]}")
+    if re.fullmatch(r"token_\d+", cleaned) or cleaned.startswith("profiles/"):
+        return cleaned
+    return f"profiles/{cleaned}"
+
+
+def resolve_account_profile_dir(
+    user_data_root: Path,
+    *,
+    token_id: Optional[int] = None,
+    profile_dir_name: Optional[str] = None,
+) -> Tuple[Path, str]:
+    """Resolve `(absolute_account_dir, canonical_profile_key)` under `user_data_root`."""
+    normalized = normalize_browser_profile_dir(profile_dir_name)
+    if normalized:
+        return user_data_root / normalized, normalized
+    if token_id is not None and int(token_id) > 0:
+        canonical = f"token_{int(token_id)}"
+        return user_data_root / canonical, canonical
+    return user_data_root / "pending", ""
+
+
+def _profile_dir_summary(profile_root: Path, canonical: str) -> Dict[str, Any]:
+    ff_dir = profile_root / "firefox-profile"
+    cookies_db = ff_dir / "cookies.sqlite"
+    fp_file = profile_root / "camoufox-fingerprint.json"
+    ss_file = profile_root / "storage-state.json"
+    mtime = 0.0
+    for candidate in (cookies_db, ss_file, fp_file, ff_dir, profile_root):
+        try:
+            if candidate.exists():
+                mtime = max(mtime, candidate.stat().st_mtime)
+        except Exception:
+            pass
+    return {
+        "profile_dir": canonical,
+        "has_firefox_profile": ff_dir.is_dir(),
+        "has_cookies_db": cookies_db.is_file(),
+        "has_fingerprint": fp_file.is_file(),
+        "has_storage_state": ss_file.is_file(),
+        "active_login": bool(get_profile_login_holder(profile_root)),
+        "updated_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+        if mtime > 0
+        else None,
+    }
+
+
+def list_browser_profile_dirs(user_data_root: Optional[Path] = None) -> List[Dict[str, Any]]:
+    """List persistent account browser directories under `browser_data_rt/`."""
+    root = user_data_root or (
+        Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
+    )
+    if not root.is_dir():
+        return []
+    entries: List[Dict[str, Any]] = []
+    try:
+        for child in sorted(root.iterdir(), key=lambda p: p.name):
+            if not child.is_dir():
+                continue
+            if re.fullmatch(r"token_\d+", child.name):
+                entries.append(_profile_dir_summary(child, child.name))
+        profiles_dir = root / "profiles"
+        if profiles_dir.is_dir():
+            for child in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
+                if child.is_dir():
+                    entries.append(_profile_dir_summary(child, f"profiles/{child.name}"))
+    except Exception:
+        pass
+    return entries
+
+
+def _canonical_lease_path(account_dir: Path) -> Path:
+    try:
+        return account_dir.resolve()
+    except Exception:
+        return account_dir
+
+
+def get_profile_login_holder(account_dir: Path) -> Optional[str]:
+    key = _canonical_lease_path(account_dir)
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        return _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
+
+
+def is_token_in_login_session(token_id: Optional[int]) -> bool:
+    if token_id is None:
+        return False
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        return int(token_id) in _ACTIVE_TOKEN_LOGIN_LEASES
+
+
+def acquire_profile_login_lease(
+    account_dir: Path, session_id: str, *, token_id: Optional[int] = None
+) -> None:
+    key = _canonical_lease_path(account_dir)
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        existing = _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
+        if existing and existing != session_id:
+            raise RuntimeError(f"浏览器资料目录 {account_dir.name} 已被登录会话 {existing} 占用")
+        _ACTIVE_PROFILE_LOGIN_LEASES[key] = session_id
+        if token_id is not None and int(token_id) > 0:
+            _ACTIVE_TOKEN_LOGIN_LEASES[int(token_id)] = session_id
+
+
+def release_profile_login_lease(
+    account_dir: Optional[Path], session_id: str, *, token_id: Optional[int] = None
+) -> None:
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        if account_dir is not None:
+            key = _canonical_lease_path(account_dir)
+            if _ACTIVE_PROFILE_LOGIN_LEASES.get(key) == session_id:
+                _ACTIVE_PROFILE_LOGIN_LEASES.pop(key, None)
+        if token_id is not None and int(token_id) > 0:
+            if _ACTIVE_TOKEN_LOGIN_LEASES.get(int(token_id)) == session_id:
+                _ACTIVE_TOKEN_LOGIN_LEASES.pop(int(token_id), None)
+
+
+def clear_site_cookies_in_profile(account_dir: Path) -> None:
+    """Clear site cookies while keeping hardware fingerprint, HTTP cache, and Firefox profile settings."""
+    ff_dir = account_dir / "firefox-profile"
+    for fname in ("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm"):
+        try:
+            p = ff_dir / fname
+            if p.exists():
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        ss_path = account_dir / "storage-state.json"
+        if ss_path.is_file():
+            ss_path.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def persist_account_login_artifacts(source_dir: Path, target_dir: Path) -> None:
+    """Copy fingerprint, storage-state, startup cache, HTTP disk cache, and full Firefox profile from isolated login dir to account dir."""
+    if not source_dir.exists() or source_dir.resolve() == target_dir.resolve():
+        return
+    target_dir.mkdir(parents=True, exist_ok=True)
+    for file_name in ("camoufox-fingerprint.json", "storage-state.json"):
+        src_file = source_dir / file_name
+        if src_file.is_file():
+            shutil.copy2(src_file, target_dir / file_name)
+    for dir_name in (PROFILE_STARTUP_DIR_NAME, "camoufox-cache", "firefox-profile"):
+        src_dir = source_dir / dir_name
+        if src_dir.is_dir():
+            dst_dir = target_dir / dir_name
+            if dir_name == "firefox-profile" and dst_dir.exists():
+                shutil.rmtree(dst_dir, ignore_errors=True)
+            shutil.copytree(
+                src_dir,
+                dst_dir,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(
+                    ".parentlock",
+                    "lock",
+                    "parent.lock",
+                    "gmp-widevinecdm",
+                    "minidumps",
+                    "crashes",
+                    "datareporting",
+                    "saved-telemetry-pings",
+                ),
+            )
+            if dir_name == "firefox-profile":
+                _clear_stale_firefox_profile_locks(dst_dir)
+
+
+def prune_camoufox_profile_bloat(
+    base_dir: Union[str, Path],
+    *,
+    max_cache_bytes: int = 32 * 1024 * 1024,
+) -> Dict[str, int]:
+    """Remove unneeded Widevine DRM binaries, crash dumps, and oversized cache2 entries from idle profiles."""
+    root = Path(base_dir)
+    stats = {"profiles_scanned": 0, "profiles_skipped_busy": 0, "bytes_reclaimed": 0}
+    if not root.is_dir():
+        return stats
+
+    candidate_account_dirs: List[Path] = []
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name == "profiles":
+            candidate_account_dirs.extend(p for p in child.iterdir() if p.is_dir())
+        else:
+            candidate_account_dirs.append(child)
+
+    def _dir_size(path: Path) -> int:
+        total = 0
+        try:
+            for dirpath, _, filenames in os.walk(path):
+                for fname in filenames:
+                    try:
+                        total += os.path.getsize(os.path.join(dirpath, fname))
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return total
+
+    for acc_dir in candidate_account_dirs:
+        ff_dir = acc_dir / "firefox-profile"
+        if not ff_dir.is_dir():
+            continue
+        stats["profiles_scanned"] += 1
+        if get_profile_login_holder(acc_dir) or any(
+            (ff_dir / lk).exists() or (ff_dir / lk).is_symlink()
+            for lk in (".parentlock", "lock", "parent.lock")
+        ):
+            stats["profiles_skipped_busy"] += 1
+            continue
+
+        for removable_rel in (
+            "gmp-widevinecdm",
+            "minidumps",
+            "crashes",
+            "datareporting",
+            "saved-telemetry-pings",
+            "cache2/doomed",
+            "cache2/trash",
+        ):
+            target = ff_dir / removable_rel
+            if target.exists():
+                reclaimed = _dir_size(target)
+                shutil.rmtree(target, ignore_errors=True)
+                stats["bytes_reclaimed"] += reclaimed
+
+        entries_dir = ff_dir / "cache2" / "entries"
+        if entries_dir.is_dir():
+            file_records: List[Tuple[float, int, Path]] = []
+            total_entries_bytes = 0
+            try:
+                for entry in entries_dir.iterdir():
+                    if not entry.is_file():
+                        continue
+                    try:
+                        st = entry.stat()
+                        total_entries_bytes += st.st_size
+                        file_records.append((st.st_mtime, st.st_size, entry))
+                    except OSError:
+                        pass
+            except OSError:
+                file_records = []
+            if total_entries_bytes > max_cache_bytes:
+                file_records.sort(key=lambda r: r[0])
+                remaining_bytes = total_entries_bytes
+                for _, fsize, fpath in file_records:
+                    if remaining_bytes <= max_cache_bytes:
+                        break
+                    try:
+                        fpath.unlink(missing_ok=True)
+                        remaining_bytes -= fsize
+                        stats["bytes_reclaimed"] += fsize
+                    except OSError:
+                        pass
+    return stats

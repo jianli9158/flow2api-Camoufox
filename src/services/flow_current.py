@@ -8,13 +8,15 @@ the retired Labs tRPC and AI Sandbox REST endpoints.
 import asyncio
 import base64
 import contextlib
+import copy
+import hashlib
 import json
 import re
 import struct
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 from ..core.logger import debug_logger
 
 from .browser_cookie_utils import (
@@ -75,6 +77,30 @@ class CurrentFlowClientMixin:
         "zephyr": "Zephyr",
         "zubenelgenubi": "Zubenelgenubi",
     }
+    PROJECT_CACHE_TTL_SECONDS = 20.0
+    HTTP_FIRST_CONTROL_PLANE_RPCS = frozenset(
+        {
+            "Zzl0ze",  # GetProject (voices, characters, settings, workflows)
+            "as29s",   # GetMedia / GetMediaUrlRedirect
+            "nzlxg",   # GetCredits
+            "wDg3C",   # GetEntities
+            "mrlkwd",  # ListAgentSessions
+            "GN0Bre",  # GetAgentSession
+            "TunYMc",  # RenameAgentSession
+            "Dcn2Le",  # DeleteAgentSession
+            "Yizz8d",  # GetUserPreferences
+            "DA4VGb",  # UpdateUserPreferences
+            "Kcr7Ub",  # UpdateProjectSettings
+            "cz8Z4b",  # DeleteMedia / DeleteWorkflow
+            "pGCYOe",  # ArchiveWorkflow
+            "lt8g5",   # UpdateMediaVisibility
+            "mYWVGd",  # RenameWorkflow
+            "C4BZMd",  # CreateEntity (character)
+            "rzMKMb",  # UpdateEntity (character)
+            "Sc7aEb",  # CopyMediaToEntitySlot
+            "LXpojc",  # ClearEntityReferenceSlot
+        }
+    )
 
     def _get_runtime_config(self):
         raise NotImplementedError
@@ -150,6 +176,113 @@ class CurrentFlowClientMixin:
                     return encoded
         return ""
 
+    def _can_use_camoufox_in_page_rpc(
+        self, token_id: Optional[int], runtime_cfg: Any
+    ) -> bool:
+        from .browser_captcha import BrowserCaptchaService
+
+        return (
+            token_id is not None
+            and BrowserCaptchaService._instance is not None
+            and str(getattr(runtime_cfg, "captcha_method", "") or "").strip().lower()
+            in {"browser", "camoufox"}
+            and bool(getattr(runtime_cfg, "browser_in_page_rpc", True))
+        )
+
+    async def _execute_in_page_camoufox_rpc(
+        self,
+        *,
+        rpc_id: str,
+        argument: List[Any],
+        project_id: Optional[str],
+        source_path: Optional[str],
+        timeout: int,
+        token_id: Optional[int],
+        browser_ref: Optional[str],
+    ) -> Tuple[bool, Any]:
+        from .browser_captcha import BrowserCaptchaService
+
+        service = await BrowserCaptchaService.get_instance(self.db)
+        in_page_executor = getattr(service, "execute_flow_frontend_rpc", None)
+        if not callable(in_page_executor):
+            return False, None
+        in_page_result = await in_page_executor(
+            rpc_id=rpc_id,
+            argument=argument,
+            project_id=project_id,
+            source_path=source_path,
+            timeout=timeout,
+            token_id=token_id,
+            browser_ref=browser_ref,
+        )
+        if isinstance(in_page_result, dict) and in_page_result.get("text"):
+            response_text = str(in_page_result.get("text") or "")
+            frames = self._parse_batchexecute_frames(response_text)
+            self._raise_batchexecute_error(frames, rpc_id)
+            payload = self._extract_batchexecute_payload(frames, rpc_id)
+            if payload is None:
+                raise RuntimeError(
+                    f"Flow frontend RPC returned no payload: rpc={rpc_id}"
+                )
+            return True, payload
+        return False, None
+
+    def _should_fallback_http_rpc_to_camoufox(
+        self, err: Exception, *, token_id: Optional[int]
+    ) -> bool:
+        msg = str(err or "")
+        lower = msg.lower()
+        if any(
+            marker in lower
+            for marker in (
+                "public_error_unusual_activity",
+                "http error 403",
+                "code=403",
+                "bootstrap metadata is unavailable",
+                "requires google session cookies",
+            )
+        ):
+            return True
+        if token_id is not None and ("401" in lower or "认证失败" in msg):
+            try:
+                from .browser_captcha import BrowserCaptchaService
+
+                svc = BrowserCaptchaService._instance
+                get_warm = getattr(svc, "get_warm_bound_token_ids", None) if svc else None
+                if callable(get_warm) and int(token_id) in (get_warm(idle_only=False) or set()):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def _call_http_control_plane_rpc(
+        self,
+        *,
+        rpc_id: str,
+        argument: List[Any],
+        google_cookies: Optional[str],
+        token_id: Optional[int],
+        project_id: Optional[str],
+        source_path: Optional[str],
+        timeout: int,
+    ) -> Any:
+        cookie_storage = await self._resolve_flow_frontend_cookie_storage(
+            google_cookies=google_cookies,
+            token_id=token_id,
+        )
+        rpc_kwargs: Dict[str, Any] = {
+            "rpc_id": rpc_id,
+            "argument": argument,
+            "cookie_header": "",
+            "timeout": timeout,
+            "project_id": project_id,
+            "source_path": source_path,
+            "cookie_storage": cookie_storage,
+        }
+        if token_id is not None:
+            rpc_kwargs["token_id"] = token_id
+        return await self._call_flow_frontend_rpc(**rpc_kwargs)
+
     async def _current_rpc(
         self,
         *,
@@ -165,70 +298,69 @@ class CurrentFlowClientMixin:
         browser_ref_fn = getattr(self, "_current_browser_ref", None)
         browser_ref = browser_ref_fn(token_id) if callable(browser_ref_fn) else None
         runtime_cfg = self._get_runtime_config()
-        from .browser_captcha import BrowserCaptchaService
+        can_use_camoufox = self._can_use_camoufox_in_page_rpc(token_id, runtime_cfg)
 
-        use_camoufox_rpc = bool(browser_ref) or (
-            token_id is not None
-            and BrowserCaptchaService._instance is not None
-            and str(getattr(runtime_cfg, "captcha_method", "") or "").strip().lower()
-            in {"browser", "camoufox"}
-            and bool(getattr(runtime_cfg, "browser_in_page_rpc", True))
+        # Low-risk / read-only control-plane RPCs without an active browser lease
+        # execute over fast HTTP first, avoiding browser slot contention & cold restarts.
+        prefer_http_first = (
+            not browser_ref and rpc_id in self.HTTP_FIRST_CONTROL_PLANE_RPCS
         )
-        if use_camoufox_rpc:
+        if prefer_http_first:
             try:
-                from .browser_captcha import BrowserCaptchaService
-
-                service = await BrowserCaptchaService.get_instance(self.db)
-                in_page_executor = getattr(
-                    service, "execute_flow_frontend_rpc", None
+                return await self._call_http_control_plane_rpc(
+                    rpc_id=rpc_id,
+                    argument=argument,
+                    google_cookies=google_cookies,
+                    token_id=token_id,
+                    project_id=project_id,
+                    source_path=source_path,
+                    timeout=effective_timeout,
                 )
-                if callable(in_page_executor):
-                    in_page_result = await in_page_executor(
-                        rpc_id=rpc_id,
-                        argument=argument,
-                        project_id=project_id,
-                        source_path=source_path,
-                        timeout=effective_timeout,
-                        token_id=token_id,
-                        browser_ref=browser_ref,
+            except Exception as http_err:
+                if not (
+                    can_use_camoufox
+                    and self._should_fallback_http_rpc_to_camoufox(
+                        http_err, token_id=token_id
                     )
-                    if isinstance(in_page_result, dict) and in_page_result.get(
-                        "text"
-                    ):
-                        response_text = str(in_page_result.get("text") or "")
-                        frames = self._parse_batchexecute_frames(response_text)
-                        self._raise_batchexecute_error(frames, rpc_id)
-                        payload = self._extract_batchexecute_payload(
-                            frames, rpc_id
-                        )
-                        if payload is None:
-                            raise RuntimeError(
-                                f"Flow frontend RPC returned no payload: rpc={rpc_id}"
-                            )
-                        return payload
+                ):
+                    raise
+                debug_logger.log_warning(
+                    f"[Flow RPC] HTTP 控制面 RPC ({rpc_id}) 遇到风控或会话差异，回退至 Camoufox 页内执行: {http_err}"
+                )
+
+        if bool(browser_ref) or can_use_camoufox:
+            try:
+                handled, payload = await self._execute_in_page_camoufox_rpc(
+                    rpc_id=rpc_id,
+                    argument=argument,
+                    project_id=project_id,
+                    source_path=source_path,
+                    timeout=effective_timeout,
+                    token_id=token_id,
+                    browser_ref=browser_ref,
+                )
+                if handled:
+                    return payload
             except Exception as in_page_err:
-                err_desc = f"{type(in_page_err).__name__}: {in_page_err}" if str(in_page_err) else type(in_page_err).__name__
+                err_desc = (
+                    f"{type(in_page_err).__name__}: {in_page_err}"
+                    if str(in_page_err)
+                    else type(in_page_err).__name__
+                )
                 debug_logger.log_warning(
                     f"[Camoufox RPC] 页面内 RPC ({rpc_id}) 失败: {err_desc}"
                 )
                 raise
-        cookie_storage = await self._resolve_flow_frontend_cookie_storage(
+
+        return await self._call_http_control_plane_rpc(
+            rpc_id=rpc_id,
+            argument=argument,
             google_cookies=google_cookies,
             token_id=token_id,
+            project_id=project_id,
+            source_path=source_path,
+            timeout=effective_timeout,
         )
-        rpc_kwargs: Dict[str, Any] = {
-            "rpc_id": rpc_id,
-            "argument": argument,
-            "cookie_header": "",
-            "timeout": effective_timeout,
-            "project_id": project_id,
-            "source_path": source_path,
-            "cookie_storage": cookie_storage,
-        }
-        if token_id is not None:
-            rpc_kwargs["token_id"] = token_id
-        return await self._call_flow_frontend_rpc(**rpc_kwargs)
-
     async def st_to_at(
         self,
         st: str = "",
@@ -292,6 +424,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=project_id,
         )
+        self._invalidate_project_snapshot_cache(project_id, token_id=token_id)
 
     async def get_credits(
         self,
@@ -421,6 +554,8 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=project_id,
         )
+        if project_id:
+            self._invalidate_project_snapshot_cache(project_id, token_id=token_id)
 
     async def upload_image(
         self,
@@ -484,6 +619,9 @@ class CurrentFlowClientMixin:
             )
             if not media_id:
                 raise RuntimeError("Flow frontend upload response missing mediaId")
+            self._invalidate_project_snapshot_cache(
+                normalized_project_id, token_id=token_id
+            )
             return media_id
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
@@ -1341,24 +1479,117 @@ class CurrentFlowClientMixin:
             "updatedAt": updated_at,
         }
 
+    def _ensure_project_snapshot_caches(
+        self,
+    ) -> Tuple[Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]], Dict[Tuple[str, str], asyncio.Task]]:
+        cache = getattr(self, "_project_snapshot_cache", None)
+        if cache is None:
+            cache = {}
+            self._project_snapshot_cache = cache
+        inflight = getattr(self, "_project_snapshot_inflight", None)
+        if inflight is None:
+            inflight = {}
+            self._project_snapshot_inflight = inflight
+        return cache, inflight
+
+    def _build_project_snapshot_cache_key(
+        self,
+        project_id: str,
+        *,
+        token_id: Optional[int] = None,
+        google_cookies: Optional[str] = None,
+    ) -> Tuple[str, str]:
+        if token_id is not None:
+            scope = f"tok:{int(token_id)}"
+        else:
+            digest = hashlib.sha256(
+                str(google_cookies or "").encode("utf-8")
+            ).hexdigest()[:16]
+            scope = f"ck:{digest}"
+        return (scope, str(project_id or "").strip())
+
+    def _invalidate_project_snapshot_cache(
+        self, project_id: Optional[str], *, token_id: Optional[int] = None
+    ) -> None:
+        norm_pid = str(project_id or "").strip()
+        if not norm_pid:
+            return
+        cache = getattr(self, "_project_snapshot_cache", None)
+        if not cache:
+            return
+        scope_prefix = f"tok:{int(token_id)}" if token_id is not None else None
+        stale_keys = [
+            key
+            for key in list(cache.keys())
+            if key[1] == norm_pid and (scope_prefix is None or key[0] == scope_prefix or key[0].startswith("ck:"))
+        ]
+        for key in stale_keys:
+            cache.pop(key, None)
+
     async def get_project(
         self,
         project_id: str,
         *,
         google_cookies: Optional[str] = None,
         token_id: Optional[int] = None,
+        force_refresh: bool = False,
     ) -> Dict[str, Any]:
         normalized_project_id = str(project_id or "").strip()
         if not normalized_project_id:
             raise ValueError("project_id is required")
-        payload = await self._current_rpc(
-            rpc_id="Zzl0ze",
-            argument=[f"projects/{normalized_project_id}", None, None, None, [1]],
-            google_cookies=google_cookies,
+
+        cache, inflight = self._ensure_project_snapshot_caches()
+        cache_key = self._build_project_snapshot_cache_key(
+            normalized_project_id,
             token_id=token_id,
-            project_id=normalized_project_id,
-            source_path=f"/project/{normalized_project_id}",
+            google_cookies=google_cookies,
         )
+        ttl = float(getattr(self, "PROJECT_CACHE_TTL_SECONDS", 20.0) or 0.0)
+        now = time.monotonic()
+        if not force_refresh and ttl > 0:
+            cached_entry = cache.get(cache_key)
+            if cached_entry is not None:
+                expires_at, cached_value = cached_entry
+                if expires_at > now:
+                    return copy.deepcopy(cached_value)
+                cache.pop(cache_key, None)
+
+            existing_task = inflight.get(cache_key)
+            if existing_task is not None and not existing_task.done():
+                shared_result = await asyncio.shield(existing_task)
+                return copy.deepcopy(shared_result)
+
+        async def _load_once() -> Dict[str, Any]:
+            payload = await self._current_rpc(
+                rpc_id="Zzl0ze",
+                argument=[f"projects/{normalized_project_id}", None, None, None, [1]],
+                google_cookies=google_cookies,
+                token_id=token_id,
+                project_id=normalized_project_id,
+                source_path=f"/project/{normalized_project_id}",
+            )
+            return self._parse_get_project_payload(normalized_project_id, payload)
+
+        if not force_refresh and ttl > 0:
+            task = asyncio.create_task(_load_once())
+            inflight[cache_key] = task
+            try:
+                result = await asyncio.shield(task)
+            finally:
+                if inflight.get(cache_key) is task:
+                    inflight.pop(cache_key, None)
+            if len(cache) > 128:
+                expired_keys = [k for k, (exp, _) in list(cache.items()) if exp <= time.monotonic()]
+                for k in expired_keys:
+                    cache.pop(k, None)
+            cache[cache_key] = (time.monotonic() + ttl, result)
+            return copy.deepcopy(result)
+
+        return await _load_once()
+
+    def _parse_get_project_payload(
+        self, normalized_project_id: str, payload: Any
+    ) -> Dict[str, Any]:
         if not isinstance(payload, list):
             raise RuntimeError("Flow GetProject (Zzl0ze) returned unexpected payload")
         scenes = payload[0] if len(payload) > 0 and isinstance(payload[0], list) else []
@@ -1633,6 +1864,7 @@ class CurrentFlowClientMixin:
                 )
             saved = True
 
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         return {
             "mediaId": media_id,
             "workflowId": workflow_id,
@@ -1698,6 +1930,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=normalized_project_id,
         )
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         return {
             "deleted": True,
             "projectId": normalized_project_id,
@@ -1780,6 +2013,7 @@ class CurrentFlowClientMixin:
         created = self._normalize_character_entity(raw_entity)
         if not created:
             raise RuntimeError("Flow CreateEntity (C4BZMd) returned invalid character entity")
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         if voice_id is not None or personality_notes is not None or image_refs is not None:
             return await self.update_character(
                 project_id=normalized_project_id,
@@ -1923,6 +2157,7 @@ class CurrentFlowClientMixin:
                     "Flow GetEntities (wDg3C) returned empty after image slot update"
                 )
 
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         return updated
     async def delete_character(
         self,
@@ -1950,6 +2185,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=normalized_project_id,
         )
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         return {
             "deleted": True,
             "projectId": normalized_project_id,
@@ -2005,6 +2241,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=normalized_project_id,
         )
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         copied_media_id = ""
         workflow_id = ""
         if isinstance(payload, list) and payload and isinstance(payload[0], list):
@@ -2041,6 +2278,7 @@ class CurrentFlowClientMixin:
             token_id=token_id,
             project_id=normalized_project_id,
         )
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         return {
             "cleared": True,
             "projectId": normalized_project_id,
@@ -3616,6 +3854,7 @@ class CurrentFlowClientMixin:
             project_id=normalized_project_id,
             source_path=f"/project/{normalized_project_id}",
         )
+        self._invalidate_project_snapshot_cache(normalized_project_id, token_id=token_id)
         raw_mz = payload[0] if isinstance(payload, list) and payload and isinstance(payload[0], list) else (payload if isinstance(payload, list) else mz)
         return {
             "projectId": normalized_project_id,

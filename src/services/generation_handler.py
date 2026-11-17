@@ -1339,6 +1339,21 @@ class GenerationHandler:
                         record_generation_result(
                             generation_type, "failed", time.time() - start_time
                         )
+                        duration = time.time() - start_time
+                        perf_trace["status"] = "failed"
+                        perf_trace["total_ms"] = int(duration * 1000)
+                        perf_trace["error"] = error_msg
+                        await self._log_request(
+                            None,
+                            request_operation,
+                            request_payload,
+                            {"error": error_msg, "performance": perf_trace},
+                            503,
+                            duration,
+                            log_id=request_log_state.get("id"),
+                            status_text="failed",
+                            progress=request_log_state.get("progress", 0),
+                        )
                         if stream:
                             yield self._create_stream_chunk(f"错误: {error_msg}\n")
                         yield self._create_error_response(error_msg, status_code=503)
@@ -1358,6 +1373,21 @@ class GenerationHandler:
                         debug_logger.log_error(f"[GENERATION] {error_msg}")
                         record_generation_result(
                             generation_type, "failed", time.time() - start_time
+                        )
+                        duration = time.time() - start_time
+                        perf_trace["status"] = "failed"
+                        perf_trace["total_ms"] = int(duration * 1000)
+                        perf_trace["error"] = error_msg
+                        await self._log_request(
+                            token.id if token else None,
+                            request_operation,
+                            request_payload,
+                            {"error": error_msg, "performance": perf_trace},
+                            403,
+                            duration,
+                            log_id=request_log_state.get("id"),
+                            status_text="failed",
+                            progress=request_log_state.get("progress", 0),
                         )
                         if stream:
                             yield self._create_stream_chunk(f"错误: {error_msg}\n")
@@ -1557,7 +1587,7 @@ class GenerationHandler:
                 progress=100,
             )
 
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, GeneratorExit):
             error_msg = "生成已取消: 客户端连接已断开"
             debug_logger.log_warning(f"[GENERATION] ⚠️ {error_msg}")
             duration = time.time() - start_time

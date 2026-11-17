@@ -52,25 +52,60 @@ from .recaptcha_runtime import (
     build_recaptcha_execute_script,
 )
 
-try:
-    import websockets
-except ImportError:
-    websockets = None
+from .bidi_transport import (
+    BIDI_ENDPOINT_PATTERN,
+    BiDiChannel,
+    BiDiClient,
+    LocalSocks5Relay,
+    _from_bidi_remote_value,
+    _to_bidi_local_value,
+    wait_for_bidi_endpoint,
+)
+from .camoufox_fingerprint import (
+    CAMOUFOX_FIREFOX_MAJOR,
+    CAMOUFOX_RELEASE_VERSION,
+    FIREFOX_VERSION_PATTERN,
+    _firefox_pref_literal,
+    _start_stdout_drain,
+    add_windows_substitute_names,
+    build_camoufox_env,
+    build_camoufox_fingerprint_config,
+    ensure_camoufox_executable,
+    find_camoufox_executable,
+    load_or_create_account_camoufox_config,
+    windows_fontconfig,
+    write_camoufox_user_js,
+)
+from .camoufox_login import (
+    FLOW_LOGIN_DETECT_SCRIPT,
+    WEBDRIVER_KEYS,
+    CamoufoxLiveView,
+    CamoufoxLoginManager,
+    CamoufoxLoginSession,
+    has_display,
+)
+from .camoufox_profile import (
+    PROFILE_STARTUP_DIR_NAME,
+    STARTUP_CACHE_ENTRIES,
+    _clear_stale_firefox_profile_locks,
+    _copy_startup_cache_entries,
+    acquire_profile_login_lease,
+    clear_site_cookies_in_profile,
+    get_profile_login_holder,
+    is_token_in_login_session,
+    list_browser_profile_dirs,
+    normalize_browser_profile_dir,
+    persist_account_login_artifacts,
+    prune_camoufox_profile_bloat,
+    release_profile_login_lease,
+    resolve_account_profile_dir,
+    restore_startup_cache,
+    save_startup_cache,
+)
 
-try:
-    import aiohttp
-except ImportError:
-    aiohttp = None
-
-
-CAMOUFOX_RELEASE_VERSION = "152.0.4-beta.29"
-CAMOUFOX_FIREFOX_MAJOR = 152
 FLOW_ORIGIN = "https://flow.google.com"
 FLOW_PROJECTS_URL = "https://flow.google.com/projects"
 FLOW_WEBSITE_KEY = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-
-BIDI_ENDPOINT_PATTERN = re.compile(r"WebDriver BiDi listening on (ws://[^\s]+)")
-FIREFOX_VERSION_PATTERN = re.compile(r"\b1[0-9]{2}\.0\b")
 BROWSER_WINDOW_URL = "chrome://browser/content/browser.xhtml"
 
 IDLE_FRAME_DIVISOR = 60
@@ -81,1520 +116,6 @@ PROTECTED_SEND_KEYS = [
     {"type": "keyDown", "value": "?"},
     {"type": "keyUp", "value": "?"},
 ]
-
-_ASSETS_DIR = Path(__file__).resolve().parent / "camoufox_assets"
-
-
-def _load_json_asset(filename: str, default: Any) -> Any:
-    path = _ASSETS_DIR / filename
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        debug_logger.log_warning(f"[Camoufox] 加载资源 {filename} 失败: {exc}")
-        return default
-
-
-_WINDOWS_PROFILE_DATA: Dict[str, Any] = _load_json_asset(
-    "windows_profile.json", {"fonts": [], "voices": []}
-)
-_WINDOWS_FONTS_DATA: Dict[str, Any] = _load_json_asset(
-    "windows_fonts.json", {"prefs": {}, "families": [], "substitutes": {}}
-)
-_WINDOWS_WEBGL_PROFILES: List[Dict[str, Any]] = _load_json_asset(
-    "windows_webgl.json", []
-)
-
-WINDOWS_ESSENTIAL_FONTS = [
-    "Arial",
-    "Times New Roman",
-    "Courier New",
-    "Verdana",
-    "Georgia",
-    "Trebuchet MS",
-    "Tahoma",
-    "Segoe UI",
-    "Calibri",
-    "Cambria Math",
-    "Nirmala UI",
-    "Consolas",
-]
-WINDOWS_MARKER_FONTS = ["Segoe UI", "Tahoma", "Cambria Math", "Nirmala UI"]
-
-
-# ============================================================================
-# 1. Windows Fingerprint & Camoufox Environment Builder
-# ============================================================================
-
-
-def _random_seed() -> int:
-    return random.randint(1, 0xFFFFFFFF)
-
-
-def _normalize_locale(locale: Optional[str]) -> str:
-    value = str(locale or "").strip()
-    return value if value else "en-US"
-
-
-def _locale_values(locale: str) -> List[str]:
-    if "-" not in locale:
-        return [locale]
-    language, _ = locale.split("-", 1)
-    return [locale, language.lower()]
-
-
-def _apply_locale_timezone(
-    cfg: Dict[str, Any], locale: str, timezone: str
-) -> None:
-    locale = _normalize_locale(locale)
-    timezone = str(timezone or "").strip() or "America/New_York"
-    if "-" in locale:
-        language, region = locale.split("-", 1)
-        found = True
-    else:
-        language, region, found = locale, "", False
-    cfg["navigator.language"] = locale
-    cfg["navigator.languages"] = _locale_values(locale)
-    cfg["headers.Accept-Language"] = (
-        f"{locale},{language.lower()};q=0.9" if found else locale
-    )
-    cfg["locale:language"] = language.lower()
-    if found and region:
-        cfg["locale:region"] = region.upper()
-    else:
-        cfg.pop("locale:region", None)
-    cfg["locale:all"] = ", ".join(_locale_values(locale))
-    cfg["timezone"] = timezone
-
-
-def _windows_font_subset() -> List[str]:
-    all_fonts = list(_WINDOWS_PROFILE_DATA.get("fonts") or [])
-    if not all_fonts:
-        return list(WINDOWS_ESSENTIAL_FONTS)
-    result: List[str] = []
-    rest: List[str] = []
-    for font in all_fonts:
-        if font in WINDOWS_ESSENTIAL_FONTS:
-            result.append(font)
-        else:
-            rest.append(font)
-    percent = random.randint(30, 78)
-    count = int(round((percent / 100.0) * len(rest)))
-    random.shuffle(rest)
-    result.extend(rest[:count])
-    for marker in WINDOWS_MARKER_FONTS:
-        if marker not in result:
-            result.append(marker)
-    return result
-
-
-def _windows_font_aliases(fonts: Iterable[str]) -> List[str]:
-    declared = {str(f).lower() for f in fonts if f}
-    allowed: Dict[str, bool] = {}
-    names: List[str] = []
-    for family in _WINDOWS_FONTS_DATA.get("families") or []:
-        if not isinstance(family, list):
-            continue
-        hit = any(str(name).lower() in declared for name in family)
-        for name in family:
-            key = str(name).lower()
-            if key in declared:
-                continue
-            if key in allowed:
-                allowed[key] = allowed[key] and hit
-                continue
-            allowed[key] = hit
-            names.append(str(name))
-    return [name for name in names if allowed.get(name.lower(), False)]
-
-
-_SUBSTITUTE_FONTS_LOCK = threading.Lock()
-_SUBSTITUTE_FONT_DIRECTORIES: Set[str] = set()
-_SUBSTITUTE_POSTSCRIPT_SUFFIX = "-Windows"
-
-
-def _utf16_be(text: str) -> bytes:
-    return text.encode("utf-16-be")
-
-
-def _font_checksum(data: bytes) -> int:
-    total = 0
-    limit = (len(data) // 4) * 4
-    for offset in range(0, limit, 4):
-        total = (total + struct.unpack_from(">I", data, offset)[0]) & 0xFFFFFFFF
-    return total
-
-
-def _read_font_name_table(path: Path) -> Optional[bytes]:
-    try:
-        with path.open("rb") as f:
-            header = f.read(12)
-            if len(header) < 12 or header[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
-                return None
-            num_tables = struct.unpack_from(">H", header, 4)[0]
-            directory = f.read(16 * num_tables)
-            if len(directory) < 16 * num_tables:
-                return None
-            for idx in range(0, len(directory), 16):
-                tag = directory[idx : idx + 4]
-                if tag != b"name":
-                    continue
-                offset, length = struct.unpack_from(">II", directory, idx + 8)
-                f.seek(offset)
-                table = f.read(length)
-                return table if len(table) == length else None
-    except Exception:
-        return None
-    return None
-
-
-def _parse_font_names(table: bytes) -> Tuple[List[List[int]], bytes]:
-    count, string_offset = struct.unpack_from(">HH", table, 2)
-    records: List[List[int]] = []
-    for idx in range(count):
-        rec = list(struct.unpack_from(">6H", table, 6 + 12 * idx))
-        records.append(rec)
-    return records, table[string_offset:]
-
-
-def _font_family_names(table: bytes) -> Tuple[str, List[str]]:
-    records, storage = _parse_font_names(table)
-    family = ""
-    names: List[str] = []
-    for platform_id, encoding_id, language_id, name_id, length, offset in records:
-        if platform_id != 3 or encoding_id != 1 or name_id != 1:
-            continue
-        raw = storage[offset : offset + length]
-        try:
-            name = raw.decode("utf-16-be")
-        except Exception:
-            continue
-        if language_id == 0x0409:
-            family = name
-        names.append(name)
-    return family, names
-
-
-def _rewrite_font_names(path: Path, missing_names: List[str]) -> None:
-    data = path.read_bytes()
-    count = struct.unpack_from(">H", data, 4)[0]
-    tables: List[List[Any]] = []
-    name_index = -1
-    for idx in range(count):
-        base = 12 + 16 * idx
-        tag = data[base : base + 4]
-        offset, length = struct.unpack_from(">II", data, base + 8)
-        if tag == b"name":
-            name_index = idx
-        tables.append([tag, data[offset : offset + length]])
-    if name_index < 0:
-        return
-
-    records, storage = _parse_font_names(tables[name_index][1])
-    text = bytearray(storage)
-    for rec in records:
-        # rec = [platform, encoding, language, nameID, length, offset]
-        if rec[3] != 6:
-            continue
-        suffix = (
-            _SUBSTITUTE_POSTSCRIPT_SUFFIX.encode("ascii")
-            if rec[0] == 1
-            else _utf16_be(_SUBSTITUTE_POSTSCRIPT_SUFFIX)
-        )
-        orig_bytes = storage[rec[5] : rec[5] + rec[4]]
-        rec[5] = len(text)
-        rec[4] = len(orig_bytes) + len(suffix)
-        text.extend(orig_bytes)
-        text.extend(suffix)
-
-    language = 0x0200
-    for name in missing_names:
-        while any(
-            r[0] == 3 and r[1] == 1 and r[2] == language and r[3] == 1
-            for r in records
-        ):
-            language += 1
-        encoded = _utf16_be(name)
-        records.append([3, 1, language, 1, len(encoded), len(text)])
-        text.extend(encoded)
-        language += 1
-
-    records.sort(key=lambda r: (r[0], r[1], r[2], r[3]))
-    name_header = bytearray(struct.pack(">3H", 0, len(records), 6 + 12 * len(records)))
-    for rec in records:
-        name_header.extend(struct.pack(">6H", *rec))
-    tables[name_index][1] = bytes(name_header) + bytes(text)
-
-    output = bytearray(data[: 12 + 16 * count])
-    head_offset = -1
-    for idx, (tag, table_data) in enumerate(tables):
-        while len(output) % 4 != 0:
-            output.append(0)
-        entry_pos = 12 + 16 * idx
-        struct.pack_into(">II", output, entry_pos + 8, len(output), len(table_data))
-        if tag == b"head":
-            head_offset = len(output)
-        output.extend(table_data)
-    while len(output) % 4 != 0:
-        output.append(0)
-
-    if head_offset >= 0:
-        struct.pack_into(">I", output, head_offset + 8, 0)
-    for idx, (_tag, table_data) in enumerate(tables):
-        entry_pos = 12 + 16 * idx
-        tbl_off = struct.unpack_from(">I", output, entry_pos + 8)[0]
-        padded_len = (len(table_data) + 3) & ~3
-        csum = _font_checksum(bytes(output[tbl_off : tbl_off + padded_len]))
-        struct.pack_into(">I", output, entry_pos + 4, csum)
-    if head_offset >= 0:
-        adj = (0xB1B0AFBA - _font_checksum(bytes(output))) & 0xFFFFFFFF
-        struct.pack_into(">I", output, head_offset + 8, adj)
-
-    fd, tmp_name = tempfile.mkstemp(prefix=".font-", dir=str(path.parent.parent))
-    try:
-        with os.fdopen(fd, "wb") as tmp_file:
-            tmp_file.write(output)
-        os.chmod(tmp_name, 0o644)
-        os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            try:
-                os.unlink(tmp_name)
-            except Exception:
-                pass
-
-
-def add_windows_substitute_names(directory: Union[str, Path]) -> None:
-    """Port of AIStudio2API `addWindowsSubstituteNames` (`fontnames.go`).
-
-    Appends `-Windows` to bundled font PostScript names so they do not collide with
-    macOS system fonts, and adds Windows platform family alias records for CJK/Windows
-    substitute families in `Camoufox.app/Contents/Resources/fonts`.
-    """
-    dir_path = Path(directory)
-    dir_key = str(dir_path.resolve()) if dir_path.exists() else str(dir_path)
-    with _SUBSTITUTE_FONTS_LOCK:
-        if dir_key in _SUBSTITUTE_FONT_DIRECTORIES or not dir_path.is_dir():
-            return
-        substitutes = _WINDOWS_FONTS_DATA.get("substitutes") or {}
-        aliases: Dict[str, List[str]] = {}
-        for alias, target in substitutes.items():
-            aliases.setdefault(str(target), []).append(str(alias))
-        try:
-            for entry in dir_path.iterdir():
-                if not entry.is_file() or entry.is_symlink():
-                    continue
-                table = _read_font_name_table(entry)
-                if table is None:
-                    continue
-                family, names = _font_family_names(table)
-                missing = sorted(
-                    alias for alias in aliases.get(family, []) if alias not in names
-                )
-                if not missing:
-                    continue
-                _rewrite_font_names(entry, missing)
-            _SUBSTITUTE_FONT_DIRECTORIES.add(dir_key)
-        except Exception as exc:
-            debug_logger.log_warning(f"[Camoufox] 修补 macOS 随包字体替换名失败: {exc}")
-
-
-def windows_fontconfig(executable_path: Union[str, Path], profile_dir: Path) -> Optional[str]:
-    """Port of AIStudio2API `windowsFontconfig` (`launcher.go`) for Linux."""
-    exe_dir = Path(executable_path).resolve().parent
-    conf_src = exe_dir / "fontconfig" / "windows" / "fonts.conf"
-    if not conf_src.is_file():
-        return None
-    try:
-        content = conf_src.read_text(encoding="utf-8")
-        win_fonts_dir = str(exe_dir / "fonts" / "windows")
-        content = content.replace('<dir prefix="cwd">fonts</dir>', f"<dir>{win_fonts_dir}</dir>")
-        content = content.replace("<const>hintfull</const>", "<const>hintslight</const>")
-        substitutes = _WINDOWS_FONTS_DATA.get("substitutes") or {}
-        lines = ['\t<alias binding="same"><family>fantasy</family><prefer><family>Arial</family></prefer></alias>\n']
-        for alias in sorted(substitutes.keys()):
-            target = substitutes[alias]
-            lines.append(
-                f'\t<match target="pattern"><test qual="any" name="family"><string>{alias}</string></test>'
-                f'<edit name="family" mode="assign" binding="same"><string>{target}</string></edit></match>\n'
-            )
-        content = content.replace("</fontconfig>", "".join(lines) + "</fontconfig>", 1)
-        out_path = profile_dir / "fonts.conf"
-        out_path.write_text(content, encoding="utf-8")
-        return str(out_path)
-    except Exception as exc:
-        debug_logger.log_warning(f"[Camoufox] 生成 Linux fontconfig 失败: {exc}")
-        return None
-
-def _windows_voices(locale: str) -> List[Dict[str, Any]]:
-    raw_voices = list(_WINDOWS_PROFILE_DATA.get("voices") or [])
-    voices: List[Dict[str, Any]] = []
-    for entry in raw_voices:
-        if not isinstance(entry, str) or entry.count(":") < 2:
-            continue
-        name_lang, service = entry.rsplit(":", 1)
-        name, language = name_lang.rsplit(":", 1)
-        voices.append(
-            {
-                "name": name,
-                "lang": language,
-                "voiceUri": f"urn:moz-tts:sapi:{name}?{language}",
-                "isDefault": False,
-                "isLocalService": service == "local",
-            }
-        )
-    if not voices:
-        return []
-    prefix = locale.lower().split("-", 1)[0] or "en"
-    default_idx = next(
-        (
-            i
-            for i, v in enumerate(voices)
-            if locale and str(v["lang"]).lower() == locale.lower()
-        ),
-        -1,
-    )
-    if default_idx < 0:
-        default_idx = next(
-            (
-                i
-                for i, v in enumerate(voices)
-                if str(v["lang"]).lower().split("-", 1)[0] == prefix
-            ),
-            0,
-        )
-    voices[default_idx]["isDefault"] = True
-    return voices
-
-
-def _windows_webgl() -> Dict[str, Any]:
-    if not _WINDOWS_WEBGL_PROFILES:
-        return {}
-    total = sum(float(p.get("weight") or 0.0) for p in _WINDOWS_WEBGL_PROFILES)
-    if total <= 0:
-        return dict(_WINDOWS_WEBGL_PROFILES[0].get("config") or {})
-    point = random.random() * total
-    selected = _WINDOWS_WEBGL_PROFILES[-1]
-    for profile in _WINDOWS_WEBGL_PROFILES:
-        weight = float(profile.get("weight") or 0.0)
-        if point < weight:
-            selected = profile
-            break
-        point -= weight
-    return dict(selected.get("config") or {})
-
-
-def _normalize_camoufox_config(cfg: Dict[str, Any]) -> None:
-    for key in list(cfg.keys()):
-        val = cfg[key]
-        derived = key.startswith(("navigator.", "screen.", "window.", "battery:"))
-        if derived and key not in ("window.screenX", "window.screenY") and not val:
-            cfg.pop(key, None)
-    for key in ("window.history.length", "canvas:aaOffset", "canvas:aaCapOffset"):
-        cfg.pop(key, None)
-    if not cfg.get("fonts"):
-        cfg["fonts"] = _windows_font_subset()
-    language = str(cfg.get("navigator.language") or "en-US")
-    cfg["voices"] = _windows_voices(language)
-    if "webGl:renderer" not in cfg:
-        cfg.update(_windows_webgl())
-    if not any(k.startswith("mediaDevices:") for k in cfg):
-        cfg["mediaDevices:enabled"] = True
-        cfg["mediaDevices:micros"] = 1
-        cfg["mediaDevices:webcams"] = 1
-        cfg["mediaDevices:speakers"] = 0
-    for seed_key in ("fonts:spacing_seed", "audio:seed", "canvas:seed"):
-        if not cfg.get(seed_key):
-            cfg[seed_key] = _random_seed()
-
-
-def build_camoufox_fingerprint_config(
-    ff_version: int = CAMOUFOX_FIREFOX_MAJOR,
-    locale: str = "en-US",
-    timezone: str = "America/New_York",
-) -> Dict[str, Any]:
-    """Generate a complete Windows Firefox Camoufox fingerprint config."""
-    locale = _normalize_locale(locale)
-    resolutions = [
-        (1920, 1080, 1920, 1040),
-        (1536, 864, 1536, 824),
-        (1600, 900, 1600, 860),
-        (1440, 900, 1440, 860),
-        (1366, 768, 1366, 728),
-    ]
-    sw, sh, aw, ah = random.choice(resolutions)
-    outer_w = sw
-    outer_h = ah
-    inner_w = outer_w
-    inner_h = max(600, outer_h - random.choice([71, 79, 85]))
-    version_str = f"{ff_version}.0"
-    user_agent = f"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:{version_str}) Gecko/20100101 Firefox/{version_str}"
-
-    cfg: Dict[str, Any] = {
-        "navigator.userAgent": user_agent,
-        "navigator.appCodeName": "Mozilla",
-        "navigator.appName": "Netscape",
-        "navigator.appVersion": "5.0 (Windows)",
-        "navigator.oscpu": "Windows NT 10.0; Win64; x64",
-        "navigator.platform": "Win32",
-        "navigator.hardwareConcurrency": random.choice([8, 12, 16]),
-        "navigator.product": "Gecko",
-        "navigator.maxTouchPoints": 0,
-        "screen.availHeight": ah,
-        "screen.availWidth": aw,
-        "screen.availTop": 0,
-        "screen.availLeft": 0,
-        "screen.height": sh,
-        "screen.width": sw,
-        "screen.colorDepth": 24,
-        "screen.pixelDepth": 24,
-        "window.outerHeight": outer_h,
-        "window.outerWidth": outer_w,
-        "window.innerHeight": inner_h,
-        "window.innerWidth": inner_w,
-        "window.screenX": 0,
-        "window.screenY": 0,
-        "headers.User-Agent": user_agent,
-        "headers.Accept-Encoding": "gzip, deflate, br, zstd",
-        "battery:charging": True,
-        "battery:chargingTime": 0,
-        "allowMainWorld": True,
-        "showcursor": False,
-        "fonts": _windows_font_subset(),
-        "fonts:spacing_seed": _random_seed(),
-    }
-    _apply_locale_timezone(cfg, locale, timezone)
-    _normalize_camoufox_config(cfg)
-    return cfg
-
-
-def load_or_create_account_camoufox_config(
-    directory: Union[str, Path],
-    ff_version: int = CAMOUFOX_FIREFOX_MAJOR,
-    locale: str = "en-US",
-    timezone: str = "America/New_York",
-) -> Dict[str, Any]:
-    """Load or create persistent `camoufox-fingerprint.json` in `directory`."""
-    dir_path = Path(directory)
-    dir_path.mkdir(parents=True, exist_ok=True)
-    fp_path = dir_path / "camoufox-fingerprint.json"
-    locale = _normalize_locale(locale)
-    timezone = str(timezone or "").strip() or "America/New_York"
-
-    if fp_path.is_file():
-        try:
-            saved = json.loads(fp_path.read_text(encoding="utf-8"))
-            raw_cfg = saved.get("config")
-            if isinstance(raw_cfg, dict) and raw_cfg:
-                cfg = dict(raw_cfg)
-                version_str = f"{ff_version}.0"
-                if saved.get("firefox_version") != ff_version:
-                    for key in (
-                        "navigator.userAgent",
-                        "navigator.appVersion",
-                        "headers.User-Agent",
-                    ):
-                        if isinstance(cfg.get(key), str):
-                            cfg[key] = FIREFOX_VERSION_PATTERN.sub(
-                                version_str, cfg[key]
-                            )
-                if saved.get("locale") != locale or saved.get("timezone") != timezone:
-                    _apply_locale_timezone(cfg, locale, timezone)
-                _normalize_camoufox_config(cfg)
-                saved_payload = {
-                    "firefox_version": ff_version,
-                    "locale": locale,
-                    "timezone": timezone,
-                    "config": cfg,
-                }
-                if saved != saved_payload:
-                    fp_path.write_text(
-                        json.dumps(saved_payload, ensure_ascii=False), encoding="utf-8"
-                    )
-                return cfg
-        except Exception as exc:
-            debug_logger.log_warning(
-                f"[Camoufox] 读取指纹 {fp_path} 失败，将重新生成: {exc}"
-            )
-
-    cfg = build_camoufox_fingerprint_config(ff_version, locale, timezone)
-    saved_payload = {
-        "firefox_version": ff_version,
-        "locale": locale,
-        "timezone": timezone,
-        "config": cfg,
-    }
-    try:
-        fp_path.write_text(
-            json.dumps(saved_payload, ensure_ascii=False), encoding="utf-8"
-        )
-    except Exception as exc:
-        debug_logger.log_warning(f"[Camoufox] 写入指纹 {fp_path} 失败: {exc}")
-    return cfg
-
-
-def build_camoufox_env(
-    fingerprint_config: Dict[str, Any],
-    base_env: Optional[Dict[str, str]] = None,
-    *,
-    headless: bool = True,
-    live_view: bool = False,
-    profile_dir: Optional[Path] = None,
-    executable_path: Optional[Union[str, Path]] = None,
-) -> Dict[str, str]:
-    """Chunk `fingerprint_config` into `CAMOU_CONFIG_1`, `CAMOU_CONFIG_2`, ... (matching AIStudio2API `launchBrowser`)."""
-    cfg = dict(fingerprint_config)
-    cfg["voices:blockIfNotDefined"] = True
-    sys_name = platform.system().lower()
-    if sys_name != "windows":
-        cfg["AudioContext:maxChannelCount"] = 2
-        cfg["AudioContext:sampleRate"] = 48000
-        raw_fonts = [str(f) for f in (cfg.get("fonts") or []) if f]
-        cfg["fonts"] = raw_fonts + _windows_font_aliases(raw_fonts)
-        if cfg.get("window.outerHeight") and cfg.get("window.innerHeight") is None:
-            try:
-                cfg["window.innerHeight"] = int(cfg["window.outerHeight"]) - 57
-            except Exception:
-                pass
-
-    env = {
-        k: v
-        for k, v in (base_env or os.environ).items()
-        if not k.startswith("CAMOU_CONFIG_")
-    }
-    encoded = json.dumps(cfg, ensure_ascii=False, separators=(",", ":"))
-    chunk_size = 2047
-    for idx, offset in enumerate(range(0, len(encoded), chunk_size), start=1):
-        env[f"CAMOU_CONFIG_{idx}"] = encoded[offset : offset + chunk_size]
-    env["MOZ_HEADLESS_WIDTH"] = str(
-        int(cfg.get("window.outerWidth") or 1280)
-    )
-    env["MOZ_HEADLESS_HEIGHT"] = str(
-        int(cfg.get("window.outerHeight") or 800)
-    )
-    if headless and not live_view:
-        env["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
-    if sys_name == "linux" and executable_path and profile_dir is not None:
-        fc_path = windows_fontconfig(executable_path, profile_dir)
-        if fc_path:
-            env["FONTCONFIG_FILE"] = fc_path
-    if profile_dir is not None:
-        env["TMP"] = str(profile_dir)
-        env["TEMP"] = str(profile_dir)
-        env["TMPDIR"] = str(profile_dir)
-    return env
-
-
-# ============================================================================
-# 2. Camoufox Binary Discovery & Auto-Download
-# ============================================================================
-
-
-def _camoufox_binary_relative_path() -> Path:
-    sys_name = platform.system().lower()
-    if sys_name == "darwin":
-        return Path("Camoufox.app") / "Contents" / "MacOS" / "camoufox"
-    if sys_name == "windows":
-        return Path("camoufox.exe")
-    return Path("camoufox-bin")
-
-
-def _camoufox_archive_url() -> Tuple[str, str]:
-    sys_name = platform.system().lower()
-    machine = platform.machine().lower()
-    os_map = {"darwin": "mac", "windows": "win", "linux": "lin"}
-    arch_map = {
-        "x86_64": "x86_64",
-        "amd64": "x86_64",
-        "arm64": "arm64",
-        "aarch64": "arm64",
-        "i686": "i686",
-        "x86": "i686",
-    }
-    os_tag = os_map.get(sys_name, "lin")
-    arch_tag = arch_map.get(machine, "x86_64")
-    archive = f"camoufox-{CAMOUFOX_RELEASE_VERSION}-{os_tag}.{arch_tag}.zip"
-    url = f"https://github.com/daijro/camoufox/releases/download/v{CAMOUFOX_RELEASE_VERSION}/{archive}"
-    return url, archive
-
-
-def find_camoufox_executable() -> Optional[str]:
-    """Find an existing Camoufox binary on the host machine."""
-    rel_bin = _camoufox_binary_relative_path()
-    candidates: List[Path] = []
-
-    for env_key in ("CAMOUFOX_PATH", "BROWSER_EXECUTABLE_PATH"):
-        raw = os.environ.get(env_key, "").strip()
-        if raw:
-            p = Path(raw)
-            if p.is_dir():
-                candidates.append(p / rel_bin)
-            else:
-                candidates.append(p)
-
-    # Local project runtime & AIStudio2API shared runtime paths
-    home = Path.home()
-    candidates.extend(
-        [
-            Path(os.getcwd()) / "runtime" / "camoufox" / rel_bin,
-            home
-            / "Library"
-            / "Application Support"
-            / "AIStudio2API"
-            / "runtime"
-            / "camoufox"
-            / rel_bin,
-            home / "runtime" / "camoufox" / rel_bin,
-            home / ".cache" / "camoufox" / rel_bin,
-            home / "Library" / "Caches" / "camoufox" / rel_bin,
-            home / ".local" / "share" / "camoufox" / rel_bin,
-            Path("/Applications/Camoufox.app/Contents/MacOS/camoufox"),
-        ]
-    )
-
-    for candidate in candidates:
-        try:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
-                return str(candidate)
-        except Exception:
-            continue
-
-    which_bin = shutil.which("camoufox") or shutil.which("camoufox-bin")
-    if which_bin:
-        return which_bin
-    return None
-
-
-async def ensure_camoufox_executable(
-    progress_callback: Optional[Callable[[str], None]] = None,
-) -> str:
-    """Locate Camoufox binary or download it into `./runtime/camoufox`."""
-    existing = find_camoufox_executable()
-    if existing:
-        return existing
-
-    target_dir = Path(os.getcwd()) / "runtime" / "camoufox"
-    target_bin = target_dir / _camoufox_binary_relative_path()
-    if target_bin.is_file() and os.access(target_bin, os.X_OK):
-        return str(target_bin)
-
-    url, archive_name = _camoufox_archive_url()
-    if progress_callback:
-        progress_callback(f"正在下载 Camoufox ({archive_name})...")
-    debug_logger.log_info(f"[Camoufox] 未找到本地可执行文件，开始下载: {url}")
-
-    def _download_and_extract() -> str:
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging_dir = Path(
-            tempfile.mkdtemp(
-                prefix="camoufox-install-", dir=str(target_dir.parent)
-            )
-        )
-        zip_path = staging_dir / archive_name
-        try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "flow2api-camoufox-installer/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp, open(
-                zip_path, "wb"
-            ) as out_file:
-                shutil.copyfileobj(resp, out_file)
-
-            extract_dir = staging_dir / "extracted"
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for info in zf.infolist():
-                    dest = (extract_dir / info.filename).resolve()
-                    if not str(dest).startswith(str(extract_dir.resolve())):
-                        continue
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if info.is_dir():
-                        dest.mkdir(parents=True, exist_ok=True)
-                        continue
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    # Check symlink
-                    if (mode & 0o170000) == 0o120000:
-                        link_target = zf.read(info).decode("utf-8")
-                        if dest.exists() or dest.is_symlink():
-                            dest.unlink()
-                        os.symlink(link_target, dest)
-                    else:
-                        with zf.open(info) as src, open(dest, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        if mode & 0o111:
-                            os.chmod(dest, 0o755)
-
-            if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            shutil.move(str(extract_dir), str(target_dir))
-            if target_bin.is_file():
-                os.chmod(target_bin, 0o755)
-            return str(target_bin)
-        finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-
-    return await asyncio.to_thread(_download_and_extract)
-
-
-# ============================================================================
-# 3. Local Unauthenticated SOCKS5 Proxy Relay (for authenticated upstream proxies)
-# ============================================================================
-
-
-class LocalSocks5Relay:
-    """Local `127.0.0.1:0` SOCKS5 server forwarding connections to upstream HTTP/SOCKS5 proxy."""
-
-    def __init__(self, upstream_proxy_url: str):
-        self.upstream_proxy_url = upstream_proxy_url.strip()
-        self.parsed = urlparse(
-            self.upstream_proxy_url
-            if "://" in self.upstream_proxy_url
-            else f"http://{self.upstream_proxy_url}"
-        )
-        self._server: Optional[asyncio.AbstractServer] = None
-        self._client_tasks: Set[asyncio.Task] = set()
-        self._client_writers: Set[asyncio.StreamWriter] = set()
-        self.host = "127.0.0.1"
-        self.port = 0
-
-    async def start(self) -> Tuple[str, int]:
-        self._server = await asyncio.start_server(
-            self._handle_client, self.host, 0
-        )
-        sockets = self._server.sockets or []
-        if sockets:
-            self.port = sockets[0].getsockname()[1]
-        return self.host, self.port
-
-    async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
-            try:
-                await self._server.wait_closed()
-            except Exception:
-                pass
-            self._server = None
-        writers = list(self._client_writers)
-        self._client_writers.clear()
-        for w in writers:
-            try:
-                w.close()
-            except Exception:
-                pass
-        tasks = list(self._client_tasks)
-        self._client_tasks.clear()
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _handle_client(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        current_task = asyncio.current_task()
-        if current_task is not None:
-            self._client_tasks.add(current_task)
-        self._client_writers.add(writer)
-        upstream_writer: Optional[asyncio.StreamWriter] = None
-        try:
-            header = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
-            if header[0] != 5:
-                return
-            methods = await asyncio.wait_for(
-                reader.readexactly(header[1]), timeout=10.0
-            )
-            if 0 not in methods:
-                writer.write(b"\x05\xff")
-                await writer.drain()
-                return
-            writer.write(b"\x05\x00")
-            await writer.drain()
-
-            req = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
-            if req[0] != 5 or req[1] != 1:
-                writer.write(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                return
-            atyp = req[3]
-            if atyp == 1:
-                raw_ip = await asyncio.wait_for(reader.readexactly(4), timeout=10.0)
-                target_host = socket.inet_ntop(socket.AF_INET, raw_ip)
-            elif atyp == 4:
-                raw_ip = await asyncio.wait_for(reader.readexactly(16), timeout=10.0)
-                target_host = socket.inet_ntop(socket.AF_INET6, raw_ip)
-            elif atyp == 3:
-                length = (
-                    await asyncio.wait_for(reader.readexactly(1), timeout=10.0)
-                )[0]
-                target_host = (
-                    await asyncio.wait_for(reader.readexactly(length), timeout=10.0)
-                ).decode("utf-8", errors="replace")
-            else:
-                writer.write(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-                return
-            target_port = struct.unpack(
-                "!H", await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
-            )[0]
-
-            upstream_reader, upstream_writer = await self._dial_upstream(
-                target_host, target_port
-            )
-            self._client_writers.add(upstream_writer)
-            writer.write(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-            await writer.drain()
-            async def _pipe(
-                r: asyncio.StreamReader, w: asyncio.StreamWriter
-            ) -> None:
-                try:
-                    while True:
-                        chunk = await r.read(32768)
-                        if not chunk:
-                            break
-                        w.write(chunk)
-                        await w.drain()
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        w.close()
-                    except Exception:
-                        pass
-
-            await asyncio.gather(
-                _pipe(reader, upstream_writer), _pipe(upstream_reader, writer)
-            )
-        except Exception:
-            try:
-                writer.write(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
-                await writer.drain()
-            except Exception:
-                pass
-        finally:
-            if current_task is not None:
-                self._client_tasks.discard(current_task)
-            for w in (upstream_writer, writer):
-                if w is not None:
-                    self._client_writers.discard(w)
-                    try:
-                        w.close()
-                    except Exception:
-                        pass
-
-    async def _dial_upstream(
-        self, target_host: str, target_port: int
-    ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
-        scheme = (self.parsed.scheme or "http").lower()
-        proxy_host = self.parsed.hostname or "127.0.0.1"
-        proxy_port = self.parsed.port or (1080 if "socks" in scheme else 8080)
-        username = self.parsed.username or ""
-        password = self.parsed.password or ""
-
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(proxy_host, proxy_port), timeout=15.0
-        )
-        try:
-            if scheme.startswith("socks5"):
-                if username or password:
-                    writer.write(b"\x05\x02\x00\x02")
-                else:
-                    writer.write(b"\x05\x01\x00")
-                await writer.drain()
-                resp = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
-                if resp[1] == 2:
-                    u_bytes = username.encode("utf-8")
-                    p_bytes = password.encode("utf-8")
-                    writer.write(
-                        bytes([1, len(u_bytes)])
-                        + u_bytes
-                        + bytes([len(p_bytes)])
-                        + p_bytes
-                    )
-                    await writer.drain()
-                    auth_resp = await asyncio.wait_for(
-                        reader.readexactly(2), timeout=10.0
-                    )
-                    if auth_resp[1] != 0:
-                        raise RuntimeError("SOCKS5 upstream auth failed")
-                elif resp[1] != 0:
-                    raise RuntimeError(f"SOCKS5 upstream method rejected: {resp[1]}")
-
-                host_bytes = target_host.encode("utf-8")
-                writer.write(
-                    b"\x05\x01\x00\x03"
-                    + bytes([len(host_bytes)])
-                    + host_bytes
-                    + struct.pack("!H", target_port)
-                )
-                await writer.drain()
-                conn_resp = await asyncio.wait_for(
-                    reader.readexactly(4), timeout=15.0
-                )
-                if conn_resp[1] != 0:
-                    raise RuntimeError(
-                        f"SOCKS5 upstream connect failed: {conn_resp[1]}"
-                    )
-                atyp = conn_resp[3]
-                if atyp == 1:
-                    await asyncio.wait_for(reader.readexactly(6), timeout=15.0)
-                elif atyp == 4:
-                    await asyncio.wait_for(reader.readexactly(18), timeout=15.0)
-                elif atyp == 3:
-                    ln = (await asyncio.wait_for(reader.readexactly(1), timeout=15.0))[0]
-                    await asyncio.wait_for(reader.readexactly(ln + 2), timeout=15.0)
-                return reader, writer
-
-            # HTTP CONNECT proxy
-            connect_lines = [
-                f"CONNECT {target_host}:{target_port} HTTP/1.1",
-                f"Host: {target_host}:{target_port}",
-            ]
-            if username or password:
-                token = base64.b64encode(
-                    f"{username}:{password}".encode("utf-8")
-                ).decode("ascii")
-                connect_lines.append(f"Proxy-Authorization: Basic {token}")
-            connect_lines.append("\r\n")
-            writer.write("\r\n".join(connect_lines).encode("utf-8"))
-            await writer.drain()
-
-            status_line = await asyncio.wait_for(reader.readline(), timeout=15.0)
-            if b" 200 " not in status_line:
-                raise RuntimeError(
-                    f"HTTP proxy CONNECT failed: {status_line.decode('utf-8', errors='replace').strip()}"
-                )
-            while True:
-                line = await asyncio.wait_for(reader.readline(), timeout=10.0)
-                if line in (b"\r\n", b"\n", b""):
-                    break
-            return reader, writer
-        except BaseException:
-            writer.close()
-            raise
-
-
-# ============================================================================
-# 4. Pure-Python WebDriver BiDi Client
-# ============================================================================
-
-
-def _from_bidi_remote_value(remote: Any) -> Any:
-    """Recursively decode a WebDriver BiDi RemoteValue into a native Python value."""
-    if not isinstance(remote, dict):
-        return remote
-    rtype = remote.get("type")
-    if rtype in ("undefined", "null"):
-        return None
-    if rtype in ("string", "boolean", "bigint"):
-        return remote.get("value")
-    if rtype == "number":
-        val = remote.get("value")
-        if isinstance(val, (int, float)):
-            return val
-        return 0
-    if rtype == "array":
-        items = remote.get("value")
-        if isinstance(items, list):
-            return [_from_bidi_remote_value(item) for item in items]
-        return []
-    if rtype in ("object", "map"):
-        pairs = remote.get("value")
-        out: Dict[str, Any] = {}
-        if isinstance(pairs, list):
-            for pair in pairs:
-                if isinstance(pair, list) and len(pair) == 2:
-                    raw_key, raw_val = pair
-                    key = (
-                        _from_bidi_remote_value(raw_key)
-                        if isinstance(raw_key, dict)
-                        else str(raw_key)
-                    )
-                    out[str(key)] = _from_bidi_remote_value(raw_val)
-        return out
-    return remote.get("value")
-
-
-def _to_bidi_local_value(value: Any) -> Dict[str, Any]:
-    """Encode a native Python value into a WebDriver BiDi LocalValue."""
-    if value is None:
-        return {"type": "null"}
-    if isinstance(value, bool):
-        return {"type": "boolean", "value": value}
-    if isinstance(value, (int, float)):
-        return {"type": "number", "value": value}
-    if isinstance(value, str):
-        return {"type": "string", "value": value}
-    if isinstance(value, (list, tuple)):
-        return {
-            "type": "array",
-            "value": [_to_bidi_local_value(item) for item in value],
-        }
-    if isinstance(value, dict):
-        return {
-            "type": "object",
-            "value": [
-                [str(k), _to_bidi_local_value(v)] for k, v in value.items()
-            ],
-        }
-    return {"type": "string", "value": str(value)}
-
-
-class BiDiChannel:
-    """Receives `script.message` events for a registered BiDi channel."""
-
-    def __init__(self, client: "BiDiClient", name: str):
-        self.client = client
-        self.name = name
-        self._queue: asyncio.Queue[Any] = asyncio.Queue()
-        self._closed = False
-
-    def push(self, data: Any) -> None:
-        if not self._closed:
-            self._queue.put_nowait(data)
-
-    def fail(self, exc: Exception) -> None:
-        if not self._closed:
-            self._closed = True
-            self._queue.put_nowait(exc)
-
-    async def next_text(self, timeout: float = 90.0) -> str:
-        item = await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        if isinstance(item, Exception):
-            raise item
-        val = _from_bidi_remote_value(item)
-        return str(val or "")
-
-    def close(self) -> None:
-        self._closed = True
-        self.client._channels.pop(self.name, None)
-
-
-class BiDiClient:
-    """Async WebDriver BiDi client over WebSocket (supports `websockets` or `aiohttp`)."""
-
-    def __init__(self, ws_send: Callable[[str], Any], ws_close: Callable[[], Any]):
-        self._ws_send = ws_send
-        self._ws_close = ws_close
-        self._send_lock = asyncio.Lock()
-        self._next_id = 0
-        self._pending: Dict[int, asyncio.Future] = {}
-        self._channels: Dict[str, BiDiChannel] = {}
-        self._event_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
-        self._closed = False
-        self._failure: Optional[Exception] = None
-        self._reader_task: Optional[asyncio.Task] = None
-
-    @staticmethod
-    def _normalize_endpoint(endpoint: str) -> str:
-        parsed = urlparse(endpoint.strip())
-        if parsed.path in ("", "/"):
-            return endpoint.strip().rstrip("/") + "/session"
-        return endpoint.strip()
-
-    @classmethod
-    async def connect(cls, endpoint: str, timeout: float = 30.0) -> "BiDiClient":
-        endpoint = cls._normalize_endpoint(endpoint)
-        if websockets is not None:
-            ws = await asyncio.wait_for(
-                websockets.connect(
-                    endpoint,
-                    max_size=64 * 1024 * 1024,
-                    ping_interval=None,
-                ),
-                timeout=timeout,
-            )
-            client = cls(ws.send, ws.close)
-
-            async def _read_loop() -> None:
-                try:
-                    async for raw in ws:
-                        text = (
-                            raw.decode("utf-8", errors="replace")
-                            if isinstance(raw, (bytes, bytearray))
-                            else str(raw)
-                        )
-                        client._handle_message(text)
-                except Exception as exc:
-                    client._fail_all(exc)
-                finally:
-                    client._fail_all(RuntimeError("BiDi WebSocket closed"))
-
-            client._reader_task = asyncio.create_task(_read_loop())
-            return client
-
-        if aiohttp is not None:
-            session = aiohttp.ClientSession()
-            try:
-                ws = await asyncio.wait_for(
-                    session.ws_connect(
-                        endpoint, max_msg_size=64 * 1024 * 1024, heartbeat=None
-                    ),
-                    timeout=timeout,
-                )
-            except BaseException:
-                await session.close()
-                raise
-
-            async def _close_all() -> None:
-                try:
-                    await ws.close()
-                finally:
-                    await session.close()
-
-            client = cls(ws.send_str, _close_all)
-
-            async def _read_loop() -> None:
-                try:
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            client._handle_message(msg.data)
-                        elif msg.type == aiohttp.WSMsgType.BINARY:
-                            client._handle_message(
-                                msg.data.decode("utf-8", errors="replace")
-                            )
-                        elif msg.type in (
-                            aiohttp.WSMsgType.CLOSED,
-                            aiohttp.WSMsgType.ERROR,
-                        ):
-                            break
-                except Exception as exc:
-                    client._fail_all(exc)
-                finally:
-                    client._fail_all(RuntimeError("BiDi WebSocket closed"))
-                    await session.close()
-
-            client._reader_task = asyncio.create_task(_read_loop())
-            return client
-
-        raise RuntimeError(
-            "缺少 WebSocket 客户端依赖：请安装 websockets 或 aiohttp"
-        )
-
-    def _fail_all(self, exc: Exception) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._failure = exc
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.set_exception(exc)
-        self._pending.clear()
-        for ch in list(self._channels.values()):
-            ch.fail(exc)
-        self._channels.clear()
-
-    def _handle_message(self, raw_text: str) -> None:
-        try:
-            envelope = json.loads(raw_text)
-        except Exception:
-            return
-        if not isinstance(envelope, dict):
-            return
-        msg_id = envelope.get("id")
-        if msg_id is not None:
-            fut = self._pending.pop(int(msg_id), None)
-            if fut is not None and not fut.done():
-                fut.set_result(envelope)
-            return
-        method = str(envelope.get("method") or "")
-        params = envelope.get("params")
-        if not isinstance(params, dict):
-            params = {}
-        if method == "script.message":
-            ch_name = str(params.get("channel") or "")
-            ch = self._channels.get(ch_name)
-            if ch is not None:
-                ch.push(params.get("data"))
-        for listener in list(self._event_listeners):
-            try:
-                listener(method, params)
-            except Exception:
-                pass
-
-    def add_listener(
-        self, callback: Callable[[str, Dict[str, Any]], None]
-    ) -> None:
-        if callback not in self._event_listeners:
-            self._event_listeners.append(callback)
-
-    def remove_listener(
-        self, callback: Callable[[str, Dict[str, Any]], None]
-    ) -> None:
-        if callback in self._event_listeners:
-            self._event_listeners.remove(callback)
-
-    def open_channel(self, name: str) -> BiDiChannel:
-        ch = BiDiChannel(self, name)
-        self._channels[name] = ch
-        return ch
-    async def command(
-        self,
-        method: str,
-        params: Optional[Dict[str, Any]] = None,
-        timeout: float = 60.0,
-    ) -> Dict[str, Any]:
-        if self._closed:
-            raise self._failure or RuntimeError("BiDi connection is closed")
-        loop = asyncio.get_running_loop()
-        self._next_id += 1
-        req_id = self._next_id
-        fut: asyncio.Future = loop.create_future()
-        self._pending[req_id] = fut
-        payload = json.dumps(
-            {"id": req_id, "method": method, "params": params or {}},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        try:
-            async with self._send_lock:
-                await asyncio.wait_for(self._ws_send(payload), timeout=timeout)
-            envelope = await asyncio.wait_for(fut, timeout=timeout)
-        finally:
-            self._pending.pop(req_id, None)
-
-        if envelope.get("type") == "error" or "error" in envelope:
-            err_code = envelope.get("error") or "unknown"
-            err_msg = envelope.get("message") or ""
-            raise RuntimeError(f"BiDi {method} failed: {err_code} ({err_msg})")
-        result = envelope.get("result")
-        return result if isinstance(result, dict) else {}
-
-    async def evaluate(
-        self,
-        context_id: str,
-        expression: str,
-        *,
-        await_promise: bool = True,
-        sandbox: str = "",
-        user_activation: bool = False,
-        timeout: float = 45.0,
-    ) -> Any:
-        target: Dict[str, Any] = {"context": context_id}
-        if sandbox:
-            target["sandbox"] = sandbox
-        params: Dict[str, Any] = {
-            "expression": expression,
-            "target": target,
-            "awaitPromise": await_promise,
-            "resultOwnership": "none",
-        }
-        if user_activation:
-            params["userActivation"] = True
-        res = await self.command("script.evaluate", params, timeout=timeout)
-        if res.get("type") == "exception":
-            details = res.get("exceptionDetails") or {}
-            text = details.get("text") or "JS evaluation exception"
-            raise RuntimeError(f"BiDi script.evaluate exception: {text}")
-        return _from_bidi_remote_value(res.get("result"))
-
-    async def call_function(
-        self,
-        context_id: str,
-        function_declaration: str,
-        arguments: Optional[List[Dict[str, Any]]] = None,
-        *,
-        await_promise: bool = True,
-        sandbox: str = "",
-        user_activation: bool = False,
-        timeout: float = 60.0,
-    ) -> Any:
-        target: Dict[str, Any] = {"context": context_id}
-        if sandbox:
-            target["sandbox"] = sandbox
-        params: Dict[str, Any] = {
-            "functionDeclaration": function_declaration,
-            "target": target,
-            "awaitPromise": await_promise,
-            "resultOwnership": "none",
-            "arguments": arguments or [],
-        }
-        if user_activation:
-            params["userActivation"] = True
-        res = await self.command("script.callFunction", params, timeout=timeout)
-        if res.get("type") == "exception":
-            details = res.get("exceptionDetails") or {}
-            text = details.get("text") or "JS callFunction exception"
-            raise RuntimeError(f"BiDi script.callFunction exception: {text}")
-        return _from_bidi_remote_value(res.get("result"))
-
-    async def close(self) -> None:
-        self._fail_all(RuntimeError("BiDi client closed"))
-        try:
-            await self._ws_close()
-        except Exception:
-            pass
-        if self._reader_task and not self._reader_task.done():
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except BaseException:
-                pass
-
-
-# ============================================================================
-# 5. Firefox Profile & Preferences Writer (matching AIStudio2API launcher.go)
-# ============================================================================
-
-
-def _firefox_pref_literal(value: Any) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, int):
-        return str(value)
-    return json.dumps(str(value), ensure_ascii=False)
-
-
-def write_camoufox_user_js(
-    profile_dir: Path,
-    fingerprint_config: Dict[str, Any],
-    *,
-    proxy_url: Optional[str] = None,
-    relay_addr: Optional[Tuple[str, int]] = None,
-    headless: bool = True,
-    live_view: bool = False,
-    cache_dir: Optional[Path] = None,
-    executable_path: Optional[Union[str, Path]] = None,
-) -> None:
-    """Write `user.js` preferences matching AIStudio2API `launchBrowser` + `firefoxPreferences`."""
-    prefs: Dict[str, Any] = {
-        "remote.active-protocols": 1,
-        "devtools.chrome.enabled": True,
-        "devtools.debugger.remote-enabled": True,
-        "browser.shell.checkDefaultBrowser": False,
-        "webgl.force-enabled": True,
-        "extensions.webextensions.remote": False,
-        "network.process.enabled": False,
-        "media.rdd-process.enabled": False,
-        "media.utility-process.enabled": False,
-        "media.peerconnection.enabled": True,
-        "javascript.options.mem.nursery.max_kb": 4096,
-        "gfx.webrender.max-shared-surface-size": 512,
-        "gfx.display.frame-rate-divisor": 1,
-    }
-    sys_name = platform.system().lower()
-    if sys_name != "windows":
-        prefs["dom.webgpu.enabled"] = True
-        prefs["widget.non-native-theme.scrollbar.style"] = 4
-        prefs["dom.quotaManager.temporaryStorage.fixedLimit"] = 50 << 20
-        prefs["ui.prefersReducedMotion"] = 0
-        font_prefs = _WINDOWS_FONTS_DATA.get("prefs")
-        if isinstance(font_prefs, dict):
-            for k, v in font_prefs.items():
-                prefs[k] = int(v) if isinstance(v, float) and v.is_integer() else v
-
-    if sys_name == "darwin":
-        exe = executable_path or find_camoufox_executable()
-        if exe:
-            fonts_dir = Path(exe).resolve().parent.parent / "Resources" / "fonts"
-            add_windows_substitute_names(fonts_dir)
-        # gfx.font_loader.delay = 0 makes Firefox load localized & weighted font family names synchronously
-        prefs["gfx.font_loader.delay"] = 0
-        # Draw in parent process where bundled Resources/fonts are registered with CoreText
-        prefs["layers.gpu-process.enabled"] = False
-        prefs["webgl.allow-in-parent"] = True
-    # Proxy configuration (always reset stale proxy keys so persistent profiles cleanly toggle proxy on/off)
-    prefs.update(
-        {
-            "network.proxy.type": 0,
-            "network.proxy.http": "",
-            "network.proxy.http_port": 0,
-            "network.proxy.ssl": "",
-            "network.proxy.ssl_port": 0,
-            "network.proxy.socks": "",
-            "network.proxy.socks_port": 0,
-            "network.proxy.no_proxies_on": "localhost, 127.0.0.1, ::1",
-        }
-    )
-    if relay_addr is not None:
-        r_host, r_port = relay_addr
-        prefs.update(
-            {
-                "network.proxy.type": 1,
-                "network.proxy.socks": r_host,
-                "network.proxy.socks_port": int(r_port),
-                "network.proxy.socks_version": 5,
-                "network.proxy.socks_remote_dns": True,
-            }
-        )
-    elif proxy_url:
-        parsed = urlparse(
-            proxy_url if "://" in proxy_url else f"http://{proxy_url}"
-        )
-        scheme = (parsed.scheme or "http").lower()
-        p_host = parsed.hostname or "127.0.0.1"
-        p_port = parsed.port or (1080 if "socks" in scheme else 8080)
-        prefs["network.proxy.type"] = 1
-        if "socks" in scheme:
-            prefs["network.proxy.socks"] = p_host
-            prefs["network.proxy.socks_port"] = int(p_port)
-            prefs["network.proxy.socks_version"] = 4 if "socks4" in scheme else 5
-            prefs["network.proxy.socks_remote_dns"] = scheme != "socks5"
-        else:
-            prefs["network.proxy.http"] = p_host
-            prefs["network.proxy.http_port"] = int(p_port)
-            prefs["network.proxy.ssl"] = p_host
-            prefs["network.proxy.ssl_port"] = int(p_port)
-
-    lines = [
-        f'user_pref({json.dumps(k)}, {_firefox_pref_literal(v)});'
-        for k, v in sorted(prefs.items())
-    ]
-    (profile_dir / "user.js").write_text("\n".join(lines) + "\n", encoding="utf-8")
-    prefs_js_path = profile_dir / "prefs.js"
-    if prefs_js_path.is_file():
-        try:
-            stale_prefixes = (
-                'user_pref("camoufox.blocked"',
-                'user_pref("dom.ipc.processCount',
-                'user_pref("javascript.options.baselinejit_threshold"',
-                'user_pref("javascript.options.ion_threshold"',
-                'user_pref("javascript.options.compact_on_user_inactive_delay"',
-                'user_pref("javascript.options.mem.gc_',
-                'user_pref("browser.sessionhistory.',
-                'user_pref("browser.sessionstore.',
-                'user_pref("image.mem.surfacecache.',
-                'user_pref("layout.frame_rate"',
-                'user_pref("media.autoplay.default"',
-                'user_pref("network.dns.disablePrefetch"',
-                'user_pref("network.http.speculative-parallel-limit"',
-                'user_pref("network.prefetch-next"',
-                'user_pref("network.proxy.',
-                'user_pref("remote.prefs.recommended"',
-                'user_pref("browser.cache.disk.',
-                'user_pref("gfx.webrender.enable-subpixel-aa"',
-                'user_pref("gfx.display.frame-rate-divisor", 60)',
-            )
-            raw_prefs = prefs_js_path.read_text(encoding="utf-8").splitlines()
-            cleaned_prefs = [
-                ln for ln in raw_prefs if not ln.startswith(stale_prefixes)
-            ]
-            if len(cleaned_prefs) != len(raw_prefs):
-                prefs_js_path.write_text(
-                    "\n".join(cleaned_prefs) + "\n", encoding="utf-8"
-                )
-        except Exception:
-            pass
-def _start_stdout_drain(
-    proc: Optional[asyncio.subprocess.Process],
-) -> Optional[asyncio.Task]:
-    """Continuously drain subprocess stdout after BiDi startup to avoid 64KB OS pipe buffer deadlocks."""
-    if proc is None or proc.stdout is None:
-        return None
-
-    async def _drain() -> None:
-        try:
-            while proc.stdout is not None:
-                chunk = await proc.stdout.read(8192)
-                if not chunk:
-                    break
-        except Exception:
-            pass
-
-    return asyncio.create_task(_drain())
-
-
 # ============================================================================
 # 7. CamoufoxWorker: Per-Slot Persistent Browser & BiDi Session
 # ============================================================================
@@ -1792,6 +313,15 @@ class CamoufoxWorker:
             return account_dir
         return self.user_data_dir / "shared"
 
+    async def _resolve_account_dir_async(
+        self,
+        token_id: Optional[int],
+        profile_dir_name: Optional[str] = None,
+    ) -> Path:
+        return await asyncio.to_thread(
+            self._resolve_account_dir, token_id, profile_dir_name=profile_dir_name
+        )
+
     async def _get_token_profile_dir_name(self, token_id: Optional[int]) -> Optional[str]:
         token_key = self._normalize_token_key(token_id)
         if token_key is None or not self.db or not hasattr(self.db, "get_token"):
@@ -1810,7 +340,7 @@ class CamoufoxWorker:
         self._browser_proxy_active = bool(raw_proxy_url)
 
         profile_dir_name = await self._get_token_profile_dir_name(token_id)
-        account_dir = self._resolve_account_dir(
+        account_dir = await self._resolve_account_dir_async(
             token_id, profile_dir_name=profile_dir_name
         )
         login_holder = get_profile_login_holder(account_dir)
@@ -1988,26 +518,7 @@ class CamoufoxWorker:
     async def _wait_for_bidi_endpoint(
         proc: asyncio.subprocess.Process, timeout: float = 45.0
     ) -> str:
-        recent_lines: deque[str] = deque(maxlen=25)
-        deadline = time.monotonic() + timeout
-        assert proc.stdout is not None
-        while time.monotonic() < deadline:
-            remaining = max(0.5, deadline - time.monotonic())
-            line_bytes = await asyncio.wait_for(
-                proc.stdout.readline(), timeout=remaining
-            )
-            if not line_bytes:
-                break
-            line = line_bytes.decode("utf-8", errors="replace").strip()
-            if line:
-                recent_lines.append(line)
-            match = BIDI_ENDPOINT_PATTERN.search(line)
-            if match:
-                return match.group(1)
-
-        # Drain remaining stdout in background if found; otherwise error
-        tail = " | ".join(recent_lines)
-        raise RuntimeError(f"Camoufox 未输出 WebDriver BiDi 端点: {tail}")
+        return await wait_for_bidi_endpoint(proc, timeout=timeout)
 
     async def _install_cookies_via_bidi(self, cookies: List[Dict[str, Any]]) -> None:
         if not self._bidi or not cookies:
@@ -2160,7 +671,7 @@ class CamoufoxWorker:
         if isinstance(account_dir, Path) and account_dir.exists():
             dirs_to_update.append(account_dir)
         elif bound_id is not None:
-            fallback_dir = self._resolve_account_dir(bound_id)
+            fallback_dir = await self._resolve_account_dir_async(bound_id)
             if fallback_dir.exists():
                 dirs_to_update.append(fallback_dir)
 
@@ -2233,7 +744,9 @@ class CamoufoxWorker:
             google_cookies = session_token
         if not (google_cookies or session_token):
             ss_path = (
-                self._resolve_account_dir(token_key, profile_dir_name=profile_dir_name)
+                await self._resolve_account_dir_async(
+                    token_key, profile_dir_name=profile_dir_name
+                )
                 / "storage-state.json"
             )
             if ss_path.is_file():
@@ -3319,10 +1832,18 @@ class CamoufoxWorker:
                                 sid: '',
                                 gsid: '',
                                 channelPath,
+                                _waiters: [],
+                                notify: () => {
+                                    const ws = entry._waiters.splice(0);
+                                    for (const w of ws) {
+                                        try { w(); } catch (_) {}
+                                    }
+                                },
                                 abort: () => {
                                     if (entry.aborted) return;
                                     entry.aborted = true;
                                     entry.done = true;
+                                    entry.notify();
                                     try { ac.abort(); } catch (_) {}
                                     if (entry.sid) {
                                         try {
@@ -3358,6 +1879,7 @@ class CamoufoxWorker:
                                         entry.status = hsResp.status;
                                         entry.error = `WebChannel handshake HTTP ${hsResp.status}: ${hsText.slice(0, 300)}`;
                                         entry.done = true;
+                                        entry.notify();
                                         return;
                                     }
                                     const gsid = hsResp.headers.get('x-http-session-id') || '';
@@ -3367,6 +1889,7 @@ class CamoufoxWorker:
                                         entry.status = hsResp.status;
                                         entry.error = `WebChannel handshake missing SID: ${hsText.slice(0, 300)}`;
                                         entry.done = true;
+                                        entry.notify();
                                         return;
                                     }
                                     entry.sid = sid;
@@ -3395,11 +1918,13 @@ class CamoufoxWorker:
                                             const errBody = await rpcResp.text();
                                             entry.error = `WebChannel GET HTTP ${rpcResp.status}: ${errBody.slice(0, 300)}`;
                                             entry.done = true;
+                                            entry.notify();
                                             return;
                                         }
                                         if (!rpcResp.body || !rpcResp.body.getReader) {
                                             entry.text = await rpcResp.text();
                                             entry.done = true;
+                                            entry.notify();
                                             return;
                                         }
                                         const reader = rpcResp.body.getReader();
@@ -3408,11 +1933,13 @@ class CamoufoxWorker:
                                             const { value, done } = await reader.read();
                                             if (value) {
                                                 entry.text += decoder.decode(value, { stream: !done });
+                                                entry.notify();
                                             }
                                             if (done) {
                                                 const tail = decoder.decode();
                                                 if (tail) entry.text += tail;
                                                 entry.done = true;
+                                                entry.notify();
                                                 break;
                                             }
                                         }
@@ -3444,16 +1971,19 @@ class CamoufoxWorker:
                                         entry.status = fwdResp.status;
                                         entry.error = `WebChannel POST HTTP ${fwdResp.status}: ${fwdErr.slice(0, 300)}`;
                                         entry.done = true;
+                                        entry.notify();
                                         return;
                                     }
                                     await rpcPromise;
                                 } catch (err) {
                                     if (entry.aborted) {
                                         entry.done = true;
+                                        entry.notify();
                                         return;
                                     }
                                     entry.error = String((err && err.message) || err || 'WebChannel fetch error');
                                     entry.done = true;
+                                    entry.notify();
                                 }
                             };
 
@@ -3491,23 +2021,50 @@ class CamoufoxWorker:
                         sent_nonempty_delta = False
                         should_retry_risk = False
                         while time.monotonic() < deadline:
+                            rem_ms = max(100, min(1500, int((deadline - time.monotonic()) * 1000)))
                             poll = await bidi.call_function(
                                 context_id,
-                                """(sid) => {
+                                """(sid, waitMs) => new Promise((resolve) => {
+                                    const flush = () => {
+                                        const store = window.__flow2apiAgentStreams || {};
+                                        const entry = store[sid];
+                                        if (!entry) return { missing: true, done: true };
+                                        const delta = entry.text.slice(entry.offset);
+                                        entry.offset = entry.text.length;
+                                        return {
+                                            status: entry.status,
+                                            delta,
+                                            done: Boolean(entry.done),
+                                            error: entry.error || '',
+                                        };
+                                    };
                                     const store = window.__flow2apiAgentStreams || {};
                                     const entry = store[sid];
-                                    if (!entry) return { missing: true, done: true };
-                                    const delta = entry.text.slice(entry.offset);
-                                    entry.offset = entry.text.length;
-                                    return {
-                                        status: entry.status,
-                                        delta,
-                                        done: Boolean(entry.done),
-                                        error: entry.error || '',
+                                    if (!entry || entry.done || entry.error || entry.text.length > entry.offset) {
+                                        resolve(flush());
+                                        return;
+                                    }
+                                    let settled = false;
+                                    const onWake = () => {
+                                        if (settled) return;
+                                        settled = true;
+                                        clearTimeout(timer);
+                                        resolve(flush());
                                     };
-                                }""",
-                                arguments=[_to_bidi_local_value(stream_id)],
-                                await_promise=False,
+                                    const timer = setTimeout(() => {
+                                        if (settled) return;
+                                        settled = true;
+                                        const idx = entry._waiters ? entry._waiters.indexOf(onWake) : -1;
+                                        if (idx >= 0) entry._waiters.splice(idx, 1);
+                                        resolve(flush());
+                                    }, Math.max(50, Math.min(2000, Number(waitMs) || 1500)));
+                                    (entry._waiters || (entry._waiters = [])).push(onWake);
+                                })""",
+                                arguments=[
+                                    _to_bidi_local_value(stream_id),
+                                    _to_bidi_local_value(rem_ms),
+                                ],
+                                await_promise=True,
                                 timeout=15.0,
                             )
                             if not isinstance(poll, dict) or poll.get("missing"):
@@ -3574,7 +2131,6 @@ class CamoufoxWorker:
                                     f"[Camoufox Agent] WebChannel done status={status} len={len(buffer_all)} preview={buffer_all[:350]!r}"
                                 )
                                 return
-                            await asyncio.sleep(0.15)
                         if should_retry_risk:
                             try:
                                 await bidi.call_function(
@@ -3867,10 +2423,35 @@ class CamoufoxWorker:
                                         window.fetch = async function(input, init) {
                                             const url = input instanceof Request ? input.url : String(input || "");
                                             if (url.includes("StreamChat")) {
-                                                const entry = { url, status: 0, chunks: "", done: false, error: "" };
+                                                const ac = new AbortController();
+                                                const origSignal = (init && init.signal) || (input instanceof Request ? input.signal : null);
+                                                if (origSignal) {
+                                                    if (origSignal.aborted) ac.abort();
+                                                    else origSignal.addEventListener("abort", () => { try { ac.abort(); } catch (_) {} }, { once: true });
+                                                }
+                                                const entry = {
+                                                    url,
+                                                    status: 0,
+                                                    chunks: "",
+                                                    done: false,
+                                                    error: "",
+                                                    _waiters: [],
+                                                    notify: () => {
+                                                        const ws = entry._waiters.splice(0);
+                                                        for (const w of ws) {
+                                                            try { w(); } catch (_) {}
+                                                        }
+                                                    },
+                                                    abort: () => {
+                                                        try { ac.abort(); } catch (_) {}
+                                                        entry.done = true;
+                                                        entry.notify();
+                                                    },
+                                                };
                                                 window.__flow2apiStreamChatReqs.push(entry);
                                                 try {
-                                                    const resp = await window.__flow2apiOrigFetch.apply(this, arguments);
+                                                    const nextInit = Object.assign({}, init || {}, { signal: ac.signal });
+                                                    const resp = await window.__flow2apiOrigFetch.call(this, input, nextInit);
                                                     entry.status = resp.status;
                                                     const clone = resp.clone();
                                                     (async () => {
@@ -3886,12 +2467,14 @@ class CamoufoxWorker:
                                                             entry.error = String(e);
                                                         } finally {
                                                             entry.done = true;
+                                                            entry.notify();
                                                         }
                                                     })();
                                                     return resp;
                                                 } catch (e) {
                                                     entry.error = String(e);
                                                     entry.done = true;
+                                                    entry.notify();
                                                     throw e;
                                                 }
                                             }
@@ -4115,20 +2698,47 @@ class CamoufoxWorker:
                                 },
                             )
 
-                            poll_steps = max(150, int((timeout or 90) * 5))
+                            stream_deadline = time.monotonic() + max(30.0, float(timeout or 90))
                             sc_status = 0
                             full_chunks = ""
-                            for _ in range(poll_steps):
-                                await asyncio.sleep(0.2)
-                                st = await bidi.evaluate(
+                            wait_sc_fn = """(minLen, waitMs) => new Promise((resolve) => {
+                                const check = () => {
+                                    const reqs = window.__flow2apiStreamChatReqs || [];
+                                    if (reqs.length <= minLen) return null;
+                                    const last = reqs[reqs.length - 1];
+                                    if (!last.done) return { pending: true, entry: last };
+                                    return { status: last.status, done: true, chunks: last.chunks || "", error: last.error || "" };
+                                };
+                                const cur = check();
+                                if (cur && cur.done) {
+                                    resolve(cur);
+                                    return;
+                                }
+                                let settled = false;
+                                const timer = setTimeout(() => {
+                                    if (settled) return;
+                                    settled = true;
+                                    const latest = check();
+                                    resolve(latest && latest.done ? latest : null);
+                                }, Math.max(80, Math.min(2000, Number(waitMs) || 1500)));
+                                if (cur && cur.entry && Array.isArray(cur.entry._waiters)) {
+                                    cur.entry._waiters.push(() => {
+                                        if (settled) return;
+                                        settled = true;
+                                        clearTimeout(timer);
+                                        const latest = check();
+                                        resolve(latest && latest.done ? latest : null);
+                                    });
+                                }
+                            })"""
+                            while time.monotonic() < stream_deadline:
+                                rem_ms = max(100, min(1500, int((stream_deadline - time.monotonic()) * 1000)))
+                                st = await bidi.call_function(
                                     context_id,
-                                    """(() => {
-                                        const reqs = window.__flow2apiStreamChatReqs || [];
-                                        if (!reqs.length) return null;
-                                        const last = reqs[reqs.length - 1];
-                                        return { status: last.status, done: last.done, chunks: last.done ? (last.chunks || "") : "", error: last.error };
-                                    })()""",
-                                    await_promise=False,
+                                    wait_sc_fn,
+                                    arguments=[_to_bidi_local_value(0), _to_bidi_local_value(rem_ms)],
+                                    await_promise=True,
+                                    timeout=15.0,
                                 )
                                 if isinstance(st, dict) and st.get("done"):
                                     sc_status = int(st.get("status") or 0)
@@ -4200,17 +2810,18 @@ class CamoufoxWorker:
                                         },
                                     )
                                     full_chunks = ""
-                                    for _ in range(poll_steps):
-                                        await asyncio.sleep(0.2)
-                                        st2 = await bidi.evaluate(
+                                    perm_deadline = time.monotonic() + max(30.0, float(timeout or 90))
+                                    while time.monotonic() < perm_deadline:
+                                        rem_ms = max(100, min(1500, int((perm_deadline - time.monotonic()) * 1000)))
+                                        st2 = await bidi.call_function(
                                             context_id,
-                                            f"""(() => {{
-                                                const reqs = window.__flow2apiStreamChatReqs || [];
-                                                if (reqs.length <= {prev_count}) return null;
-                                                const last = reqs[reqs.length - 1];
-                                                return {{ status: last.status, done: last.done, chunks: last.done ? (last.chunks || "") : "", error: last.error }};
-                                            }})()""",
-                                            await_promise=False,
+                                            wait_sc_fn,
+                                            arguments=[
+                                                _to_bidi_local_value(prev_count),
+                                                _to_bidi_local_value(rem_ms),
+                                            ],
+                                            await_promise=True,
+                                            timeout=15.0,
                                         )
                                         if isinstance(st2, dict) and st2.get("done"):
                                             sc_status = int(st2.get("status") or 0)
@@ -4377,6 +2988,25 @@ class CamoufoxWorker:
                         "session_id": f";{int(time.time() * 1000)}",
                         "fingerprint": self.get_last_fingerprint(),
                     }
+                except asyncio.CancelledError:
+                    try:
+                        await bidi.evaluate(
+                            context_id,
+                            """(() => {
+                                const reqs = window.__flow2apiStreamChatReqs || [];
+                                for (const item of reqs) {
+                                    if (item && !item.done && typeof item.abort === "function") {
+                                        item.abort();
+                                    }
+                                }
+                                return true;
+                            })()""",
+                            await_promise=False,
+                            timeout=3.0,
+                        )
+                    except Exception:
+                        pass
+                    raise
                 finally:
                     try:
                         await self._sync_live_cookies_to_db(token_id)
@@ -4616,1523 +3246,3 @@ class CamoufoxWorker:
                 self.note_idle()
 
 
-# ============================================================================
-# 6. Startup Cache, Storage State & Direct Browser Login (AIStudio2API login.go + liveview.go)
-# ============================================================================
-
-PROFILE_STARTUP_DIR_NAME = "profile-startup"
-STARTUP_CACHE_ENTRIES = ("compatibility.ini", "startupCache")
-
-
-def restore_startup_cache(account_dir: Path, profile_dir: Path) -> None:
-    """Copy cached `compatibility.ini` and `startupCache` from `account_dir/profile-startup` into `profile_dir`."""
-    source_root = account_dir / PROFILE_STARTUP_DIR_NAME
-    if not source_root.exists():
-        return
-    try:
-        _copy_startup_cache_entries(source_root, profile_dir)
-    except Exception as exc:
-        debug_logger.log_warning(f"[Camoufox] 恢复启动缓存失败: {exc}")
-
-
-def save_startup_cache(profile_dir: Path, account_dir: Path) -> None:
-    """Persist `compatibility.ini` and `startupCache` from `profile_dir` back to `account_dir/profile-startup`."""
-    if not (profile_dir / "startupCache").exists():
-        return
-    target = account_dir / PROFILE_STARTUP_DIR_NAME
-    staging = account_dir / f"{PROFILE_STARTUP_DIR_NAME}.new"
-    shutil.rmtree(staging, ignore_errors=True)
-    try:
-        _copy_startup_cache_entries(profile_dir, staging)
-        shutil.rmtree(target, ignore_errors=True)
-        staging.rename(target)
-    except Exception as exc:
-        shutil.rmtree(staging, ignore_errors=True)
-        debug_logger.log_warning(f"[Camoufox] 保存启动缓存失败: {exc}")
-
-
-def _copy_startup_cache_entries(source: Path, target: Path) -> None:
-    for entry_name in STARTUP_CACHE_ENTRIES:
-        src_entry = source / entry_name
-        if not src_entry.exists():
-            continue
-        dst_entry = target / entry_name
-        if src_entry.is_dir():
-            shutil.copytree(src_entry, dst_entry, dirs_exist_ok=True)
-        else:
-            dst_entry.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src_entry, dst_entry)
-
-
-def _clear_stale_firefox_profile_locks(profile_dir: Path) -> None:
-    """Remove stale Firefox profile lock files after a clean or forced exit."""
-    for lock_name in (".parentlock", "lock", "parent.lock"):
-        lock_path = profile_dir / lock_name
-        try:
-            if lock_path.exists() or lock_path.is_symlink():
-                lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-_RESERVED_PROFILE_NAMES = {"shared", "pending"}
-_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+(?:/[A-Za-z0-9._@-]+)*$")
-_ACTIVE_PROFILE_LOGIN_LEASES: Dict[Path, str] = {}
-_ACTIVE_TOKEN_LOGIN_LEASES: Dict[int, str] = {}
-_PROFILE_LOGIN_LEASE_LOCK = threading.Lock()
-
-
-def normalize_browser_profile_dir(profile_dir: Optional[str]) -> str:
-    """Normalize a per-account browser profile directory key relative to `browser_data_rt/`."""
-    raw = str(profile_dir or "").strip().replace("\\", "/")
-    raw = raw.strip("/")
-    if not raw:
-        return ""
-    if raw.startswith("browser_data_rt/"):
-        raw = raw[len("browser_data_rt/") :].strip("/")
-    if not raw:
-        return ""
-    parts = [p for p in raw.split("/") if p]
-    if not parts or any(p in (".", "..") for p in parts):
-        raise ValueError("浏览器资料目录路径不合法")
-    cleaned = "/".join(parts)
-    if not _PROFILE_NAME_RE.fullmatch(cleaned):
-        raise ValueError("浏览器资料目录仅支持字母、数字及 . _ @ - / 字符")
-    first_seg = parts[0].lower()
-    if first_seg in _RESERVED_PROFILE_NAMES or re.match(r"^browser_\d+$", first_seg):
-        raise ValueError(f"浏览器资料目录不能使用保留名称: {parts[0]}")
-    if re.fullmatch(r"token_\d+", cleaned) or cleaned.startswith("profiles/"):
-        return cleaned
-    return f"profiles/{cleaned}"
-
-
-def resolve_account_profile_dir(
-    user_data_root: Path,
-    *,
-    token_id: Optional[int] = None,
-    profile_dir_name: Optional[str] = None,
-) -> Tuple[Path, str]:
-    """Resolve `(absolute_account_dir, canonical_profile_key)` under `user_data_root`."""
-    normalized = normalize_browser_profile_dir(profile_dir_name)
-    if normalized:
-        return user_data_root / normalized, normalized
-    if token_id is not None and int(token_id) > 0:
-        canonical = f"token_{int(token_id)}"
-        return user_data_root / canonical, canonical
-    return user_data_root / "pending", ""
-
-
-def _profile_dir_summary(profile_root: Path, canonical: str) -> Dict[str, Any]:
-    ff_dir = profile_root / "firefox-profile"
-    cookies_db = ff_dir / "cookies.sqlite"
-    fp_file = profile_root / "camoufox-fingerprint.json"
-    ss_file = profile_root / "storage-state.json"
-    mtime = 0.0
-    for candidate in (cookies_db, ss_file, fp_file, ff_dir, profile_root):
-        try:
-            if candidate.exists():
-                mtime = max(mtime, candidate.stat().st_mtime)
-        except Exception:
-            pass
-    return {
-        "profile_dir": canonical,
-        "has_firefox_profile": ff_dir.is_dir(),
-        "has_cookies_db": cookies_db.is_file(),
-        "has_fingerprint": fp_file.is_file(),
-        "has_storage_state": ss_file.is_file(),
-        "active_login": bool(get_profile_login_holder(profile_root)),
-        "updated_at": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
-        if mtime > 0
-        else None,
-    }
-
-
-def list_browser_profile_dirs(user_data_root: Optional[Path] = None) -> List[Dict[str, Any]]:
-    """List persistent account browser directories under `browser_data_rt/`."""
-    root = user_data_root or (
-        Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
-    )
-    if not root.is_dir():
-        return []
-    entries: List[Dict[str, Any]] = []
-    try:
-        for child in sorted(root.iterdir(), key=lambda p: p.name):
-            if not child.is_dir():
-                continue
-            if re.fullmatch(r"token_\d+", child.name):
-                entries.append(_profile_dir_summary(child, child.name))
-        profiles_dir = root / "profiles"
-        if profiles_dir.is_dir():
-            for child in sorted(profiles_dir.iterdir(), key=lambda p: p.name):
-                if child.is_dir():
-                    entries.append(_profile_dir_summary(child, f"profiles/{child.name}"))
-    except Exception:
-        pass
-    return entries
-
-
-def _canonical_lease_path(account_dir: Path) -> Path:
-    try:
-        return account_dir.resolve()
-    except Exception:
-        return account_dir
-
-
-def get_profile_login_holder(account_dir: Path) -> Optional[str]:
-    key = _canonical_lease_path(account_dir)
-    with _PROFILE_LOGIN_LEASE_LOCK:
-        return _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
-
-
-def is_token_in_login_session(token_id: Optional[int]) -> bool:
-    if token_id is None:
-        return False
-    with _PROFILE_LOGIN_LEASE_LOCK:
-        return int(token_id) in _ACTIVE_TOKEN_LOGIN_LEASES
-
-
-def acquire_profile_login_lease(
-    account_dir: Path, session_id: str, *, token_id: Optional[int] = None
-) -> None:
-    key = _canonical_lease_path(account_dir)
-    with _PROFILE_LOGIN_LEASE_LOCK:
-        existing = _ACTIVE_PROFILE_LOGIN_LEASES.get(key)
-        if existing and existing != session_id:
-            raise RuntimeError(f"浏览器资料目录 {account_dir.name} 已被登录会话 {existing} 占用")
-        _ACTIVE_PROFILE_LOGIN_LEASES[key] = session_id
-        if token_id is not None and int(token_id) > 0:
-            _ACTIVE_TOKEN_LOGIN_LEASES[int(token_id)] = session_id
-
-
-def release_profile_login_lease(
-    account_dir: Optional[Path], session_id: str, *, token_id: Optional[int] = None
-) -> None:
-    with _PROFILE_LOGIN_LEASE_LOCK:
-        if account_dir is not None:
-            key = _canonical_lease_path(account_dir)
-            if _ACTIVE_PROFILE_LOGIN_LEASES.get(key) == session_id:
-                _ACTIVE_PROFILE_LOGIN_LEASES.pop(key, None)
-        if token_id is not None and int(token_id) > 0:
-            if _ACTIVE_TOKEN_LOGIN_LEASES.get(int(token_id)) == session_id:
-                _ACTIVE_TOKEN_LOGIN_LEASES.pop(int(token_id), None)
-
-
-def clear_site_cookies_in_profile(account_dir: Path) -> None:
-    """Clear site cookies while keeping hardware fingerprint, HTTP cache, and Firefox profile settings."""
-    ff_dir = account_dir / "firefox-profile"
-    for fname in ("cookies.sqlite", "cookies.sqlite-wal", "cookies.sqlite-shm"):
-        try:
-            p = ff_dir / fname
-            if p.exists():
-                p.unlink(missing_ok=True)
-        except Exception:
-            pass
-    try:
-        ss_path = account_dir / "storage-state.json"
-        if ss_path.is_file():
-            ss_path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-def persist_account_login_artifacts(source_dir: Path, target_dir: Path) -> None:
-    """Copy fingerprint, storage-state, startup cache, HTTP disk cache, and full Firefox profile from isolated login dir to account dir."""
-    if not source_dir.exists() or source_dir.resolve() == target_dir.resolve():
-        return
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for file_name in ("camoufox-fingerprint.json", "storage-state.json"):
-        src_file = source_dir / file_name
-        if src_file.is_file():
-            shutil.copy2(src_file, target_dir / file_name)
-    for dir_name in (PROFILE_STARTUP_DIR_NAME, "camoufox-cache", "firefox-profile"):
-        src_dir = source_dir / dir_name
-        if src_dir.is_dir():
-            dst_dir = target_dir / dir_name
-            if dir_name == "firefox-profile" and dst_dir.exists():
-                shutil.rmtree(dst_dir, ignore_errors=True)
-            shutil.copytree(
-                src_dir,
-                dst_dir,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(".parentlock", "lock", "parent.lock"),
-            )
-            if dir_name == "firefox-profile":
-                _clear_stale_firefox_profile_locks(dst_dir)
-def has_display() -> bool:
-    if sys.platform in ("darwin", "win32"):
-        return True
-    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
-
-
-WEBDRIVER_KEYS: Dict[str, str] = {
-    "Cancel": "\uE001",
-    "Help": "\uE002",
-    "Backspace": "\uE003",
-    "Tab": "\uE004",
-    "Clear": "\uE005",
-    "Enter": "\uE007",
-    "Shift": "\uE008",
-    "Control": "\uE009",
-    "Alt": "\uE00A",
-    "Pause": "\uE00B",
-    "Escape": "\uE00C",
-    "PageUp": "\uE00E",
-    "PageDown": "\uE00F",
-    "End": "\uE010",
-    "Home": "\uE011",
-    "ArrowLeft": "\uE012",
-    "ArrowUp": "\uE013",
-    "ArrowRight": "\uE014",
-    "ArrowDown": "\uE015",
-    "Insert": "\uE016",
-    "Delete": "\uE017",
-    "F1": "\uE031",
-    "F2": "\uE032",
-    "F3": "\uE033",
-    "F4": "\uE034",
-    "F5": "\uE035",
-    "F6": "\uE036",
-    "F7": "\uE037",
-    "F8": "\uE038",
-    "F9": "\uE039",
-    "F10": "\uE03A",
-    "F11": "\uE03B",
-    "F12": "\uE03C",
-    "Meta": "\uE03D",
-    "ZenkakuHankaku": "\uE040",
-}
-
-
-class CamoufoxLiveView:
-    """Streams live browser screenshots and forwards mouse/keyboard/wheel/paste inputs over WebSocket (AIStudio2API liveview.go)."""
-
-    def __init__(self) -> None:
-        self.status: str = "starting"
-        self.message: str = "正在启动 Camoufox 浏览器..."
-        self.frame_meta: Optional[Dict[str, Any]] = None
-        self.frame_b64: str = ""
-        self.frame_seq: int = 0
-        self.dialog: Optional[Dict[str, Any]] = None
-        self.dialog_seq: int = 0
-        self.contexts: List[str] = []
-        self._bidi: Optional[BiDiClient] = None
-        self._inputs: deque[Dict[str, Any]] = deque(maxlen=256)
-        self._subscribers: Set[Any] = set()
-        self._last_frame_requested_at: float = time.monotonic()
-        self._input_event = asyncio.Event()
-        self._wake_event = asyncio.Event()
-        self._closed = False
-        self._tasks: List[asyncio.Task] = []
-
-    def add_subscriber(self, subscriber: Any = None) -> Any:
-        token = subscriber if subscriber is not None else object()
-        self._subscribers.add(token)
-        self._last_frame_requested_at = time.monotonic()
-        self._wake_event.set()
-        return token
-
-    def remove_subscriber(self, subscriber: Any) -> None:
-        self._subscribers.discard(subscriber)
-
-    def snapshot(self, *, include_frame: bool = True) -> Dict[str, Any]:
-        if include_frame:
-            self._last_frame_requested_at = time.monotonic()
-        payload: Dict[str, Any] = {
-            "status": self.status,
-            "message": self.message,
-            "frame_seq": self.frame_seq,
-            "dialog": self.dialog,
-            "dialog_seq": self.dialog_seq,
-        }
-        if include_frame and self.frame_b64:
-            payload["frame_b64"] = self.frame_b64
-            payload["frame_meta"] = self.frame_meta
-        return payload
-
-    def set_status(self, status: str, message: str = "") -> None:
-        self.status = status
-        if message:
-            self.message = message
-        self._wake_event.set()
-    async def attach(self, bidi: BiDiClient, root_context_id: str) -> None:
-        self._bidi = bidi
-        self.contexts = [root_context_id]
-        bidi.add_listener(self._on_bidi_event)
-        try:
-            await bidi.command(
-                "session.subscribe",
-                {
-                    "events": [
-                        "browsingContext.contextCreated",
-                        "browsingContext.contextDestroyed",
-                        "browsingContext.userPromptOpened",
-                        "browsingContext.userPromptClosed",
-                    ]
-                },
-                timeout=10.0,
-            )
-        except Exception:
-            pass
-        self._tasks = [
-            asyncio.create_task(self._capture_loop()),
-            asyncio.create_task(self._input_loop()),
-        ]
-
-    async def close(self) -> None:
-        self._closed = True
-        self._wake_event.set()
-        self._input_event.set()
-        for task in list(self._tasks):
-            task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
-        if self._bidi is not None:
-            self._bidi.remove_listener(self._on_bidi_event)
-            self._bidi = None
-
-    def active_context(self) -> str:
-        return self.contexts[-1] if self.contexts else ""
-
-    def _on_bidi_event(
-        self, method: str, params: Optional[Dict[str, Any]] = None
-    ) -> None:
-        params = params or {}
-        ctx_id = str(params.get("context") or "")
-        if method == "browsingContext.contextCreated":
-            if params.get("parent") is None and ctx_id and ctx_id not in self.contexts:
-                self.contexts.append(ctx_id)
-        elif method == "browsingContext.contextDestroyed":
-            if ctx_id in self.contexts and len(self.contexts) > 1:
-                self.contexts.remove(ctx_id)
-        elif method == "browsingContext.userPromptOpened":
-            self.dialog = {
-                "context": ctx_id,
-                "kind": str(params.get("type") or "alert"),
-                "message": str(params.get("message") or ""),
-                "value": str(params.get("defaultValue") or ""),
-            }
-            self.dialog_seq += 1
-            self._wake_event.set()
-        elif method == "browsingContext.userPromptClosed":
-            self.dialog = None
-            self.dialog_seq += 1
-            self._wake_event.set()
-
-    def enqueue_input(self, item: Dict[str, Any]) -> None:
-        if not isinstance(item, dict):
-            return
-        itype = str(item.get("type") or "")
-        if itype == "dialog":
-            asyncio.create_task(
-                self._answer_dialog(
-                    bool(item.get("accept", True)), str(item.get("text") or "")
-                )
-            )
-            return
-        # Coalesce consecutive pointer moves or wheel deltas
-        if self._inputs:
-            last = self._inputs[-1]
-            if last.get("type") == itype:
-                if (
-                    itype == "pointer"
-                    and item.get("action") == "move"
-                    and last.get("action") == "move"
-                ):
-                    self._inputs[-1] = item
-                    self._input_event.set()
-                    return
-                if (
-                    itype == "wheel"
-                    and last.get("x") == item.get("x")
-                    and last.get("y") == item.get("y")
-                ):
-                    last["dx"] = float(last.get("dx") or 0) + float(item.get("dx") or 0)
-                    last["dy"] = float(last.get("dy") or 0) + float(item.get("dy") or 0)
-                    self._input_event.set()
-                    return
-        self._inputs.append(item)
-        self._input_event.set()
-
-    async def _answer_dialog(self, accept: bool, text: str) -> None:
-        dialog = self.dialog
-        bidi = self._bidi
-        if not dialog or not bidi:
-            return
-        params: Dict[str, Any] = {
-            "context": dialog["context"],
-            "accept": accept,
-        }
-        if dialog.get("kind") == "prompt" and accept:
-            params["userText"] = text
-        try:
-            await bidi.command("browsingContext.handleUserPrompt", params, timeout=5.0)
-        except Exception:
-            pass
-
-    async def _capture_loop(self) -> None:
-        while not self._closed:
-            now = time.monotonic()
-            if len(self._subscribers) > 0:
-                self._last_frame_requested_at = now
-            elif (
-                self.frame_seq > 0
-                and (now - self._last_frame_requested_at) > 5.0
-            ):
-                await asyncio.sleep(0.4)
-                continue
-            started = now
-            bidi = self._bidi
-            ctx_id = self.active_context()
-            if bidi and ctx_id and not bidi._closed:
-                try:
-                    shot = await bidi.command(
-                        "browsingContext.captureScreenshot",
-                        {
-                            "context": ctx_id,
-                            "format": {"type": "image/jpeg", "quality": 0.78},
-                        },
-                        timeout=4.0,
-                    )
-                    b64_data = str(shot.get("data") or "")
-                    if b64_data and b64_data != self.frame_b64:
-                        meta = await bidi.evaluate(
-                            ctx_id,
-                            "(() => [location.href, document.title || '', innerWidth || 1280, innerHeight || 800, devicePixelRatio || 1])()",
-                            await_promise=False,
-                            timeout=2.5,
-                        )
-                        if isinstance(meta, list) and len(meta) >= 5:
-                            self.frame_meta = {
-                                "type": "frame",
-                                "context": ctx_id,
-                                "url": str(meta[0] or ""),
-                                "title": str(meta[1] or ""),
-                                "width": float(meta[2] or 1280),
-                                "height": float(meta[3] or 800),
-                                "scale": float(meta[4] or 1),
-                            }
-                        elif self.frame_meta is None:
-                            self.frame_meta = {
-                                "type": "frame",
-                                "context": ctx_id,
-                                "url": "",
-                                "title": "",
-                                "width": 1280.0,
-                                "height": 800.0,
-                                "scale": 1.0,
-                            }
-                        self.frame_b64 = b64_data
-                        self.frame_seq += 1
-                        self._wake_event.set()
-                except Exception:
-                    pass
-            elapsed = time.monotonic() - started
-            await asyncio.sleep(max(0.05, 0.14 - elapsed))
-    async def _input_loop(self) -> None:
-        while not self._closed:
-            await self._input_event.wait()
-            self._input_event.clear()
-            if self._closed:
-                break
-            bidi = self._bidi
-            if not bidi or bidi._closed:
-                continue
-            batch: List[Dict[str, Any]] = []
-            while self._inputs:
-                batch.append(self._inputs.popleft())
-            for item in batch:
-                ctx_id = str(item.get("context") or "") or self.active_context()
-                if not ctx_id:
-                    continue
-                source = self._build_action_source(item)
-                if not source:
-                    continue
-                try:
-                    await bidi.command(
-                        "input.performActions",
-                        {"context": ctx_id, "actions": [source]},
-                        timeout=5.0,
-                    )
-                except Exception:
-                    pass
-
-    def _build_action_source(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        itype = str(item.get("type") or "")
-        meta = self.frame_meta or {}
-        max_w = max(1, int(meta.get("width") or 1280))
-        max_h = max(1, int(meta.get("height") or 800))
-        x = min(max(int(round(float(item.get("x") or 0))), 0), max_w - 1)
-        y = min(max(int(round(float(item.get("y") or 0))), 0), max_h - 1)
-        action = str(item.get("action") or "")
-
-        if itype == "pointer":
-            move = {"type": "pointerMove", "x": x, "y": y}
-            button = int(item.get("button") or 0)
-            if action == "move":
-                acts = [move]
-            elif action == "down":
-                acts = [move, {"type": "pointerDown", "button": button}]
-            elif action == "up":
-                acts = [move, {"type": "pointerUp", "button": button}]
-            elif action == "click":
-                acts = [
-                    move,
-                    {"type": "pointerDown", "button": button},
-                    {"type": "pointerUp", "button": button},
-                ]
-            else:
-                return None
-            return {
-                "type": "pointer",
-                "id": "mouse",
-                "parameters": {"pointerType": "mouse"},
-                "actions": acts,
-            }
-        if itype == "wheel":
-            dx = int(round(float(item.get("dx") or 0)))
-            dy = int(round(float(item.get("dy") or 0)))
-            return {
-                "type": "wheel",
-                "id": "wheel",
-                "actions": [{"type": "scroll", "x": x, "y": y, "deltaX": dx, "deltaY": dy}],
-            }
-        if itype == "key":
-            key_name = str(item.get("key") or "")
-            key_val = WEBDRIVER_KEYS.get(key_name) or (
-                key_name if len(key_name) == 1 else ""
-            )
-            if not key_val or action not in ("down", "up"):
-                return None
-            return {
-                "type": "key",
-                "id": "keyboard",
-                "actions": [
-                    {
-                        "type": "keyDown" if action == "down" else "keyUp",
-                        "value": key_val,
-                    }
-                ],
-            }
-        if itype == "text":
-            text = str(item.get("text") or "")
-            key_actions: List[Dict[str, Any]] = []
-            for ch in text:
-                if ch == "\n":
-                    val = WEBDRIVER_KEYS["Enter"]
-                elif ch == "\t":
-                    val = WEBDRIVER_KEYS["Tab"]
-                elif ord(ch) < 0x20 or ord(ch) == 0x7F:
-                    continue
-                else:
-                    val = ch
-                key_actions.append({"type": "keyDown", "value": val})
-                key_actions.append({"type": "keyUp", "value": val})
-            if not key_actions:
-                return None
-            return {"type": "key", "id": "keyboard", "actions": key_actions}
-        return None
-
-
-FLOW_LOGIN_DETECT_SCRIPT = r"""
-(async () => {
-    const href = String(location.href || '');
-    const host = String(location.hostname || '').toLowerCase();
-    const result = {
-        url: href,
-        host: host,
-        title: String(document.title || ''),
-        is_flow_origin: host === 'flow.google.com' || host === 'labs.google',
-        is_auth_page: host.includes('accounts.google') || href.includes('/about') || href.includes('ServiceLogin'),
-        has_onboarding_dialog: false,
-        workspace_ready: false,
-        xsrf_token: '',
-        email: '',
-        project_id: '',
-        local_storage: []
-    };
-    try {
-        result.local_storage = Object.keys(localStorage).sort().map(name => ({
-            name,
-            value: String(localStorage.getItem(name) ?? '')
-        }));
-    } catch (e) {}
-
-    const projMatch = href.match(/\/project\/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})/);
-    if (projMatch) {
-        result.project_id = projMatch[1];
-    }
-
-    if (result.is_flow_origin && !result.is_auth_page) {
-        try {
-            const consentHints = [
-                '隐私权政策', 'privacy policy', '体验并参与塑造', '您的数据和', 'your data and',
-                '下一步', '上一步', '同意', '接受'
-            ];
-            const keywords = [
-                '下一步', '继续', '同意', '接受', '开始', '知道了', '跳过', '完成',
-                'next', 'continue', 'start', 'got it', 'agree', 'accept', 'skip', 'done'
-            ];
-            const dialogs = Array.from(
-                document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], .cdk-overlay-pane')
-            ).filter(el => {
-                if (el.offsetWidth <= 50 || el.offsetHeight <= 50) return false;
-                const t = String(el.innerText || '').toLowerCase();
-                return consentHints.some(h => t.includes(h)) || Array.from(el.querySelectorAll('button, [role="button"]')).some(
-                    b => keywords.some(k => String(b.innerText || b.textContent || '').trim().toLowerCase() === k)
-                );
-            });
-            if (dialogs.length > 0) {
-                result.has_onboarding_dialog = true;
-                let didScroll = false;
-                for (const dlg of dialogs) {
-                    const scrollables = [dlg, ...Array.from(dlg.querySelectorAll('*'))];
-                    for (const s of scrollables) {
-                        if (s.scrollHeight > s.clientHeight + 4 && s.scrollTop + s.clientHeight < s.scrollHeight - 2) {
-                            s.scrollTop = s.scrollHeight;
-                            s.dispatchEvent(new Event('scroll', { bubbles: true }));
-                            s.dispatchEvent(new WheelEvent('wheel', { deltaY: 800, bubbles: true }));
-                            didScroll = true;
-                        }
-                    }
-                }
-                if (didScroll) {
-                    await new Promise(r => setTimeout(r, 280));
-                }
-                for (const dlg of dialogs) {
-                    const btns = Array.from(dlg.querySelectorAll('button, [role="button"]'));
-                    for (const btn of btns) {
-                        if (btn.disabled || btn.getAttribute('aria-disabled') === 'true') continue;
-                        const txt = String(btn.innerText || btn.textContent || '').trim().toLowerCase();
-                        if (txt && txt.length <= 24 && keywords.some(k => txt === k || txt.includes(k))) {
-                            btn.click();
-                            break;
-                        }
-                    }
-                }
-            }
-            const bodyText = String(document.body?.innerText || '');
-            const isLoading = bodyText.includes('正在加载') || bodyText.includes('Loading...');
-            const hasProjectUI = Boolean(
-                result.project_id
-                || document.querySelector('a[href*="/project/"]')
-                || bodyText.includes('新建项目')
-                || bodyText.includes('New project')
-            );
-            result.workspace_ready = !result.has_onboarding_dialog && !isLoading && hasProjectUI;
-        } catch (e) {}
-    }
-    try {
-        const wiz = window.WIZ_global_data;
-        if (wiz && typeof wiz === 'object') {
-            if (typeof wiz.SNlM0e === 'string' && wiz.SNlM0e) {
-                result.xsrf_token = wiz.SNlM0e;
-            }
-            for (const v of Object.values(wiz)) {
-                if (typeof v === 'string' && /^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$/i.test(v.trim())) {
-                    result.email = v.trim().toLowerCase();
-                    break;
-                }
-            }
-        }
-    } catch (e) {}
-
-    if (!result.email) {
-        try {
-            const values = [];
-            for (const el of document.querySelectorAll('[aria-label],[data-email]')) {
-                values.push(el.getAttribute('data-email') || '');
-                values.push(el.getAttribute('aria-label') || '');
-            }
-            values.push(document.body?.innerText || '');
-            const m = values.join('\n').match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-            if (m) {
-                result.email = m[0].toLowerCase();
-            }
-        } catch (e) {}
-    }
-
-    if (result.is_flow_origin && !result.is_auth_page && !result.email) {
-        try {
-            const resp = await fetch('/fx/api/auth/session', { credentials: 'include' });
-            if (resp.ok) {
-                const data = await resp.json();
-                const sessionEmail = data?.user?.email;
-                if (typeof sessionEmail === 'string' && sessionEmail.includes('@')) {
-                    result.email = sessionEmail.trim().toLowerCase();
-                }
-            }
-        } catch (e) {}
-    }
-    return result;
-})()
-"""
-
-
-class CamoufoxLoginSession:
-    """Isolated Camoufox login session that waits for Google Flow authentication and extracts cookies, storageState, fingerprint, and startupCache."""
-
-    def __init__(
-        self,
-        session_id: str,
-        *,
-        mode: str = "auto",
-        proxy_url: Optional[str] = None,
-        token_id: Optional[int] = None,
-        browser_profile_dir: Optional[str] = None,
-        clean_login: bool = False,
-        auto_save_token: bool = True,
-        remark: Optional[str] = None,
-        project_id: Optional[str] = None,
-        project_name: Optional[str] = None,
-        timeout_seconds: float = 300.0,
-        user_data_root: Optional[Path] = None,
-    ) -> None:
-        self.session_id = session_id
-        self.mode = mode  # "window" | "liveview" | "auto"
-        self.proxy_url = (proxy_url or "").strip() or None
-        self.token_id = token_id
-        self.browser_profile_dir = normalize_browser_profile_dir(browser_profile_dir)
-        self.clean_login = bool(clean_login)
-        self.auto_save_token = auto_save_token
-        self.remark = remark
-        self.project_id = project_id
-        self.project_name = project_name
-        self.timeout_seconds = max(30.0, float(timeout_seconds or 300.0))
-        self.user_data_root = user_data_root or (
-            Path(__file__).resolve().parent.parent.parent / "browser_data_rt"
-        )
-        self.live_view = CamoufoxLiveView()
-        self.status: str = "starting"  # starting | waiting | saving | completed | failed | cancelled
-        self.message: str = "正在启动 Camoufox 浏览器..."
-        self.error: Optional[str] = None
-        self.result: Optional[Dict[str, Any]] = None
-        self.created_at: float = time.time()
-        self.finished_at: Optional[float] = None
-        self.headless: bool = False
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._stdout_drain_task: Optional[asyncio.Task] = None
-        self._bidi: Optional[BiDiClient] = None
-        self._relay: Optional[LocalSocks5Relay] = None
-        self._temp_account_dir: Optional[Path] = None
-        self._is_ephemeral_staging: bool = False
-        self._is_explicit_profile_dir: bool = bool(self.browser_profile_dir)
-        self._reused_existing_profile: bool = False
-        self._lease_account_dir: Optional[Path] = None
-        self._profile_dir: Optional[Path] = None
-        self._task: Optional[asyncio.Task] = None
-        self._cancel_event = asyncio.Event()
-
-    def set_state(self, status: str, message: str, error: Optional[str] = None) -> None:
-        self.status = status
-        self.message = message
-        if error is not None:
-            self.error = error
-        if status in ("completed", "failed", "cancelled") and self.finished_at is None:
-            self.finished_at = time.time()
-        self.live_view.set_status(status, message)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "session_id": self.session_id,
-            "status": self.status,
-            "message": self.message,
-            "error": self.error,
-            "mode": "liveview" if self.headless else "window",
-            "headless": self.headless,
-            "has_display": has_display(),
-            "token_id": self.token_id,
-            "browser_profile_dir": self.browser_profile_dir,
-            "reused_existing_profile": self._reused_existing_profile,
-            "clean_login": self.clean_login,
-            "auto_save_token": self.auto_save_token,
-            "result": self.result,
-            "frame_seq": self.live_view.frame_seq,
-            "page_url": (self.live_view.frame_meta or {}).get("url") or "",
-            "page_title": (self.live_view.frame_meta or {}).get("title") or "",
-            "dialog": self.live_view.dialog,
-        }
-    async def start(
-        self,
-        on_complete: Optional[Callable[["CamoufoxLoginSession", Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
-    ) -> None:
-        self._task = asyncio.create_task(self._run(on_complete))
-
-    async def cancel(self) -> None:
-        self._cancel_event.set()
-        if self.status not in ("completed", "failed"):
-            self.set_state("cancelled", "浏览器登录已取消")
-        if self._task and not self._task.done():
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
-        await self._cleanup(save_cache=False)
-
-    async def _run(
-        self,
-        on_complete: Optional[Callable[["CamoufoxLoginSession", Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
-    ) -> None:
-        save_cache = False
-        try:
-            exe_path = await ensure_camoufox_executable()
-            if self.mode == "liveview":
-                self.headless = True
-            elif self.mode == "window":
-                if not has_display():
-                    self.headless = True
-                else:
-                    self.headless = False
-            else:
-                # auto: use local visible window if display available, else headless liveview
-                self.headless = not has_display()
-
-            # Resolve fixed per-account startup directory directly (no ephemeral blank profile on relogin!)
-            if self.token_id or self.browser_profile_dir:
-                account_dir, canonical_profile_dir = resolve_account_profile_dir(
-                    self.user_data_root,
-                    token_id=self.token_id,
-                    profile_dir_name=self.browser_profile_dir,
-                )
-                self.browser_profile_dir = canonical_profile_dir
-                self._is_ephemeral_staging = False
-            else:
-                account_dir = self.user_data_root / "pending" / f"login_{self.session_id}"
-                self._is_ephemeral_staging = True
-
-            # Release any active runtime worker holding this token or profile directory before launching
-            try:
-                from .browser_captcha import BrowserCaptchaService
-                svc = BrowserCaptchaService._instance
-                if svc is not None:
-                    if self.token_id:
-                        await svc.release_token_browsers(
-                            int(self.token_id), reason="camoufox_relogin_start"
-                        )
-                    if hasattr(svc, "release_profile_browsers"):
-                        await svc.release_profile_browsers(
-                            account_dir, reason="camoufox_relogin_start"
-                        )
-            except Exception:
-                pass
-
-            acquire_profile_login_lease(
-                account_dir, self.session_id, token_id=self.token_id
-            )
-            self._lease_account_dir = account_dir
-            self._temp_account_dir = account_dir
-            account_dir.mkdir(parents=True, exist_ok=True)
-
-            fp_config = load_or_create_account_camoufox_config(
-                account_dir,
-                CAMOUFOX_FIREFOX_MAJOR,
-                "en-US",
-                "America/New_York",
-            )
-
-            relay_addr: Optional[Tuple[str, int]] = None
-            if self.proxy_url:
-                parsed = urlparse(self.proxy_url)
-                if parsed.username or parsed.password or "socks" in (
-                    parsed.scheme or ""
-                ).lower():
-                    self._relay = LocalSocks5Relay(self.proxy_url)
-                    relay_addr = await self._relay.start()
-
-            self._profile_dir = account_dir / "firefox-profile"
-            self._reused_existing_profile = (
-                self._profile_dir / "cookies.sqlite"
-            ).is_file() or (self._profile_dir / "prefs.js").is_file()
-            self._profile_dir.mkdir(parents=True, exist_ok=True)
-            _clear_stale_firefox_profile_locks(self._profile_dir)
-            if self.clean_login:
-                clear_site_cookies_in_profile(account_dir)
-                self._reused_existing_profile = False
-            if not (self._profile_dir / "startupCache").exists():
-                await asyncio.to_thread(
-                    restore_startup_cache, account_dir, self._profile_dir
-                )
-            cache_dir = account_dir / "camoufox-cache"
-            write_camoufox_user_js(
-                self._profile_dir,
-                fp_config,
-                proxy_url=self.proxy_url,
-                relay_addr=relay_addr,
-                headless=self.headless,
-                live_view=True,
-                cache_dir=cache_dir,
-                executable_path=exe_path,
-            )
-
-            args = [exe_path, "--remote-debugging-port=0"]
-            if self.headless:
-                args.extend(["-no-remote", "-headless"])
-            else:
-                args.append("-wait-for-browser")
-            args.extend(["-profile", str(self._profile_dir)])
-
-            env = build_camoufox_env(
-                fp_config,
-                headless=self.headless,
-                live_view=True,
-                profile_dir=self._profile_dir,
-                executable_path=exe_path,
-            )
-            self._process = await asyncio.create_subprocess_exec(
-                *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-            )
-            endpoint = await CamoufoxWorker._wait_for_bidi_endpoint(
-                self._process, timeout=45.0
-            )
-            self._stdout_drain_task = _start_stdout_drain(self._process)
-            self._bidi = await BiDiClient.connect(endpoint, timeout=30.0)
-            capabilities: Dict[str, Any] = {
-                "alwaysMatch": {
-                    "unhandledPromptBehavior": {
-                        "alert": "ignore",
-                        "confirm": "ignore",
-                        "prompt": "ignore",
-                    }
-                }
-            }
-            await self._bidi.command("session.new", {"capabilities": capabilities})
-
-            tree = await self._bidi.command("browsingContext.getTree", {"maxDepth": 0})
-            contexts = tree.get("contexts") or []
-            if not contexts or not isinstance(contexts[0], dict):
-                raise RuntimeError("Camoufox BiDi 未返回初始标签页")
-            root_ctx = str(contexts[0].get("context") or "")
-            if not root_ctx:
-                raise RuntimeError("Camoufox BiDi 初始标签页无效")
-
-            # Always attach LiveView so the Web UI can preview and interact even in window mode
-            await self.live_view.attach(self._bidi, root_ctx)
-
-            profile_note = (
-                f"（已绑定并复用资料目录 {self.browser_profile_dir}）"
-                if self._reused_existing_profile and self.browser_profile_dir
-                else (
-                    f"（已绑定资料目录 {self.browser_profile_dir}）"
-                    if self.browser_profile_dir
-                    else ""
-                )
-            )
-            if self.headless:
-                self.set_state(
-                    "waiting",
-                    f"请在下方远程浏览器画面中登录 Google 账号并进入 Flow 页面{profile_note}，登录成功后将自动拉取 Cookie 与缓存...",
-                )
-            else:
-                self.set_state(
-                    "waiting",
-                    f"已弹出 Camoufox 浏览器窗口{profile_note}（也可在下方画面直接操作），请完成 Google 登录进入 Flow，成功后将自动抓取 Cookie 与缓存...",
-                )
-            try:
-                await self._bidi.command(
-                    "browsingContext.navigate",
-                    {
-                        "context": root_ctx,
-                        "url": "https://flow.google.com/projects",
-                        "wait": "none",
-                    },
-                    timeout=20.0,
-                )
-            except Exception as nav_exc:
-                if "NS_ERROR_ABORT" not in str(nav_exc):
-                    debug_logger.log_warning(f"[CamoufoxLogin] 初始导航提示: {nav_exc}")
-
-            login_data = await self._wait_for_login()
-            save_cache = True
-            self.set_state(
-                "saving",
-                f"检测到 Flow 登录成功 ({login_data.get('email') or 'Google Account'})，正在导出 Cookie、StorageState 与浏览器缓存...",
-            )
-
-            # Give the page a brief moment to flush all cookies & localStorage
-            await asyncio.sleep(1.2)
-            exported = await self._export_login_state(login_data)
-
-            # Close browser cleanly first so Firefox writes startupCache & cookies.sqlite to profile_dir
-            await self._cleanup(save_cache=True)
-
-            if on_complete is not None:
-                saved_info = await on_complete(self, exported)
-                exported.update(saved_info or {})
-
-            final_token_id = exported.get("token_id") or self.token_id
-            target_profile_hint = (
-                exported.get("browser_profile_dir") or self.browser_profile_dir
-            )
-            if final_token_id and self._temp_account_dir and self._temp_account_dir.exists():
-                try:
-                    from .browser_captcha import BrowserCaptchaService
-                    svc = BrowserCaptchaService._instance
-                    if svc is not None:
-                        await svc.release_token_browsers(
-                            int(final_token_id), reason="camoufox_relogin_complete"
-                        )
-                except Exception:
-                    pass
-                target_dir, final_canonical = resolve_account_profile_dir(
-                    self.user_data_root,
-                    token_id=int(final_token_id),
-                    profile_dir_name=target_profile_hint,
-                )
-                if self._temp_account_dir.resolve() != target_dir.resolve():
-                    if self._is_ephemeral_staging and not target_dir.exists():
-                        target_dir.parent.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(
-                            shutil.move, str(self._temp_account_dir), str(target_dir)
-                        )
-                        _clear_stale_firefox_profile_locks(target_dir / "firefox-profile")
-                        self._temp_account_dir = target_dir
-                        self._is_ephemeral_staging = False
-                    else:
-                        await asyncio.to_thread(
-                            persist_account_login_artifacts,
-                            self._temp_account_dir,
-                            target_dir,
-                        )
-                self.browser_profile_dir = final_canonical
-                exported["browser_profile_dir"] = final_canonical
-                exported["cache_persisted_dir"] = str(target_dir)
-            elif not self._is_ephemeral_staging and self._temp_account_dir:
-                exported["browser_profile_dir"] = self.browser_profile_dir
-                exported["cache_persisted_dir"] = str(self._temp_account_dir)
-            self.result = exported
-            self.set_state(
-                "completed",
-                f"浏览器登录并拉取缓存完成！账号: {exported.get('email') or '已同步'}",
-            )
-        except asyncio.CancelledError:
-            if self.status not in ("completed", "cancelled"):
-                self.set_state("cancelled", "浏览器登录已取消")
-        except Exception as exc:
-            debug_logger.log_error(f"[CamoufoxLogin] 登录流程失败: {exc}")
-            self.set_state("failed", f"浏览器登录失败: {exc}", error=str(exc))
-        finally:
-            await self._cleanup(save_cache=save_cache)
-            release_profile_login_lease(
-                self._lease_account_dir, self.session_id, token_id=self.token_id
-            )
-            self._lease_account_dir = None
-            if (
-                self._is_ephemeral_staging
-                and self._temp_account_dir
-                and self._temp_account_dir.exists()
-                and self._temp_account_dir.parent.name == "pending"
-            ):
-                shutil.rmtree(self._temp_account_dir, ignore_errors=True)
-    async def _wait_for_login(self) -> Dict[str, Any]:
-        deadline = time.monotonic() + self.timeout_seconds
-        origins: Dict[str, Any] = {}
-        session_cookie_names = {
-            "SID",
-            "__Secure-1PSID",
-            "__Secure-3PSID",
-            "SAPISID",
-            "__Secure-1PAPISID",
-            "__Secure-3PAPISID",
-        }
-        while time.monotonic() < deadline and not self._cancel_event.is_set():
-            if self._process and self._process.returncode is not None:
-                raise RuntimeError("Camoufox 登录窗口已被关闭，未完成登录")
-            bidi = self._bidi
-            ctx_id = self.live_view.active_context()
-            if not bidi or bidi._closed or not ctx_id:
-                await asyncio.sleep(0.5)
-                continue
-            try:
-                info = await bidi.evaluate(
-                    ctx_id,
-                    FLOW_LOGIN_DETECT_SCRIPT,
-                    await_promise=True,
-                    timeout=6.0,
-                )
-            except Exception:
-                await asyncio.sleep(0.5)
-                continue
-
-            if isinstance(info, dict):
-                page_url = str(info.get("url") or "")
-                parsed = urlparse(page_url)
-                host = (parsed.hostname or "").lower()
-                if parsed.scheme == "https" and (
-                    host == "google.com"
-                    or host.endswith(".google.com")
-                    or host == "labs.google"
-                ):
-                    ls_items = info.get("local_storage")
-                    if isinstance(ls_items, list) and ls_items:
-                        origin_key = f"{parsed.scheme}://{parsed.netloc}"
-                        origins[origin_key] = {
-                            "origin": origin_key,
-                            "localStorage": ls_items,
-                        }
-
-                if info.get("is_flow_origin") and not info.get("is_auth_page"):
-                    # Verify Google session cookies exist in browser storage
-                    cookie_res = await bidi.command("storage.getCookies", {}, timeout=8.0)
-                    raw_cookies = cookie_res.get("cookies") or []
-                    found_session_cookies = {
-                        str(c.get("name") or "")
-                        for c in raw_cookies
-                        if isinstance(c, dict)
-                        and str(c.get("name") or "") in session_cookie_names
-                    }
-                    has_auth_signal = bool(
-                        info.get("xsrf_token") or info.get("email")
-                    )
-                    if len(found_session_cookies) >= 2 and has_auth_signal:
-                        if info.get("has_onboarding_dialog") or not info.get("workspace_ready"):
-                            self.set_state(
-                                "waiting",
-                                "已登录进入 Flow，正在自动滚动并同意《隐私权政策》与引导条款（完成后自动保存）...",
-                            )
-                            await asyncio.sleep(0.7)
-                            continue
-                        return {
-                            "email": str(info.get("email") or "").strip().lower(),
-                            "xsrf_token": str(info.get("xsrf_token") or ""),
-                            "project_id": str(info.get("project_id") or ""),
-                            "page_url": page_url,
-                            "origins": origins,
-                        }
-            await asyncio.sleep(0.6)
-        raise RuntimeError("等待 Google Flow 登录超时，请重试")
-
-    async def _export_login_state(self, login_data: Dict[str, Any]) -> Dict[str, Any]:
-        assert self._bidi is not None
-        in_page_meta: Dict[str, Any] = {}
-        try:
-            ctx = self.live_view.active_context()
-            if ctx:
-                meta_res = await self._bidi.evaluate(
-                    ctx,
-                    r"""(async () => {
-                        const out = { email: '', project_id: '', credits: null, tier: '' };
-                        try {
-                            const wiz = window.WIZ_global_data || {};
-                            const at = String(wiz.SNlM0e || '');
-                            const bl = String(wiz.cfb2h || 'boq_labs-ai-sandbox-frontend_20260415.05_p0');
-                            const fSid = String(wiz.FdrFJe || '');
-                            const hl = String(document.documentElement.lang || navigator.language || 'en');
-                            if (typeof wiz.oPEP7c === 'string' && wiz.oPEP7c.includes('@')) {
-                                out.email = wiz.oPEP7c.trim().toLowerCase();
-                            }
-                            // Wait briefly for project cards or onboarding dialog to finish rendering
-                            for (let w = 0; w < 8; w++) {
-                                if (document.querySelector('a[href*="/project/"]') || /\/project\/[0-9a-f-]{36}/i.test(location.pathname)) break;
-                                await new Promise(r => setTimeout(r, 400));
-                            }
-                            // Dismiss onboarding overlays if present
-                            for (let i = 0; i < 4; i++) {
-                                const btns = Array.from(document.querySelectorAll('.cdk-overlay-container button, [role="dialog"] button'));
-                                const hit = btns.find(b => !b.disabled && ['下一步','继续','同意','接受','开始','知道了','跳过','next','continue','start','got it','agree','accept','skip'].some(k => (b.innerText || '').trim().toLowerCase().includes(k)));
-                                if (!hit) break;
-                                hit.click();
-                                await new Promise(r => setTimeout(r, 350));
-                            }
-                            const m = location.pathname.match(/\/project\/([0-9a-f-]{36})/i);
-                            if (m) out.project_id = m[1];
-                            if (!out.project_id) {
-                                for (const a of document.querySelectorAll('a[href*="/project/"]')) {
-                                    const am = (a.getAttribute('href') || '').match(/\/project\/([0-9a-f-]{36})/i);
-                                    if (am) { out.project_id = am[1]; break; }
-                                }
-                            }
-                            if (at) {
-                                const callRpc = async (rpcId, argJson) => {
-                                    const qs = new URLSearchParams({
-                                        'rpcids': rpcId,
-                                        'source-path': location.pathname || '/projects',
-                                        'bl': bl,
-                                        'hl': hl,
-                                        'soc-app': '1',
-                                        'soc-platform': '1',
-                                        'soc-device': '1',
-                                        'rt': 'c'
-                                    });
-                                    if (fSid) qs.set('f.sid', fSid);
-                                    const body = new URLSearchParams({
-                                        'f.req': JSON.stringify([[[rpcId, argJson, null, 'generic']]]),
-                                        'at': at
-                                    });
-                                    const resp = await fetch(`/_/LabsTailwindUi/data/batchexecute?${qs.toString()}`, {
-                                        method: 'POST',
-                                        credentials: 'include',
-                                        headers: {
-                                            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-                                            'X-Same-Domain': '1'
-                                        },
-                                        body: body.toString()
-                                    });
-                                    return await resp.text();
-                                };
-                                try {
-                                    const credText = await callRpc('i945dd', '["projects"]');
-                                    const cm = credText.match(/\[(\d+),"PAYGATE_TIER_[A-Z_]+"\]/) || credText.match(/"PAYGATE_TIER_[A-Z_]+"/);
-                                    const tm = credText.match(/PAYGATE_TIER_[A-Z_]+/);
-                                    if (tm) out.tier = tm[0];
-                                    const numMatch = credText.match(/\\?"\[(\d+),\\?"PAYGATE_TIER/);
-                                    if (numMatch) out.credits = parseInt(numMatch[1], 10);
-                                } catch (e) {}
-                                if (!out.project_id) {
-                                    try {
-                                        const projText = await callRpc('jHPbke', JSON.stringify(['projects/*', [null, ['Flow Project']], [null, 22]]));
-                                        const pm = projText.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
-                                        if (pm) out.project_id = pm[0];
-                                    } catch (e) {}
-                                }
-                            }
-                        } catch (e) {}
-                        return out;
-                    })()""",
-                    await_promise=True,
-                    timeout=15.0,
-                )
-                if isinstance(meta_res, dict):
-                    in_page_meta = meta_res
-        except Exception as exc:
-            debug_logger.log_warning(f"[CamoufoxLogin] 页面内预取项目与积分提示: {exc}")
-
-        cookie_res = await self._bidi.command("storage.getCookies", {}, timeout=10.0)
-        raw_cookies = cookie_res.get("cookies") or []
-        flow_cookies: List[Dict[str, Any]] = []
-        storage_cookies: List[Dict[str, Any]] = []
-
-        for item in raw_cookies:
-            if not isinstance(item, dict):
-                continue
-            name = str(item.get("name") or "").strip()
-            domain = str(item.get("domain") or "").strip()
-            path = str(item.get("path") or "/")
-            if not name or not domain:
-                continue
-            clean_domain = domain.lstrip(".").lower()
-            if not (
-                clean_domain == "google.com"
-                or clean_domain.endswith(".google.com")
-                or clean_domain == "labs.google"
-                or clean_domain.endswith(".labs.google")
-            ):
-                continue
-            val_obj = item.get("value")
-            value = (
-                str(val_obj.get("value") or "")
-                if isinstance(val_obj, dict)
-                else str(val_obj or "")
-            )
-            expiry = item.get("expiry")
-            expires = (
-                float(expiry)
-                if isinstance(expiry, (int, float)) and expiry > 0
-                else -1.0
-            )
-            same_site_raw = str(item.get("sameSite") or "lax").strip().lower()
-            same_site = (
-                same_site_raw.capitalize()
-                if same_site_raw in ("none", "lax", "strict")
-                else "Lax"
-            )
-            http_only = bool(item.get("httpOnly", False))
-            secure = bool(item.get("secure", True))
-            host_only = not domain.startswith(".") and (
-                clean_domain == "flow.google.com" or name.startswith("__Host-")
-            )
-            cookie_entry: Dict[str, Any] = {
-                "name": name,
-                "value": value,
-                "domain": domain,
-                "path": path,
-                "expires": expires,
-                "httpOnly": http_only,
-                "secure": secure,
-                "sameSite": same_site,
-            }
-            if host_only:
-                cookie_entry["hostOnly"] = True
-            flow_cookies.append(cookie_entry)
-            storage_cookies.append(cookie_entry)
-
-        if not flow_cookies:
-            raise RuntimeError("未从 Camoufox 浏览器导出到有效的 Google/Flow Cookie")
-
-        flow_cookies.sort(
-            key=lambda c: (c.get("domain") or "", c.get("name") or "", c.get("path") or "")
-        )
-        origins_map = login_data.get("origins") or {}
-        storage_origins = sorted(
-            origins_map.values(), key=lambda o: str(o.get("origin") or "")
-        )
-        storage_state = {
-            "cookies": storage_cookies,
-            "origins": storage_origins,
-        }
-        if self._temp_account_dir and self._temp_account_dir.exists():
-            (self._temp_account_dir / "storage-state.json").write_text(
-                json.dumps(storage_state, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-
-        google_cookies_json = json.dumps(
-            flow_cookies, ensure_ascii=False, separators=(",", ":")
-        )
-        return {
-            "email": login_data.get("email") or in_page_meta.get("email") or "",
-            "project_id": (
-                self.project_id
-                or login_data.get("project_id")
-                or in_page_meta.get("project_id")
-                or ""
-            ),
-            "credits": in_page_meta.get("credits"),
-            "user_paygate_tier": in_page_meta.get("tier") or "",
-            "page_url": login_data.get("page_url") or "https://flow.google.com/projects",
-            "cookie_count": len(flow_cookies),
-            "google_cookies": google_cookies_json,
-        }
-
-    async def _cleanup(self, save_cache: bool = False) -> None:
-        await self.live_view.close()
-        drain_task = self._stdout_drain_task
-        bidi = self._bidi
-        proc = self._process
-        relay = self._relay
-        profile_dir = self._profile_dir
-        temp_account_dir = self._temp_account_dir
-
-        self._stdout_drain_task = None
-        self._bidi = None
-        self._process = None
-        self._relay = None
-        self._profile_dir = None
-
-        if drain_task is not None and not drain_task.done():
-            drain_task.cancel()
-
-        if bidi is not None:
-            try:
-                await asyncio.wait_for(bidi.command("browser.close", {}), timeout=4.0)
-            except Exception:
-                pass
-            await bidi.close()
-
-        if proc is not None:
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=4.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
-
-        if relay is not None:
-            await relay.close()
-
-        if profile_dir is not None and profile_dir.exists():
-            if save_cache and temp_account_dir is not None and temp_account_dir.exists():
-                await asyncio.to_thread(
-                    save_startup_cache, profile_dir, temp_account_dir
-                )
-                _clear_stale_firefox_profile_locks(profile_dir)
-            elif self._is_ephemeral_staging:
-                shutil.rmtree(profile_dir, ignore_errors=True)
-            else:
-                _clear_stale_firefox_profile_locks(profile_dir)
-class CamoufoxLoginManager:
-    """Manages active Camoufox interactive login sessions for the Admin UI."""
-
-    _instance: Optional["CamoufoxLoginManager"] = None
-
-    def __init__(self) -> None:
-        self._sessions: Dict[str, CamoufoxLoginSession] = {}
-        self._lock = asyncio.Lock()
-
-    @classmethod
-    def get_instance(cls) -> "CamoufoxLoginManager":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def _prune_sessions(self) -> None:
-        now = time.time()
-        for sid, sess in list(self._sessions.items()):
-            if sess.status in ("completed", "failed", "cancelled"):
-                ended_at = sess.finished_at or sess.created_at
-                age = now - ended_at
-                if age > 60.0 and sess.live_view.frame_b64:
-                    sess.live_view.frame_b64 = ""
-                if age > 300.0:
-                    self._sessions.pop(sid, None)
-            elif now - sess.created_at > max(600.0, sess.timeout_seconds + 300.0):
-                self._sessions.pop(sid, None)
-
-    def get_session(self, session_id: str) -> Optional[CamoufoxLoginSession]:
-        self._prune_sessions()
-        sess = self._sessions.get(session_id)
-        if sess is not None and sess.status in ("starting", "waiting", "saving"):
-            sess.live_view._last_frame_requested_at = time.monotonic()
-        return sess
-
-    def get_active_session(self) -> Optional[CamoufoxLoginSession]:
-        self._prune_sessions()
-        for sess in list(self._sessions.values()):
-            if sess.status in ("starting", "waiting", "saving"):
-                return sess
-        return None
-
-    async def start_session(
-        self,
-        *,
-        mode: str = "auto",
-        proxy_url: Optional[str] = None,
-        token_id: Optional[int] = None,
-        browser_profile_dir: Optional[str] = None,
-        clean_login: bool = False,
-        auto_save_token: bool = True,
-        remark: Optional[str] = None,
-        project_id: Optional[str] = None,
-        project_name: Optional[str] = None,
-        timeout_seconds: float = 300.0,
-        on_complete: Optional[Callable[[CamoufoxLoginSession, Dict[str, Any]], Awaitable[Dict[str, Any]]]] = None,
-    ) -> CamoufoxLoginSession:
-        async with self._lock:
-            # Cancel any previous unfinished login session to avoid multiple login browsers
-            for old_id, old_sess in list(self._sessions.items()):
-                if old_sess.status in ("starting", "waiting"):
-                    await old_sess.cancel()
-            self._prune_sessions()
-            session_id = uuid.uuid4().hex[:16]
-            session = CamoufoxLoginSession(
-                session_id,
-                mode=mode,
-                proxy_url=proxy_url,
-                token_id=token_id,
-                browser_profile_dir=browser_profile_dir,
-                clean_login=clean_login,
-                auto_save_token=auto_save_token,
-                remark=remark,
-                project_id=project_id,
-                project_name=project_name,
-                timeout_seconds=timeout_seconds,
-            )
-            self._sessions[session_id] = session
-            await session.start(on_complete=on_complete)
-            return session
-    async def cancel_session(self, session_id: str) -> bool:
-        sess = self._sessions.get(session_id)
-        if not sess:
-            return False
-        await sess.cancel()
-        return True

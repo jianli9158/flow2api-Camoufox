@@ -77,6 +77,7 @@ GEMINI_STATUS_MAP = {
     502: "UNAVAILABLE",
     503: "UNAVAILABLE",
     504: "DEADLINE_EXCEEDED",
+    499: "CANCELLED",
 }
 
 # Dependency injection will be set up in main.py
@@ -307,7 +308,9 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
 
     try:
         current_url = url
-        async with AsyncSession() as session:
+
+        async def _download_with_session(session: Any) -> Optional[bytes]:
+            nonlocal current_url
             for _ in range(5):
                 await _validate_safe_remote_url(current_url)
                 response = await session.get(
@@ -339,9 +342,25 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
                     f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
                 )
                 break
+            return None
+
+        get_pooled = getattr(file_cache, "get_http_session", None) if file_cache else None
+        if callable(get_pooled):
+            pool_key, pooled_session = await get_pooled(
+                impersonate="chrome120", proxy_url=proxy_url, verify=True
+            )
+            try:
+                return await _download_with_session(pooled_session)
+            except Exception:
+                evict_fn = getattr(file_cache, "evict_http_session", None)
+                if callable(evict_fn):
+                    await evict_fn(pool_key, pooled_session)
+                raise
+
+        async with AsyncSession() as session:
+            return await _download_with_session(session)
     except Exception as exc:
         debug_logger.log_error(f"[CONTEXT] 图片下载异常: {str(exc)}")
-
     return None
 
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
@@ -630,24 +649,58 @@ async def _collect_non_stream_result(
     images: List[bytes],
     base_url_override: Optional[str] = None,
     video_media_id: Optional[str] = None,
+    raw_request: Optional[Request] = None,
 ) -> str:
     handler = _ensure_generation_handler()
-    result = None
-    async for chunk in handler.handle_generation(
-        model=model,
-        prompt=prompt,
-        images=images if images else None,
-        stream=False,
-        base_url_override=base_url_override,
-        video_media_id=video_media_id,
-    ):
-        result = chunk
+
+    async def _consume() -> Optional[str]:
+        last_chunk: Optional[str] = None
+        async for chunk in handler.handle_generation(
+            model=model,
+            prompt=prompt,
+            images=images if images else None,
+            stream=False,
+            base_url_override=base_url_override,
+            video_media_id=video_media_id,
+        ):
+            last_chunk = chunk
+        return last_chunk
+
+    if raw_request is None:
+        result = await _consume()
+    else:
+        gen_task = asyncio.create_task(_consume())
+        client_disconnected = False
+
+        async def _watch_disconnect() -> None:
+            nonlocal client_disconnected
+            try:
+                while not gen_task.done():
+                    if await raw_request.is_disconnected():
+                        client_disconnected = True
+                        if not gen_task.done():
+                            gen_task.cancel()
+                        return
+                    await asyncio.sleep(0.4)
+            except Exception:
+                return
+
+        watch_task = asyncio.create_task(_watch_disconnect())
+        try:
+            result = await gen_task
+        except asyncio.CancelledError:
+            if client_disconnected:
+                raise HTTPException(status_code=499, detail="Client disconnected")
+            raise
+        finally:
+            if not watch_task.done():
+                watch_task.cancel()
+                await asyncio.gather(watch_task, return_exceptions=True)
 
     if result is None:
         raise HTTPException(status_code=500, detail="Generation failed: No response")
 
     return result
-
 
 def _parse_handler_result(result: str) -> Dict[str, Any]:
     try:
@@ -862,6 +915,7 @@ async def _convert_openai_stream_chunk_to_gemini_event(
 async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
+    raw_request: Optional[Request] = None,
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -872,6 +926,8 @@ async def _iterate_openai_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
     ):
+        if raw_request is not None and await raw_request.is_disconnected():
+            break
         if chunk.startswith("data: "):
             yield chunk
             continue
@@ -879,13 +935,15 @@ async def _iterate_openai_stream(
         payload = _parse_handler_result(chunk)
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    yield "data: [DONE]\n\n"
+    if raw_request is None or not await raw_request.is_disconnected():
+        yield "data: [DONE]\n\n"
 
 
 async def _iterate_gemini_stream(
     normalized: NormalizedGenerationRequest,
     response_model: str,
     base_url_override: Optional[str] = None,
+    raw_request: Optional[Request] = None,
 ):
     handler = _ensure_generation_handler()
     async for chunk in handler.handle_generation(
@@ -896,6 +954,8 @@ async def _iterate_gemini_stream(
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
     ):
+        if raw_request is not None and await raw_request.is_disconnected():
+            break
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
             if payload_text == "[DONE]":
@@ -1006,7 +1066,7 @@ async def create_chat_completion(
 
         if request.stream:
             return StreamingResponse(
-                _iterate_openai_stream(normalized, request_base_url),
+                _iterate_openai_stream(normalized, request_base_url, raw_request=raw_request),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -1022,6 +1082,7 @@ async def create_chat_completion(
                 normalized.images,
                 base_url_override=request_base_url,
                 video_media_id=normalized.video_media_id,
+                raw_request=raw_request,
             )
         )
         return _build_openai_json_response(payload)
@@ -1056,6 +1117,7 @@ async def generate_content(
                     normalized.images,
                     base_url_override=request_base_url,
                     video_media_id=normalized.video_media_id,
+                    raw_request=raw_request,
                 )
             )
         )
@@ -1096,7 +1158,9 @@ async def stream_generate_content(
         request_base_url = _get_request_base_url(raw_request)
 
         return StreamingResponse(
-            _iterate_gemini_stream(normalized, normalized.model, request_base_url),
+            _iterate_gemini_stream(
+                normalized, normalized.model, request_base_url, raw_request=raw_request
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
