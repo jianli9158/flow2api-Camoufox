@@ -254,20 +254,49 @@
                                 <div class="field-grid-2">
                                     <div class="field">
                                         <label for="voiceSelect" data-i18n="音色 (Voice)">音色 (Voice)</label>
-                                        <select id="voiceSelect" class="input">
-                                            <option value="Achernar">Achernar</option>
-                                            <option value="Aoede">Aoede</option>
-                                            <option value="Charon">Charon</option>
-                                            <option value="Fenrir">Fenrir</option>
-                                            <option value="Kore">Kore</option>
-                                            <option value="Puck">Puck</option>
-                                        </select>
+                                        <div class="input-join">
+                                            <select id="voiceSelect" class="input" style="padding-right: 26px; text-overflow: ellipsis;" onchange="updateVoiceSamplePreview()">
+                                                <option value="Achernar">Achernar · Female, soft, high pitch</option>
+                                                <option value="Achird">Achird · Male, friendly, mid pitch</option>
+                                                <option value="Algenib">Algenib · Male, gravelly, low pitch</option>
+                                                <option value="Algieba">Algieba · Male, easy-going, mid-low pitch</option>
+                                                <option value="Alnilam">Alnilam · Male, firm, mid-low pitch</option>
+                                                <option value="Aoede">Aoede · Female, breezy, mid pitch</option>
+                                                <option value="Autonoe">Autonoe · Female, bright, mid pitch</option>
+                                                <option value="Callirrhoe">Callirrhoe · Female, easy-going, mid pitch</option>
+                                                <option value="Charon">Charon · Male, informative, lower pitch</option>
+                                                <option value="Despina">Despina · Female, smooth, mid pitch</option>
+                                                <option value="Enceladus">Enceladus · Male, breathy, lower pitch</option>
+                                                <option value="Erinome">Erinome · Female, clear, mid pitch</option>
+                                                <option value="Fenrir">Fenrir · Male, excitable, younger pitch</option>
+                                                <option value="Gacrux">Gacrux · Female, mature, mid pitch</option>
+                                                <option value="Iapetus">Iapetus · Male, clear, mid-low pitch</option>
+                                                <option value="Kore">Kore · Female, firm, mid pitch</option>
+                                                <option value="Laomedeia">Laomedeia · Female, upbeat, mid-high pitch</option>
+                                                <option value="Leda">Leda · Female, youthful, mid-high pitch</option>
+                                                <option value="Orus">Orus · Male, firm, mid-low pitch</option>
+                                                <option value="Puck">Puck · Male, upbeat, mid pitch</option>
+                                                <option value="Pulcherrima">Pulcherrima · Ungendered, forward, mid-high pitch</option>
+                                                <option value="Rasalgethi">Rasalgethi · Male, informative, mid pitch</option>
+                                                <option value="Sadachbia">Sadachbia · Male, lively, low pitch</option>
+                                                <option value="Sadaltager">Sadaltager · Male, knowledgeable, mid pitch</option>
+                                                <option value="Schedar">Schedar · Male, even, mid-low pitch</option>
+                                                <option value="Sulafat">Sulafat · Female, warm, mid pitch</option>
+                                                <option value="Umbriel">Umbriel · Male, smooth, lower pitch</option>
+                                                <option value="Vindemiatrix">Vindemiatrix · Female, gentle, mid pitch</option>
+                                                <option value="Zephyr">Zephyr · Female, bright, mid-high pitch</option>
+                                                <option value="Zubenelgenubi">Zubenelgenubi · Male, casual, mid-low pitch</option>
+                                            </select>
+                                            <button type="button" id="btnPreviewVoiceSample" onclick="previewSelectedVoiceSample()" class="btn" data-i18n="试听原声">试听原声</button>
+                                        </div>
+                                        <div id="voicePresetSampleMeta" class="hint">Female, soft, high pitch</div>
                                     </div>
                                     <div class="field">
                                         <label for="voiceStyleInput" data-i18n="风格指令">风格指令</label>
                                         <input id="voiceStyleInput" class="input" placeholder="例如：温暖、冷静、电影旁白感" data-i18n-placeholder="例如：温暖、冷静、电影旁白感">
                                     </div>
                                 </div>
+                                <audio id="voicePresetSampleAudio" controls class="hidden" style="width: 100%; height: 34px;"></audio>
                                 <div class="field">
                                     <label for="voiceTextInput" data-i18n="合成文本">合成文本</label>
                                     <textarea id="voiceTextInput" rows="3" class="input" placeholder="输入要朗读的文本..." data-i18n-placeholder="输入要朗读的文本..."></textarea>
@@ -301,9 +330,9 @@
                                     </div>
                                     <div class="field">
                                         <label for="characterVoiceInput" data-i18n="绑定音色 ID (可选)">绑定音色 ID (可选)</label>
-                                        <input id="characterVoiceInput" class="input mono-id" placeholder="Achernar">
+                                        <input id="characterVoiceInput" class="input mono-id" list="characterVoiceDatalist" placeholder="Achernar">
+                                        <datalist id="characterVoiceDatalist"></datalist>
                                     </div>
-                                </div>
                                 <div class="field">
                                     <label for="characterNotesInput" data-i18n="角色设定 / 性格备注">角色设定 / 性格备注</label>
                                     <textarea id="characterNotesInput" rows="2" class="input" placeholder="外貌特征、服装、口音、性格描述..." data-i18n-placeholder="外貌特征、服装、口音、性格描述..."></textarea>
@@ -338,7 +367,11 @@ const STATE = {
   agentProjectId: null,
   agentPendingPermission: null,
   agentSending: false,
-  agentMessages: []
+  agentMessages: [],
+  presetVoices: [],
+  customVoices: [],
+  voicesLoadedFor: null,
+  voicesLoading: false
 };
 </script>
 <script>
@@ -382,8 +415,16 @@ function switchWorkbenchTab(tab) {
       else sEl.removeAttribute("aria-current");
     }
   });
+  if (tab === "voices") {
+    const creds = getApiCredentials();
+    if (creds) {
+      const credsKey = `${creds.baseUrl}\0${creds.apiKey}`;
+      if (STATE.voicesLoadedFor !== credsKey) {
+        loadVoicesAndCharacters({ silent: true });
+      }
+    }
+  }
 }
-
 // Normalize legacy underscore ids so both catalog styles classify identically.
 function normalizeModelId(modelId) {
   return String(modelId).toLowerCase().replace(/_/g, "-");
@@ -830,6 +871,13 @@ function renderResult(content) {
 }
 
 // ── Creation Agent Workbench (/v1/flow/agent/*) ────────────────────────────────
+function getApiCredentials() {
+  const baseUrl = (document.getElementById("baseUrl").value || "").trim().replace(/\/$/, "");
+  const apiKey = (document.getElementById("apiKey").value || "").trim();
+  if (!apiKey || !baseUrl) return null;
+  return { baseUrl, apiKey };
+}
+
 function requireApiCredentials() {
   const baseUrl = (document.getElementById("baseUrl").value || "").trim().replace(/\/$/, "");
   const apiKey = (document.getElementById("apiKey").value || "").trim();
@@ -1071,9 +1119,126 @@ async function deleteActiveAgentSession() {
 }
 
 // ── Voices & Characters (/v1/flow/voices & /v1/flow/characters) ────────────────
-async function loadVoicesAndCharacters() {
-  const creds = requireApiCredentials();
+const FALLBACK_PRESET_VOICES = [
+  { id: "achernar", name: "Achernar", description: "Female, soft, high pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Achernar.wav" },
+  { id: "achird", name: "Achird", description: "Male, friendly, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Achird.wav" },
+  { id: "algenib", name: "Algenib", description: "Male, gravelly, low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Algenib.wav" },
+  { id: "algieba", name: "Algieba", description: "Male, easy-going, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Algieba.wav" },
+  { id: "alnilam", name: "Alnilam", description: "Male, firm, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Alnilam.wav" },
+  { id: "aoede", name: "Aoede", description: "Female, breezy, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Aoede.wav" },
+  { id: "autonoe", name: "Autonoe", description: "Female, bright, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Autonoe.wav" },
+  { id: "callirrhoe", name: "Callirrhoe", description: "Female, easy-going, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Callirrhoe.wav" },
+  { id: "charon", name: "Charon", description: "Male, informative, lower pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Charon.wav" },
+  { id: "despina", name: "Despina", description: "Female, smooth, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Despina.wav" },
+  { id: "enceladus", name: "Enceladus", description: "Male, breathy, lower pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Enceladus.wav" },
+  { id: "erinome", name: "Erinome", description: "Female, clear, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Erinome.wav" },
+  { id: "fenrir", name: "Fenrir", description: "Male, excitable, younger pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Fenrir.wav" },
+  { id: "gacrux", name: "Gacrux", description: "Female, mature, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Gacrux.wav" },
+  { id: "iapetus", name: "Iapetus", description: "Male, clear, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Iapetus.wav" },
+  { id: "kore", name: "Kore", description: "Female, firm, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Kore.wav" },
+  { id: "laomedeia", name: "Laomedeia", description: "Female, upbeat, mid-high pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Laomedeia.wav" },
+  { id: "leda", name: "Leda", description: "Female, youthful, mid-high pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Leda.wav" },
+  { id: "orus", name: "Orus", description: "Male, firm, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Orus.wav" },
+  { id: "puck", name: "Puck", description: "Male, upbeat, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Puck.wav" },
+  { id: "pulcherrima", name: "Pulcherrima", description: "Ungendered, forward, mid-high pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Pulcherrima.wav" },
+  { id: "rasalgethi", name: "Rasalgethi", description: "Male, informative, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Rasalgethi.wav" },
+  { id: "sadachbia", name: "Sadachbia", description: "Male, lively, low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Sadachbia.wav" },
+  { id: "sadaltager", name: "Sadaltager", description: "Male, knowledgeable, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Sadaltager.wav" },
+  { id: "schedar", name: "Schedar", description: "Male, even, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Schedar.wav" },
+  { id: "sulafat", name: "Sulafat", description: "Female, warm, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Sulafat.wav" },
+  { id: "umbriel", name: "Umbriel", description: "Male, smooth, lower pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Umbriel.wav" },
+  { id: "vindemiatrix", name: "Vindemiatrix", description: "Female, gentle, mid pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Vindemiatrix.wav" },
+  { id: "zephyr", name: "Zephyr", description: "Female, bright, mid-high pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Zephyr.wav" },
+  { id: "zubenelgenubi", name: "Zubenelgenubi", description: "Male, casual, mid-low pitch", sampleUrl: "https://gstatic.com/aitestkitchen/voices/samples/Zubenelgenubi.wav" }
+];
+
+function findSelectedPresetVoice() {
+  const sel = document.getElementById("voiceSelect");
+  const val = String(sel?.value || "").trim().toLowerCase();
+  const list = STATE.presetVoices.length ? STATE.presetVoices : FALLBACK_PRESET_VOICES;
+  return list.find(v => String(v.name || "").toLowerCase() === val || String(v.id || "").toLowerCase() === val) || list[0] || null;
+}
+
+function updateVoiceSamplePreview() {
+  const voice = findSelectedPresetVoice();
+  const metaEl = document.getElementById("voicePresetSampleMeta");
+  const previewBtn = document.getElementById("btnPreviewVoiceSample");
+  const audioEl = document.getElementById("voicePresetSampleAudio");
+  if (metaEl) metaEl.textContent = voice?.description || "";
+  if (previewBtn) previewBtn.disabled = !(voice && voice.sampleUrl);
+  if (audioEl && !audioEl.classList.contains("hidden")) {
+    const nextUrl = voice?.sampleUrl || "";
+    if (!nextUrl || audioEl.getAttribute("data-voice-sample") !== nextUrl) {
+      audioEl.pause();
+      if (nextUrl) {
+        audioEl.src = nextUrl;
+        audioEl.setAttribute("data-voice-sample", nextUrl);
+      } else {
+        audioEl.removeAttribute("src");
+        audioEl.removeAttribute("data-voice-sample");
+        audioEl.classList.add("hidden");
+      }
+    }
+  }
+}
+
+function previewSelectedVoiceSample() {
+  const voice = findSelectedPresetVoice();
+  const audioEl = document.getElementById("voicePresetSampleAudio");
+  if (!voice?.sampleUrl || !audioEl) return;
+  audioEl.src = voice.sampleUrl;
+  audioEl.setAttribute("data-voice-sample", voice.sampleUrl);
+  audioEl.classList.remove("hidden");
+  audioEl.currentTime = 0;
+  audioEl.play().catch(() => {});
+}
+
+function renderVoiceCatalog(presets, customs) {
+  const effectivePresets = Array.isArray(presets) && presets.length ? presets : FALLBACK_PRESET_VOICES;
+  const effectiveCustoms = Array.isArray(customs) ? customs : [];
+  STATE.presetVoices = effectivePresets;
+  STATE.customVoices = effectiveCustoms;
+
+  const sel = document.getElementById("voiceSelect");
+  if (sel) {
+    const previous = sel.value;
+    sel.innerHTML = effectivePresets.map(v => {
+      const val = v.name || v.id || "";
+      const desc = String(v.description || "").trim();
+      const label = desc ? `${val} · ${desc}` : val;
+      return `<option value="${I18n.escapeHtml(val)}">${I18n.escapeHtml(label)}</option>`;
+    }).join("");
+    if (previous && effectivePresets.some(v => (v.name || v.id) === previous)) {
+      sel.value = previous;
+    }
+  }
+
+  const datalist = document.getElementById("characterVoiceDatalist");
+  if (datalist) {
+    const presetOpts = effectivePresets.map(v => {
+      const val = v.name || v.id || "";
+      const desc = String(v.description || "").trim();
+      const label = desc ? `${val} · ${desc}` : val;
+      return `<option value="${I18n.escapeHtml(val)}" label="${I18n.escapeHtml(label)}"></option>`;
+    });
+    const customTag = I18n.t("自定义");
+    const customOpts = effectiveCustoms.map(v => {
+      const val = v.id || v.mediaId || v.name || "";
+      const name = v.name || val;
+      return `<option value="${I18n.escapeHtml(val)}" label="${I18n.escapeHtml(`${name} (${customTag})`)}"></option>`;
+    });
+    datalist.innerHTML = [...presetOpts, ...customOpts].join("");
+  }
+
+  updateVoiceSamplePreview();
+}
+
+async function loadVoicesAndCharacters(opts = {}) {
+  const silent = !!(opts && opts.silent);
+  const creds = silent ? getApiCredentials() : requireApiCredentials();
   if (!creds) return;
+  if (STATE.voicesLoading && silent) return;
+  STATE.voicesLoading = true;
   try {
     const [vResp, cResp] = await Promise.all([
       fetch(`${creds.baseUrl}/v1/flow/voices`, { headers: { ...I18n.headers(), "Authorization": `Bearer ${creds.apiKey}` } }),
@@ -1081,12 +1246,9 @@ async function loadVoicesAndCharacters() {
     ]);
     if (vResp.ok) {
       const vd = await vResp.json();
-      const sel = document.getElementById("voiceSelect");
       const presets = Array.isArray(vd.presetVoices) ? vd.presetVoices : [];
-      if (presets.length) {
-        sel.innerHTML = presets.map(v => `<option value="${I18n.escapeHtml(v.name || v.id)}">${I18n.escapeHtml(v.name || v.id)}</option>`).join("");
-      }
       const customs = Array.isArray(vd.customVoices) ? vd.customVoices : [];
+      renderVoiceCatalog(presets, customs);
       document.getElementById("customVoicesList").innerHTML = customs.map(v => `
         <div class="session-row" style="cursor:default;">
           <div>
@@ -1098,6 +1260,9 @@ async function loadVoicesAndCharacters() {
             <button type="button" class="act-btn danger" onclick="deleteVoiceItem('${I18n.escapeHtml(v.workflowId || v.mediaId || v.id)}')">${I18n.escapeHtml(I18n.t("删除"))}</button>
           </div>
         </div>`).join("");
+      STATE.voicesLoadedFor = `${creds.baseUrl}\0${creds.apiKey}`;
+    } else if (!silent) {
+      throw new Error(`HTTP ${vResp.status}: ${await vResp.text()}`);
     }
     if (cResp.ok) {
       const cd = await cResp.json();
@@ -1112,12 +1277,15 @@ async function loadVoicesAndCharacters() {
             <button type="button" class="act-btn danger" onclick="deleteCharacterItem('${I18n.escapeHtml(c.id)}')">${I18n.escapeHtml(I18n.t("删除"))}</button>
           </div>`).join("")
         : `<div class="notice-well">${I18n.escapeHtml(I18n.t("暂无自定义角色"))}</div>`;
+    } else if (!silent) {
+      throw new Error(`HTTP ${cResp.status}: ${await cResp.text()}`);
     }
   } catch (e) {
-    alert(e.message);
+    if (!silent) alert(e.message);
+  } finally {
+    STATE.voicesLoading = false;
   }
 }
-
 async function generateVoiceSample() {
   const creds = requireApiCredentials();
   if (!creds) return;
@@ -1199,11 +1367,18 @@ async function deleteCharacterItem(id) {
   const baseUrlInput = document.getElementById("baseUrl");
   const apiKeyInput = document.getElementById("apiKey");
   baseUrlInput.value = window.location.origin;
-  baseUrlInput.addEventListener("change", loadModels);
-  apiKeyInput.addEventListener("change", loadModels);
+  const handleCredsChange = () => {
+    STATE.voicesLoadedFor = null;
+    loadModels();
+    if (STATE.workbenchTab === "voices") {
+      loadVoicesAndCharacters({ silent: true });
+    }
+  };
+  baseUrlInput.addEventListener("change", handleCredsChange);
+  apiKeyInput.addEventListener("change", handleCredsChange);
+  renderVoiceCatalog(FALLBACK_PRESET_VOICES, []);
   loadModels();
 })();
-
 window.addEventListener('languagechange', () => {
   const collapsed = new Set(Array.from(document.querySelectorAll('.section-title.collapsed'), title => title.dataset.category));
   renderSidebar();
@@ -1213,6 +1388,7 @@ window.addEventListener('languagechange', () => {
       title.nextElementSibling.classList.add('hidden');
     }
   });
+  renderVoiceCatalog(STATE.presetVoices, STATE.customVoices);
   if (!STATE.selectedModel) return;
   const meta = STATE.modelConfig;
   I18n.setMessage(document.getElementById('selectedModelInfo'), ALL_MODELS[STATE.selectedModel] || '');
@@ -1222,7 +1398,7 @@ window.addEventListener('languagechange', () => {
   }
   I18n.setMessage(document.getElementById('btnGenerate'), STATE.generating ? I18n.t('⏳ 生成中...') : I18n.t(meta.type === 'image' ? '🎨 生成图片' : '🎬 生成视频')); // taste-skill-ignore: test_i18n_browser contract
 });
-        Object.assign(window, {toggleMobileNav, closeMobileNav, switchWorkbenchTab, setFamilyFilter, filterModelCatalog, applyFallbackModels, loadModels, renderSidebarFallback, getModelType, getModelMeta, renderSidebar, selectModel, handleFiles, renderImagePreviews, removeImage, generate, renderResult, startNewAgentSession, loadAgentSessions, openAgentSession, sendAgentPrompt, respondAgentPermission, renameActiveAgentSession, deleteActiveAgentSession, loadVoicesAndCharacters, generateVoiceSample, deleteVoiceItem, createCharacterItem, deleteCharacterItem});
+        Object.assign(window, {toggleMobileNav, closeMobileNav, switchWorkbenchTab, setFamilyFilter, filterModelCatalog, applyFallbackModels, loadModels, renderSidebarFallback, getModelType, getModelMeta, renderSidebar, selectModel, handleFiles, renderImagePreviews, removeImage, generate, renderResult, startNewAgentSession, loadAgentSessions, openAgentSession, sendAgentPrompt, respondAgentPermission, renameActiveAgentSession, deleteActiveAgentSession, loadVoicesAndCharacters, generateVoiceSample, deleteVoiceItem, createCharacterItem, deleteCharacterItem, previewSelectedVoiceSample, updateVoiceSamplePreview});
     });
 </script>
 </body>

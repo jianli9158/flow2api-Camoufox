@@ -834,3 +834,132 @@ def test_manage_browser_profile_dir_and_login_modal_binding(browser_page):
     assert len(login_requests) == 2
     assert login_requests[1]["clean_login"] is True
     page.evaluate("closeBrowserLoginModal(true)")
+
+
+def test_voices_tab_has_all_presets_autoloads_and_supports_sample_preview(browser_page):
+    from src.services.flow_current import CurrentFlowClientMixin
+
+    page, base = browser_page
+    voice_requests = []
+    character_requests = []
+    dialogs = []
+    page.on("dialog", lambda d: (dialogs.append(d.message), d.accept()))
+    page.route(
+        "https://gstatic.com/aitestkitchen/voices/samples/**",
+        lambda route: route.fulfill(status=200, content_type="audio/wav", body=b"RIFF"),
+    )
+    page.route(
+        "**/v1/flow/voices",
+        lambda route: (
+            voice_requests.append(route.request.url),
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "presetVoices": [
+                            {
+                                "id": key,
+                                "name": name,
+                                "type": "preset",
+                                "description": (
+                                    "Female, bright, mid-high pitch"
+                                    if name == "Zephyr"
+                                    else "Voice sample"
+                                ),
+                                "enabled": True,
+                                "sampleUrl": f"https://gstatic.com/aitestkitchen/voices/samples/{name}.wav",
+                            }
+                            for key, name in CurrentFlowClientMixin.FLOW_PRESET_VOICES.items()
+                        ],
+                        "customVoices": [
+                            {
+                                "id": "custom-voice-1",
+                                "mediaId": "media-voice-1",
+                                "workflowId": "wf-voice-1",
+                                "name": "Narrator Warm",
+                            }
+                        ],
+                    }
+                ),
+            ),
+        )[-1],
+    )
+    page.route(
+        "**/v1/flow/characters",
+        lambda route: (
+            character_requests.append(route.request.url),
+            route.fulfill(
+                content_type="application/json",
+                body=json.dumps(
+                    {
+                        "characters": [
+                            {
+                                "id": "char-1",
+                                "displayName": "Captain Aria",
+                                "personalityNotes": "Calm space navigator",
+                                "voiceId": "Zephyr",
+                            }
+                        ]
+                    }
+                ),
+            ),
+        )[-1],
+    )
+
+    open_page(page, base + "/test")
+    options = page.locator("#voiceSelect option")
+    playwright_api.expect(options).to_have_count(len(CurrentFlowClientMixin.FLOW_PRESET_VOICES))
+    assert set(options.evaluate_all("els => els.map(el => el.value)")) == set(
+        CurrentFlowClientMixin.FLOW_PRESET_VOICES.values()
+    )
+    playwright_api.expect(page.locator("#characterVoiceDatalist option")).to_have_count(
+        len(CurrentFlowClientMixin.FLOW_PRESET_VOICES)
+    )
+
+    # Switching without an API key must not pop an alert or fire requests.
+    page.locator("#workbenchTabVoices").click()
+    assert dialogs == []
+    assert voice_requests == []
+    assert character_requests == []
+
+    # Switching back, entering an API key, and opening Voices tab auto-loads lists.
+    page.locator("#workbenchTabModels").click()
+    page.locator("#apiKey").fill("local-test-key")
+    with page.expect_response("**/v1/flow/voices"):
+        page.locator("#workbenchTabVoices").click()
+    playwright_api.expect(page.locator("#customVoicesList")).to_contain_text("Narrator Warm")
+    playwright_api.expect(page.locator("#charactersList")).to_contain_text("Captain Aria")
+    assert len(voice_requests) == 1
+    assert len(character_requests) == 1
+    playwright_api.expect(page.locator("#characterVoiceDatalist option")).to_have_count(
+        len(CurrentFlowClientMixin.FLOW_PRESET_VOICES) + 1
+    )
+
+    page.locator("#voiceSelect").select_option("Zephyr")
+    playwright_api.expect(page.locator("#voicePresetSampleMeta")).to_have_text(
+        "Female, bright, mid-high pitch"
+    )
+    page.locator("#btnPreviewVoiceSample").click()
+    audio = page.locator("#voicePresetSampleAudio")
+    playwright_api.expect(audio).to_be_visible()
+    assert audio.get_attribute("src") == "https://gstatic.com/aitestkitchen/voices/samples/Zephyr.wav"
+    page.locator("#voiceSelect").select_option("Achernar")
+    assert audio.get_attribute("src") == "https://gstatic.com/aitestkitchen/voices/samples/Achernar.wav"
+
+    # Language toggle updates Preview button and custom datalist label cleanly.
+    page.locator("[data-language-select]").select_option("zh-CN")
+    playwright_api.expect(page.locator("#btnPreviewVoiceSample")).to_have_text("试听原声")
+    assert (
+        page.locator('#characterVoiceDatalist option[value="custom-voice-1"]').get_attribute(
+            "label"
+        )
+        == "Narrator Warm (自定义)"
+    )
+    page.locator("[data-language-select]").select_option("en")
+    playwright_api.expect(page.locator("#btnPreviewVoiceSample")).to_have_text("Preview")
+    assert (
+        page.locator('#characterVoiceDatalist option[value="custom-voice-1"]').get_attribute(
+            "label"
+        )
+        == "Narrator Warm (Custom)"
+    )
