@@ -212,7 +212,7 @@ curl -s -X POST "http://127.0.0.1:8001/v1/flow/characters" \
 ### 4.4 参考生视频（Reference Video）
 
 #### 13) 使用角色/音色/参考图生成视频：`POST /v1/flow/videos`
-将项目下已创建的角色、自定义音色与参考图传入 Flow 参考生视频接口（`MZZa6b`）。
+将项目下已创建的角色、自定义音色与参考图传入 Flow 参考生视频接口（`MZZa6b`）；当 `model_key` 包含 `_i2v_` 且提供 `image_refs` 时，自动按首帧生视频（`eb1hJf`）模式提交 `image_refs[0]`。
 - **Body 参数**：
   - `prompt: string`（必填）
   - `model_key: string`（默认 `"macaron_cookie_r2v_8s_relaxed"`；若遇到 `code=[5]` 会自动尝试去掉 `_relaxed`）

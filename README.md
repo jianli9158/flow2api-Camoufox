@@ -8,16 +8,20 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
 
 ## 核心能力
 
-- **Camoufox + WebDriver BiDi 单会话执行管线**：移植自 `AIStudio2API` 的浏览器运行时（`src/services/camoufox_bidi.py`），为每个账号槽位锁定持久化 Windows 10/11 指纹（`camoufox-fingerprint.json`）、WebGL/字体子集与独立 Firefox Profile（`browser_data_rt/token_<id>/`）。打码、表单交互、`StreamChat` 生成与同源 `batchexecute` RPC 全部在同一浏览器上下文完成，消除独立打码端与发包端 TLS/Cookie 割裂导致的 `PUBLIC_ERROR_UNUSUAL_ACTIVITY`。
+- **Camoufox + WebDriver BiDi 双 Tab 隔离与分层执行管线**：模块化浏览器运行时（`camoufox_bidi.py`、`camoufox_fingerprint.py`、`bidi_transport.py`、`camoufox_profile.py`、`camoufox_login.py`）为每个账号锁定持久化 Windows 10/11 指纹（`camoufox-fingerprint.json`）、WebGL/字体子集与独立 Firefox Profile（`browser_data_rt/token_<id>/`）：
+  - **同进程双 Tab 隔离**：同一 Camoufox 进程内分离 **API Tab**（常驻 `flow.google.com`，专责 `WIZ_global_data`、同源 `batchexecute` RPC 与 `StreamChat`）与 **打码 Tab**（专责人类轨迹预热与 `grecaptcha.enterprise.execute`），共享同一份 Cookie / TLS / 代理而互不污染页面缓存；遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 时独立清理 `_GRECAPTCHA` 并销毁重建打码 Tab 自动重试，不中断 API 会话且不再持久化瞬态 `_GRECAPTCHA` Cookie。
+  - **控制面分层路由**：只读查询与视频状态轮询 RPC（`Zzl0ze` 20s 缓存与单飞合并、`jwpduf`、`as29s`、`nzlxg`、`wDg3C`、Agent 会话、用户/项目设置等）优先走连接池化的 `curl_cffi` HTTP 控制面（遇风控自动回退浏览器），彻底减少对打码槽位的抢占。
 - **三协议 API 兼容**：
   - **OpenAI 兼容**：`GET /v1/models`、`GET /v1/models/aliases`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式）。
   - **Gemini 兼容**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`（及 `/models/...` 路径），支持 `generationConfig.imageConfig` 动态分辨率与比例解析。
-  - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
-- **多账号调度、风控冷却与自动续期**：
-  - `LoadBalancer` 支持随机负载优先与顺序轮询（`call_mode = "default" | "polling"`），按账号等级（Free / Pro / Ult）与图像/视频并发配额自动路由。
-  - 遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` / `403` / `429` 时自动冷却槽位并切换下一可用账号；生成类 RPC 超时严格保护以防重复扣费；后台定时任务通过真实 Camoufox 实例续期 Google/Flow Cookies（`__Secure-1PSIDTS`、`SIDCC`、`OSID`）并原子写回 SQLite 与 `storage-state.json`。
+  - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、参考生视频 / 首帧生视频、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
+- **多账号调度、防误封自愈与断开取消**：
+  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）与 `default` / `polling` 策略，并严格保证单账号 Profile 单槽位互斥（禁止同 Profile 双开 `.parentlock` 冲突）。
+  - 区分短暂 `401`/风控抖动与真实掉线：触发异步 `schedule_auth_recovery()` 二次复核与 10 秒被动 SSO 跳转等待，避免高并发下误封账号；后台错峰自动续期 Google/Flow Cookies 并同步更新 `at_expires`。
+  - 支持客户端断开实时传播：自动中止后台任务并向页内 `StreamChat` 发送 `AbortController` 取消信号，日志状态统一收敛为 `499`。
+- **性能存储与安全加固**：SQLite 采用 4 连接只读池（`query_only = ON`）与启动维护整理（`PRAGMA optimize` / `wal_checkpoint`）；Camoufox 磁盘缓存限额 30 MiB 并禁用 Widevine；管理端内置登录 IP 滑动窗口限流（`429`）、过期会话清理及 Cookie 鉴权同源 CSRF 校验。
 - **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
-- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 语音与角色交互测试。
+- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
 
 ---
 
@@ -26,11 +30,13 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
 ```mermaid
 flowchart LR
     Client["客户端<br/>OpenAI / Gemini / Flow REST"] --> API["FastAPI 网关<br/>/v1/chat/completions · /v1beta/models/* · /v1/flow/*"]
-    API --> Core["TokenManager & LoadBalancer<br/>并发配额 / 等级鉴权 / 风控冷却 / 定时续期"]
-    Core --> Pool["BrowserCaptchaService<br/>账号亲和槽位池与恢复状态机"]
-    Pool --> Worker["CamoufoxWorker<br/>WebDriver BiDi · 局部 SOCKS5 认证中继"]
-    Worker --> Profile["browser_data_rt/token_{id}<br/>Windows 指纹 + Firefox Profile + storage-state.json"]
-    Worker --> Flow["flow.google.com<br/>reCAPTCHA Enterprise · 原生 UI StreamChat · batchexecute"]
+    API --> Core["TokenManager & LoadBalancer<br/>热槽位亲和 · 防误封自愈 · 断开取消 499"]
+    Core -->|控制面/轮询 HTTP-First| HTTP["curl_cffi 连接池<br/>Zzl0ze 缓存 · jwpduf · as29s"]
+    Core -->|高风险提交/打码| Pool["BrowserCaptchaService<br/>单 Profile 排他槽位池"]
+    Pool --> Worker["CamoufoxWorker (WebDriver BiDi)<br/>API Tab (RPC/StreamChat) ⇄ 打码 Tab (reCAPTCHA)"]
+    Worker --> Profile["browser_data_rt/token_{id}<br/>Windows 指纹 + 30MiB Profile + storage-state.json"]
+    HTTP --> Flow["flow.google.com"]
+    Worker --> Flow
 ```
 
 ---
@@ -46,8 +52,8 @@ flowchart LR
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/jianli9158/flow2api.git
-cd flow2api
+git clone https://github.com/jianli9158/flow2api-Camoufox.git
+cd flow2api-Camoufox
 
 # 2. 创建虚拟环境并安装依赖
 python3 -m venv .venv
@@ -166,7 +172,7 @@ python main.py
 | | `DELETE /v1/flow/voices/{voice_ref}` | 删除自定义语音 |
 | **角色管理** | `GET /v1/flow/characters` / `GET /v1/flow/characters/{character_id}` | 列出或查询角色设定 |
 | | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建、更新（名称/音色/设定/收藏）或删除角色 |
-| **参考生视频** | `POST /v1/flow/videos` | 关联 `character_refs`、`voice_refs` 与 `image_refs` 生成参考视频，支持同步轮询或异步返回 |
+| **参考/首帧生视频** | `POST /v1/flow/videos` | 关联 `character_refs`、`voice_refs` 与 `image_refs` 生成参考视频（`MZZa6b`）；当 `model_key` 含 `_i2v_` 且附带 `image_refs` 时自动路由首帧生视频（`eb1hJf`），支持同步轮询或异步返回 |
 | **Creation Agent** | `POST /v1/flow/agent/chat` | 发起或继续 Agent 对话（`stream: true` 输出 SSE：`session` / `thinking` / `text` / `a2ui` / `media` / `permission` / `done` / `error`） |
 | | `POST /v1/flow/agent/sessions/{session_id}/approve` | 批准（`approved` / `approved_sticky`）或拒绝（`denied`）Agent 扣费/生成确认卡片 |
 | | `GET /v1/flow/agent/sessions` / `GET` / `PATCH` / `DELETE .../{session_id}` | 查询会话列表、读取历史轮次、重命名或删除会话 |
