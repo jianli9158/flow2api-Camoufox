@@ -336,3 +336,36 @@ curl -s -X PATCH "http://127.0.0.1:8001/v1/flow/projects/<project_uuid>/settings
     "token_id": 1
   }'
 ```
+
+---
+
+### 4.7 模型能力目录、自动建角、视频串联与内置 MCP
+
+#### 22) 查询账号能力与模型目录：`GET /v1/flow/models`
+- **Query 参数**：`email?: string`, `token_id?: int`
+- 返回账号订阅等级（`accountTier`）、剩余积分（`credits`）、`imageModels`、`videoModels`（含 `supported` 等级判定）、`nativeVideoModels` 与 `supportedResolutions`。
+
+#### 23) 两段式自动建角（Face -> Body Saga）：`POST /v1/flow/characters`
+- 除原有 `display_name` / `voice_id` / `personality_notes` / `image_refs` 外，新增可选参数：
+  - `face_prompt?: string`：自动生成角色面部参考图并绑定；
+  - `body_prompt?: string`：自动以面部参考图为锚点生成全身造型图并一同绑定至角色；
+  - `aspect_ratio?: string`（默认 `IMAGE_ASPECT_RATIO_PORTRAIT`）、`model_name?: string`（默认 `GEM_PIX_2`）。
+- 返回体额外包含 `generatedMediaIds`、`faceMediaId`、`bodyMediaId`。
+
+#### 24) `@mention` 自动解析与提示词清理：`POST /v1/flow/videos`
+- 新增可选布尔字段：
+  - `resolve_mentions: bool = true`：自动解析提示词中的 `@CharacterName` 或 `@"Multi Word Name"` 并注入对应 `character_refs` / `image_refs`；若命中没有参考图的空角色会直接返回 `400` 提示；
+  - `clean_prompt: bool = false`：开启后清理 `8k`、`4k`、`masterpiece`、`ultra hd` 等遗留 SD 冗余标签。
+
+#### 25) 尾帧提取与多段视频串联：`POST /v1/flow/videos/chain`
+> 需要宿主机 `PATH` 中存在 `ffmpeg` 与 `ffprobe`。
+- **Body 参数**：
+  - `segments: [{prompt, model_key?, aspect_ratio?, character_refs?, voice_refs?, image_refs?, resolution?}]`（1–6 段）
+  - `frame_offset_ms: int = 200`（距视频结尾提前偏移毫秒提取尾帧，规避末尾黑场淡出）
+  - `concat: bool = true`（使用 `ffmpeg` 拼接为单条成片返回 `/tmp/chain_*.mp4`）
+  - `clean_prompt: bool = false`、`resolve_mentions: bool = true`、`poll_interval: float = 5.0`、`timeout: int = 360`
+
+#### 26) 内置 Streamable HTTP MCP 服务端：`GET / POST /mcp`
+- 使用标准 `Authorization: Bearer <api_key>` 或 `x-goog-api-key` 鉴权。
+- 支持 JSON-RPC 2.0 `initialize`、`ping`、`tools/list`、`tools/call`（内置 9 个工具：`flow_list_models`、`flow_get_project`、`flow_list_voices`、`flow_list_characters`、`flow_create_character`、`flow_generate_image`、`flow_generate_video`、`flow_get_asset`、`flow_tts`）。
+- 高消费工具内置令牌桶限流（容量 8，每 20s 恢复 1 枚），超限返回 JSON-RPC `-32029`（HTTP `429`）。

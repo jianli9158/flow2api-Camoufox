@@ -442,6 +442,41 @@ class FlowFrontendMixin:
         )
 
     @classmethod
+    def _extract_observed_flow_model(
+        cls, value: Any, *, kind: str = "image"
+    ) -> Optional[str]:
+        """Best-effort extraction of upstream-reported model key from Flow protobuf tuples."""
+        image_models = ("GEM_PIX_2", "BELUGA", "HARBOR_SEAL", "NARWHAL")
+
+        def walk(node: Any) -> Optional[str]:
+            if isinstance(node, str):
+                cleaned = node.strip()
+                if not cleaned or len(cleaned) > 80:
+                    return None
+                if kind == "video":
+                    if cleaned.startswith("veo_"):
+                        return cleaned
+                else:
+                    if cleaned in image_models or cleaned.startswith("IMAGEN_"):
+                        return cleaned
+                return None
+            if isinstance(node, list):
+                for child in node:
+                    found = walk(child)
+                    if found:
+                        return found
+            elif isinstance(node, dict):
+                for k, child in node.items():
+                    if str(k).lower() in ("model", "modelkey", "imagemodelname", "videomodelkey") and isinstance(child, str) and child.strip():
+                        return child.strip()
+                    found = walk(child)
+                    if found:
+                        return found
+            return None
+
+        return walk(value)
+
+    @classmethod
     def _normalize_frontend_image_generation_response(
         cls, payload: Any
     ) -> Dict[str, Any]:
@@ -451,22 +486,29 @@ class FlowFrontendMixin:
             else []
         )
         media: List[Dict[str, Any]] = []
+        first_observed: Optional[str] = None
         for item in media_items:
             if not isinstance(item, list) or not item:
                 continue
             media_id = str(item[0] or "").strip()
             image_url = cls._find_flow_content_url(item, "image")
+            observed_model = cls._extract_observed_flow_model(item, kind="image")
+            if observed_model and not first_observed:
+                first_observed = observed_model
             if media_id and image_url:
-                media.append(
-                    {
-                        "name": media_id,
-                        "image": {"generatedImage": {"fifeUrl": image_url}},
-                    }
-                )
+                entry: Dict[str, Any] = {
+                    "name": media_id,
+                    "image": {"generatedImage": {"fifeUrl": image_url}},
+                }
+                if observed_model:
+                    entry["observedModel"] = observed_model
+                media.append(entry)
         if not media:
             raise RuntimeError("Flow frontend image RPC returned no downloadable media")
-        return {"media": media, "frontendRpc": "ogiZ0b"}
-
+        result: Dict[str, Any] = {"media": media, "frontendRpc": "ogiZ0b"}
+        if first_observed:
+            result["observedModel"] = first_observed
+        return result
     def _build_frontend_video_generation_argument(
         self,
         *,
@@ -737,14 +779,19 @@ class FlowFrontendMixin:
                 video_info["fifeUrl"] = video_url
             video_info.setdefault("mediaName", media_name)
             video_info.setdefault("mediaGenerationId", operation_id)
+            observed_model = cls._extract_observed_flow_model(record, kind="video")
             video_info.setdefault(
                 "aspectRatio",
                 previous.get("aspectRatio") if isinstance(previous, dict) else None,
             )
-            video_info.setdefault(
-                "model",
-                previous.get("modelKey") if isinstance(previous, dict) else None,
-            )
+            if observed_model:
+                video_info["observedModel"] = observed_model
+                video_info["model"] = observed_model
+            else:
+                video_info.setdefault(
+                    "model",
+                    previous.get("modelKey") if isinstance(previous, dict) else None,
+                )
             metadata["video"] = video_info
             error_message = {
                 "PUBLIC_ERROR_PROMINENT_PEOPLE_FILTER_FAILED": (

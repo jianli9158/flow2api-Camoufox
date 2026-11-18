@@ -19,7 +19,9 @@ except ImportError:
     AsyncSession = None
 
 from ..core.config import config
+from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
+from ..core.prompt_tools import jitter_seconds
 from .flow_cookies import FlowCookieJar
 from .flow_current import CurrentFlowClientMixin
 from .flow_frontend import FlowFrontendMixin
@@ -1095,23 +1097,19 @@ class _FlowClientBase(FlowFrontendMixin):
         return request_ref
 
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
-        error_lower = error_str.lower()
+        error_lower = str(error_str or "").lower()
+        classified = classify_flow_error(error_str)
+        if classified.category in (
+            FlowErrorCategory.CONTENT_POLICY,
+            FlowErrorCategory.TIER_PERMISSION,
+            FlowErrorCategory.AUTH_EXPIRED,
+            FlowErrorCategory.INVALID_INPUT,
+            FlowErrorCategory.NOT_FOUND,
+        ):
+            return None
         if "browser captcha queue wait timeout" in error_lower:
             return None
-        if "model_access_denied" in error_lower:
-            return None
-        if any(
-            marker in error_lower
-            for marker in (
-                "public_error_unusual_activity",
-                "public_error_unsafe_generation",
-                "public_error_prominent_people_filter_failed",
-                "public_error_model_access_denied",
-                "too much traffic",
-                "登录态已失效",
-                "登录已失效",
-            )
-        ):
+        if "public_error_unusual_activity" in error_lower or "too much traffic" in error_lower:
             return None
         if "403" in error_lower:
             return "403错误"
@@ -1123,28 +1121,16 @@ class _FlowClientBase(FlowFrontendMixin):
             return "reCAPTCHA 验证失败"
         if "recaptcha" in error_lower:
             return "reCAPTCHA 错误"
-        if any(
-            keyword in error_lower
-            for keyword in [
-                "http error 500",
-                "public_error",
-                "internal error",
-                "reason=internal",
-                "reason: internal",
-                '"reason":"internal"',
-                "server error",
-                "upstream error",
-            ]
-        ):
+        if classified.category == FlowErrorCategory.TRANSIENT_UPSTREAM or "public_error" in error_lower:
             return "500/内部错误"
         return None
 
-    def _get_retry_delay_seconds(self, error_str: str, retry_attempt: int) -> int:
+    def _get_retry_delay_seconds(self, error_str: str, retry_attempt: int) -> float:
         _ = retry_attempt
         error_lower = str(error_str or "").lower()
         if "recaptcha" in error_lower:
-            return 2
-        return 1
+            return round(jitter_seconds(2.0, low_ratio=0.75, high_ratio=1.35), 2)
+        return round(jitter_seconds(1.0, low_ratio=0.7, high_ratio=1.4), 2)
 
     def _merge_request_fingerprint(self, patch: Optional[Dict[str, Any]]):
         if not isinstance(patch, dict) or not patch:

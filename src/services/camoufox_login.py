@@ -25,7 +25,9 @@ from .camoufox_fingerprint import (
     write_camoufox_user_js,
 )
 from .camoufox_profile import (
+    ProfileLease,
     _clear_stale_firefox_profile_locks,
+    acquire_profile_lease,
     acquire_profile_login_lease,
     clear_site_cookies_in_profile,
     normalize_browser_profile_dir,
@@ -599,6 +601,7 @@ class CamoufoxLoginSession:
         self._is_explicit_profile_dir: bool = bool(self.browser_profile_dir)
         self._reused_existing_profile: bool = False
         self._lease_account_dir: Optional[Path] = None
+        self._profile_lease: Optional[ProfileLease] = None
         self._profile_dir: Optional[Path] = None
         self._task: Optional[asyncio.Task] = None
         self._cancel_event = asyncio.Event()
@@ -696,6 +699,9 @@ class CamoufoxLoginSession:
                 account_dir, self.session_id, token_id=self.token_id
             )
             self._lease_account_dir = account_dir
+            self._profile_lease = acquire_profile_lease(
+                account_dir, holder=f"camoufox_login_{self.session_id}"
+            )
             self._temp_account_dir = account_dir
             account_dir.mkdir(parents=True, exist_ok=True)
 
@@ -888,6 +894,9 @@ class CamoufoxLoginSession:
             self.set_state("failed", f"浏览器登录失败: {exc}", error=str(exc))
         finally:
             await self._cleanup(save_cache=save_cache)
+            if self._profile_lease is not None:
+                self._profile_lease.release()
+                self._profile_lease = None
             release_profile_login_lease(
                 self._lease_account_dir, self.session_id, token_id=self.token_id
             )

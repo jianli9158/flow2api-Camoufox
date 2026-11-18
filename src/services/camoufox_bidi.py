@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from ..core.prompt_tools import jitter_sleep
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 import uuid
 import zipfile
@@ -85,12 +86,17 @@ from .camoufox_login import (
     has_display,
 )
 from .camoufox_profile import (
+    PROFILE_KERNEL_LOCK_FILENAME,
     PROFILE_STARTUP_DIR_NAME,
+    ProfileLease,
+    ProfileLeaseBusyError,
     STARTUP_CACHE_ENTRIES,
     _clear_stale_firefox_profile_locks,
     _copy_startup_cache_entries,
+    acquire_profile_lease,
     acquire_profile_login_lease,
     clear_site_cookies_in_profile,
+    get_active_profile_lease_holder,
     get_profile_login_holder,
     is_token_in_login_session,
     list_browser_profile_dirs,
@@ -171,6 +177,7 @@ class CamoufoxWorker:
         self._last_stream_chat_at: float = 0.0
         self._cached_wiz: Dict[str, str] = {}
         self._consecutive_risk_failures: int = 0
+        self._profile_lease: Optional[ProfileLease] = None
     def is_busy(self) -> bool:
         return self._solve_inflight > 0
 
@@ -435,10 +442,16 @@ class CamoufoxWorker:
                 f"账号浏览器资料目录 {account_dir.name} 正在进行登录会话 ({login_holder})，请先完成或关闭登录"
             )
         account_dir.mkdir(parents=True, exist_ok=True)
+        if token_id:
+            if self._profile_lease is not None:
+                self._profile_lease.release()
+                self._profile_lease = None
+            self._profile_lease = acquire_profile_lease(
+                account_dir, holder=f"camoufox_slot_{self.token_id}_token_{token_id}"
+            )
         fp_config = load_or_create_account_camoufox_config(
             account_dir, CAMOUFOX_FIREFOX_MAJOR, "en-US", "America/New_York"
         )
-
         try:
             relay_addr: Optional[Tuple[str, int]] = None
             if raw_proxy_url:
@@ -594,6 +607,9 @@ class CamoufoxWorker:
                 and not self._is_persistent_profile
             ):
                 shutil.rmtree(profile_dir_cleanup, ignore_errors=True)
+            if self._profile_lease is not None:
+                self._profile_lease.release()
+                self._profile_lease = None
             raise
 
     @staticmethod
@@ -1113,6 +1129,9 @@ class CamoufoxWorker:
                 _clear_stale_firefox_profile_locks(profile_dir)
             else:
                 shutil.rmtree(profile_dir, ignore_errors=True)
+        if self._profile_lease is not None:
+            self._profile_lease.release()
+            self._profile_lease = None
         if proc is not None or bidi is not None:
             debug_logger.log_info(
                 f"[Camoufox] Slot-{self.token_id} 实例已回收 (reason={reason})"
@@ -1294,9 +1313,9 @@ class CamoufoxWorker:
             except Exception:
                 await self._send_trusted_gesture(context_id)
             if first_warmup:
-                await asyncio.sleep(1.1 if r == 0 else 0.9)
+                await jitter_sleep(1.1 if r == 0 else 0.9, low_ratio=0.75, high_ratio=1.35)
             else:
-                await asyncio.sleep(0.25)
+                await jitter_sleep(0.25, low_ratio=0.7, high_ratio=1.5)
         if first_warmup:
             self._warmed_projects.add(warmup_key)
 

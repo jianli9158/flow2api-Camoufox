@@ -17,8 +17,9 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
-
+from ..core.prompt_tools import jitter_sleep, validate_base64_media_payload
 from .browser_cookie_utils import (
     serialize_cookie_header_for_url,
     validate_flow_cookie_storage,
@@ -781,7 +782,22 @@ class CurrentFlowClientMixin:
                     int(self._get_runtime_config().upsample_timeout or 300), 90
                 ),
             )
-            return self._find_media_url(payload) or self._find_encoded_media(payload)
+            media_url = self._find_media_url(payload)
+            if media_url:
+                return media_url
+            encoded_media = self._find_encoded_media(payload)
+            if encoded_media:
+                validate_base64_media_payload(encoded_media, expected_kind="image")
+            return encoded_media
+        except Exception as exc:
+            classified = classify_flow_error(
+                exc, target_resolution=target_resolution, operation="upsample"
+            )
+            if classified.category == FlowErrorCategory.TIER_PERMISSION:
+                raise RuntimeError(
+                    f"Image upsample permission denied ({target_resolution}): {classified.remediation_hint}"
+                ) from exc
+            raise
         finally:
             await self._notify_browser_captcha_request_finished(browser_id)
 
@@ -892,20 +908,18 @@ class CurrentFlowClientMixin:
                         debug_logger.log_warning(
                             f"[VIDEO] RPC ({rpc_id}) 遇到 PUBLIC_ERROR_UNUSUAL_ACTIVITY，重置独立打码 Tab 后重试一次"
                         )
-                        await asyncio.sleep(1.5)
+                        await jitter_sleep(1.5, low_ratio=0.75, high_ratio=1.4)
                         continue
                     raise
-                # 账号权限/内容安全/登录失效等错误不重复提交同一账号
-                if any(
-                    marker in error_text
-                    for marker in (
-                        "model_access_denied",
-                        "public_error_unsafe_generation",
-                        "public_error_prominent_people_filter_failed",
-                        "too much traffic",
-                        "登录态已失效",
-                        "登录已失效",
-                    )
+                classified = classify_flow_error(error)
+                if classified.category in (
+                    FlowErrorCategory.TIER_PERMISSION,
+                    FlowErrorCategory.CONTENT_POLICY,
+                    FlowErrorCategory.AUTH_EXPIRED,
+                    FlowErrorCategory.INVALID_INPUT,
+                ) or (
+                    classified.category == FlowErrorCategory.RATE_LIMIT
+                    and ("daily" in error_text or "quota" in error_text or "too much traffic" in error_text)
                 ):
                     raise
                 is_missing_model = bool(
@@ -1826,7 +1840,7 @@ class CurrentFlowClientMixin:
                         pass
                 if not is_risk or attempt_idx >= max_attempts - 1:
                     raise
-                await asyncio.sleep(1.5)
+                await jitter_sleep(1.5, low_ratio=0.75, high_ratio=1.4)
             finally:
                 if isinstance(browser_id, str) and ":lease-" in browser_id:
                     await self._notify_browser_captcha_request_finished(

@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from curl_cffi.requests import AsyncSession
 from ..core.config import config
 from ..core.logger import debug_logger
-
+from ..core.prompt_tools import validate_base64_media_payload
 
 class FileCache:
     """File caching service for videos"""
@@ -289,11 +289,16 @@ class FileCache:
                 except Exception:
                     pass
 
-    def _decode_and_write_base64(self, file_path: Path, base64_data: str) -> int:
-        raw_bytes = base64.b64decode(base64_data)
+    def _decode_and_write_base64(
+        self, file_path: Path, base64_data: str, expected_kind: Optional[str] = None
+    ) -> int:
+        kind = expected_kind
+        if kind is None:
+            suffix = file_path.suffix.lower()
+            kind = "video" if suffix in (".mp4", ".webm", ".mov") else "image"
+        raw_bytes = validate_base64_media_payload(base64_data, expected_kind=kind)
         self._write_cached_content(file_path, raw_bytes)
         return len(raw_bytes)
-
     def _check_existing_cache_file(self, file_path: Path) -> bool:
         if not file_path.exists():
             return False

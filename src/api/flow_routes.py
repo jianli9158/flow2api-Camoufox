@@ -8,6 +8,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from ..core.auth import verify_api_key_flexible
+from ..core.flow_errors import classify_flow_error
+from ..core.redaction import redact_sensitive_text
 from ..services.flow_features import (
     FlowFeatureService,
     get_resolved_flow_token_id,
@@ -35,18 +37,18 @@ def _ensure_service() -> FlowFeatureService:
 
 def _translate_service_error(exc: Exception) -> HTTPException:
     if isinstance(exc, HTTPException):
-        return exc
+        return HTTPException(
+            status_code=exc.status_code,
+            detail=redact_sensitive_text(str(exc.detail or "")),
+        )
     if isinstance(exc, ValueError):
-        return HTTPException(status_code=400, detail=str(exc))
-    msg = str(exc or "Flow request failed")
-    msg_lower = msg.lower()
-    if "code=401" in msg_lower or "登录认证失败" in msg or "unauthenticated" in msg_lower:
-        return HTTPException(status_code=401, detail=msg)
-    if "not_found" in msg_lower or "code=[5]" in msg_lower or "code=5" in msg_lower:
-        return HTTPException(status_code=404, detail=msg)
-    if "public_error_" in msg_lower or "code=[3]" in msg_lower or "code=3" in msg_lower:
-        return HTTPException(status_code=400, detail=msg)
-    return HTTPException(status_code=502, detail=msg)
+        return HTTPException(status_code=400, detail=redact_sensitive_text(str(exc)))
+    msg = redact_sensitive_text(str(exc or "Flow request failed"))
+    classified = classify_flow_error(msg)
+    status = classified.http_status
+    if status == 500:
+        status = 502
+    return HTTPException(status_code=status, detail=msg)
 
 
 def _sanitize_flow_response_for_log(result: Any) -> Any:
@@ -161,10 +163,13 @@ class CreateCharacterRequest(BaseModel):
     voice_id: Optional[str] = None
     personality_notes: Optional[str] = None
     image_refs: Optional[List[str]] = None
+    face_prompt: Optional[str] = None
+    body_prompt: Optional[str] = None
+    aspect_ratio: str = "IMAGE_ASPECT_RATIO_PORTRAIT"
+    model_name: str = "GEM_PIX_2"
     project_id: Optional[str] = None
     email: Optional[str] = None
     token_id: Optional[int] = None
-
 
 class UpdateCharacterRequest(BaseModel):
     display_name: Optional[str] = None
@@ -542,6 +547,16 @@ async def create_flow_character(
             voice_id=request.voice_id,
             personality_notes=request.personality_notes,
             image_refs=request.image_refs,
+            **(
+                {
+                    "face_prompt": request.face_prompt,
+                    "body_prompt": request.body_prompt,
+                    "aspect_ratio": request.aspect_ratio,
+                    "model_name": request.model_name,
+                }
+                if (request.face_prompt or request.body_prompt)
+                else {}
+            ),
             project_id=request.project_id,
             email=request.email,
             token_id=request.token_id,
@@ -1051,12 +1066,54 @@ class GenerateReferenceVideoRequest(BaseModel):
     voice_refs: Optional[List[Any]] = None
     image_refs: Optional[List[Any]] = None
     resolution: Optional[str] = None
+    clean_prompt: bool = Field(default=False)
+    resolve_mentions: bool = Field(default=True)
     wait: bool = Field(default=True)
     poll_interval: float = Field(default=5.0, ge=1.0, le=30.0)
     timeout: int = Field(default=360, ge=30, le=900)
     project_id: Optional[str] = None
     email: Optional[str] = None
     token_id: Optional[int] = None
+
+
+class ChainVideoSegment(BaseModel):
+    prompt: str = Field(..., min_length=1)
+    model_key: Optional[str] = None
+    aspect_ratio: str = Field(default="VIDEO_ASPECT_RATIO_LANDSCAPE")
+    character_refs: Optional[List[Any]] = None
+    voice_refs: Optional[List[Any]] = None
+    image_refs: Optional[List[Any]] = None
+    resolution: Optional[str] = None
+
+
+class ChainVideosRequest(BaseModel):
+    segments: List[ChainVideoSegment] = Field(..., min_length=1, max_length=6)
+    frame_offset_ms: int = Field(default=200, ge=0, le=2000)
+    concat: bool = Field(default=True)
+    clean_prompt: bool = Field(default=False)
+    resolve_mentions: bool = Field(default=True)
+    poll_interval: float = Field(default=5.0, ge=1.0, le=30.0)
+    timeout: int = Field(default=360, ge=30, le=900)
+    project_id: Optional[str] = None
+    email: Optional[str] = None
+    token_id: Optional[int] = None
+
+
+@router.get("/models")
+async def list_flow_models(
+    email: Optional[str] = Query(None),
+    token_id: Optional[int] = Query(None),
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    _ = api_key
+    svc = _ensure_service()
+    return await _execute_logged_flow_call(
+        svc,
+        operation="flow_list_models",
+        request_data={"email": email, "token_id": token_id},
+        explicit_token_id=token_id,
+        fn=lambda: svc.list_models(email=email, token_id=token_id),
+    )
 
 
 @router.post("/videos")
@@ -1066,6 +1123,11 @@ async def generate_flow_reference_video(
 ):
     _ = api_key
     svc = _ensure_service()
+    extra_flags: Dict[str, Any] = {}
+    if request.clean_prompt:
+        extra_flags["clean_prompt"] = True
+    if not request.resolve_mentions:
+        extra_flags["resolve_mentions"] = False
     return await _execute_logged_flow_call(
         svc,
         operation="flow_generate_video",
@@ -1082,6 +1144,37 @@ async def generate_flow_reference_video(
             wait=request.wait,
             poll_interval=request.poll_interval,
             timeout=request.timeout,
+            project_id=request.project_id,
+            email=request.email,
+            token_id=request.token_id,
+            **extra_flags,
+        ),
+    )
+
+
+@router.post("/videos/chain")
+async def chain_flow_videos(
+    request: ChainVideosRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    _ = api_key
+    svc = _ensure_service()
+    base_url = f"{raw_request.url.scheme}://{raw_request.headers.get('host', raw_request.url.netloc)}"
+    return await _execute_logged_flow_call(
+        svc,
+        operation="flow_chain_videos",
+        request_data=request.model_dump(exclude_none=True),
+        explicit_token_id=request.token_id,
+        fn=lambda: svc.chain_videos(
+            segments=[seg.model_dump(exclude_none=True) for seg in request.segments],
+            frame_offset_ms=request.frame_offset_ms,
+            concat=request.concat,
+            clean_prompt=request.clean_prompt,
+            resolve_mentions=request.resolve_mentions,
+            poll_interval=request.poll_interval,
+            timeout=request.timeout,
+            base_url=base_url,
             project_id=request.project_id,
             email=request.email,
             token_id=request.token_id,

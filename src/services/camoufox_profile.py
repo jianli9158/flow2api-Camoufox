@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None  # type: ignore[assignment]
+
+try:
+    import msvcrt as _msvcrt
+except ImportError:
+    _msvcrt = None  # type: ignore[assignment]
 
 from ..core.logger import debug_logger
 
@@ -20,8 +31,154 @@ _RESERVED_PROFILE_NAMES = {"shared", "pending"}
 _PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+(?:/[A-Za-z0-9._@-]+)*$")
 _ACTIVE_PROFILE_LOGIN_LEASES: Dict[Path, str] = {}
 _ACTIVE_TOKEN_LOGIN_LEASES: Dict[int, str] = {}
+_ACTIVE_PROFILE_KERNEL_LEASES: Dict[Path, Tuple["ProfileLease", str]] = {}
 _PROFILE_LOGIN_LEASE_LOCK = threading.Lock()
+PROFILE_KERNEL_LOCK_FILENAME = ".flow2api-profile.lock"
 
+
+class ProfileLeaseBusyError(RuntimeError):
+    """Raised when another worker or OS process holds the profile directory lock."""
+
+
+class ProfileLease:
+    """Cross-process + in-process OS kernel lock for a Camoufox account profile directory."""
+
+    def __init__(
+        self,
+        account_dir: Path,
+        lock_path: Path,
+        fd: int,
+        holder: str,
+    ) -> None:
+        self.account_dir = _canonical_lease_path(account_dir)
+        self.lock_path = lock_path
+        self.holder = holder
+        self._fd: Optional[int] = fd
+        self._released = False
+
+    @property
+    def active(self) -> bool:
+        return not self._released and self._fd is not None
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        with _PROFILE_LOGIN_LEASE_LOCK:
+            existing = _ACTIVE_PROFILE_KERNEL_LEASES.get(self.account_dir)
+            if existing is not None and existing[0] is self:
+                _ACTIVE_PROFILE_KERNEL_LEASES.pop(self.account_dir, None)
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_UN)
+            elif _msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_SET)
+                _msvcrt.locking(fd, _msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __enter__(self) -> "ProfileLease":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.release()
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+def _read_lock_holder_diag(lock_path: Path) -> str:
+    try:
+        raw = lock_path.read_bytes()
+        payload = raw.lstrip(b"\x00").decode("utf-8", errors="ignore").strip()
+        if payload:
+            info = json.loads(payload)
+            if isinstance(info, dict):
+                return f"pid={info.get('pid')}, holder={info.get('holder')}"
+    except Exception:
+        pass
+    return "unknown holder"
+
+
+def acquire_profile_lease(
+    account_dir: Union[str, Path],
+    holder: str = "worker",
+) -> ProfileLease:
+    """Acquire exclusive in-process and OS kernel lock (`flock`/`msvcrt`) on `account_dir`.
+
+    Byte 0 holds the kernel lock and diagnostic metadata lives at offset 1+. The lock
+    file is intentionally never unlinked on release so concurrent processes share one inode.
+    """
+    target_dir = _canonical_lease_path(Path(account_dir))
+    target_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = target_dir / PROFILE_KERNEL_LOCK_FILENAME
+
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        active_entry = _ACTIVE_PROFILE_KERNEL_LEASES.get(target_dir)
+        if active_entry is not None and active_entry[0].active:
+            raise ProfileLeaseBusyError(
+                f"浏览器资料目录 {target_dir.name} 已被本进程持有 ({active_entry[1]})"
+            )
+
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if _fcntl is not None:
+                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+            elif _msvcrt is not None:
+                os.lseek(fd, 0, os.SEEK_END)
+                if os.lseek(fd, 0, os.SEEK_CUR) == 0:
+                    os.write(fd, b"\x00")
+                os.lseek(fd, 0, os.SEEK_SET)
+                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+        except OSError as exc:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            diag = _read_lock_holder_diag(lock_path)
+            raise ProfileLeaseBusyError(
+                f"浏览器资料目录 {target_dir.name} 已被其他进程锁定 ({diag})"
+            ) from exc
+
+        meta = json.dumps(
+            {
+                "pid": os.getpid(),
+                "holder": str(holder or "worker"),
+                "acquired_at": datetime.now(timezone.utc).isoformat(),
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, b"\x00" + meta)
+        except OSError:
+            pass
+
+        lease = ProfileLease(target_dir, lock_path, fd, str(holder or "worker"))
+        _ACTIVE_PROFILE_KERNEL_LEASES[target_dir] = (lease, str(holder or "worker"))
+        return lease
+
+
+def get_active_profile_lease_holder(account_dir: Path) -> Optional[str]:
+    key = _canonical_lease_path(account_dir)
+    with _PROFILE_LOGIN_LEASE_LOCK:
+        entry = _ACTIVE_PROFILE_KERNEL_LEASES.get(key)
+        if entry is not None and entry[0].active:
+            return entry[1]
+        return None
 
 def restore_startup_cache(account_dir: Path, profile_dir: Path) -> None:
     """Copy cached `compatibility.ini` and `startupCache` from `account_dir/profile-startup` into `profile_dir`."""
@@ -299,9 +456,13 @@ def prune_camoufox_profile_bloat(
         if not ff_dir.is_dir():
             continue
         stats["profiles_scanned"] += 1
-        if get_profile_login_holder(acc_dir) or any(
-            (ff_dir / lk).exists() or (ff_dir / lk).is_symlink()
-            for lk in (".parentlock", "lock", "parent.lock")
+        if (
+            get_profile_login_holder(acc_dir)
+            or get_active_profile_lease_holder(acc_dir)
+            or any(
+                (ff_dir / lk).exists() or (ff_dir / lk).is_symlink()
+                for lk in (".parentlock", "lock", "parent.lock")
+            )
         ):
             stats["profiles_skipped_busy"] += 1
             continue

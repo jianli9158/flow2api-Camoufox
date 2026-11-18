@@ -16,10 +16,9 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
   - **Gemini 兼容**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`（及 `/models/...` 路径），支持 `generationConfig.imageConfig` 动态分辨率与比例解析。
   - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、参考生视频 / 首帧生视频、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
 - **多账号调度、防误封自愈与断开取消**：
-  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）与 `default` / `polling` 策略，并严格保证单账号 Profile 单槽位互斥（禁止同 Profile 双开 `.parentlock` 冲突）。
-  - 区分短暂 `401`/风控抖动与真实掉线：触发异步 `schedule_auth_recovery()` 二次复核与 10 秒被动 SSO 跳转等待，避免高并发下误封账号；后台错峰自动续期 Google/Flow Cookies 并同步更新 `at_expires`。
+  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）与 `default` / `polling` 策略，并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`）实现跨进程单账号 Profile 排他占用。
+  - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`，不重试不故障转移）、权限/等级不足（`403`，跳过 4K 放大重复重试）、限流/配额（`429`）与短暂 `401`/风控抖动（触发 `schedule_auth_recovery()`），杜绝虚假封禁与无意义重试；记录请求 `requested_model` 与上游 `observed_model` 归因并全程对敏感 Cookie/签名链接脱敏。
   - 支持客户端断开实时传播：自动中止后台任务并向页内 `StreamChat` 发送 `AbortController` 取消信号，日志状态统一收敛为 `499`。
-- **性能存储与安全加固**：SQLite 采用 4 连接只读池（`query_only = ON`）与启动维护整理（`PRAGMA optimize` / `wal_checkpoint`）；Camoufox 磁盘缓存限额 30 MiB 并禁用 Widevine；管理端内置登录 IP 滑动窗口限流（`429`）、过期会话清理及 Cookie 鉴权同源 CSRF 校验。
 - **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
 - **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
 
@@ -171,13 +170,16 @@ python main.py
 | | `POST /v1/flow/voices` | TTS 合成；支持 `response_format` 为 `json`、`wav` 或 `pcm`，及 `cache_audio` |
 | | `DELETE /v1/flow/voices/{voice_ref}` | 删除自定义语音 |
 | **角色管理** | `GET /v1/flow/characters` / `GET /v1/flow/characters/{character_id}` | 列出或查询角色设定 |
-| | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建、更新（名称/音色/设定/收藏）或删除角色 |
-| **参考/首帧生视频** | `POST /v1/flow/videos` | 关联 `character_refs`、`voice_refs` 与 `image_refs` 生成参考视频（`MZZa6b`）；当 `model_key` 含 `_i2v_` 且附带 `image_refs` 时自动路由首帧生视频（`eb1hJf`），支持同步轮询或异步返回 |
+| | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建（支持 `face_prompt` + `body_prompt` 两段式自动建图绑定）、更新或删除角色 |
+| **模型与视频链** | `GET /v1/flow/models` | 返回当前账号等级、积分与可用图像/视频模型矩阵 |
+| | `POST /v1/flow/videos` | 支持 `@角色名` / `@资产名` 自动解析与可选 SD 标签清理（`clean_prompt`），自动路由参考/首帧生视频 |
+| | `POST /v1/flow/videos/chain` | 顺序生成多段视频，通过 `ffmpeg`/`ffprobe` 提取尾帧串联下一段并无缝拼接（需本机安装 `ffmpeg`） |
 | **Creation Agent** | `POST /v1/flow/agent/chat` | 发起或继续 Agent 对话（`stream: true` 输出 SSE：`session` / `thinking` / `text` / `a2ui` / `media` / `permission` / `done` / `error`） |
 | | `POST /v1/flow/agent/sessions/{session_id}/approve` | 批准（`approved` / `approved_sticky`）或拒绝（`denied`）Agent 扣费/生成确认卡片 |
 | | `GET /v1/flow/agent/sessions` / `GET` / `PATCH` / `DELETE .../{session_id}` | 查询会话列表、读取历史轮次、重命名或删除会话 |
 | **偏好与设置** | `GET` / `PATCH /v1/flow/user/preferences` | 读取或更新 Flow 用户全局偏好（自动清框、水印开关等） |
 | | `GET` / `PATCH /v1/flow/projects/{project_id}/settings` | 读取或更新项目面板与默认生图/生视频配置 |
+| **MCP Server** | `GET / POST /mcp` | 内置 Streamable HTTP MCP 服务端（`initialize` / `tools/list` / `tools/call`），带令牌桶消费保护防 Agent 循环刷量 |
 
 ### 控制台与监控端点
 

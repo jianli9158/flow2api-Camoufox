@@ -552,6 +552,11 @@ class Config:
             0, int(value)
         )
 
+    @property
+    def flow_clean_prompt(self) -> bool:
+        """是否自动清理 Stable Diffusion 遗留冗余标签（如 8k、masterpiece）。"""
+        return bool(self._config.get("flow", {}).get("clean_prompt", False))
+
 
 # Global config instance
 config = Config()

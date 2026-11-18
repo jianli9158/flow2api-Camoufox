@@ -9,7 +9,7 @@ from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Dict, Any, Optional
 from .config import config
-
+from .redaction import redact_headers, redact_sensitive_text, redact_structure
 
 class DebugLogger:
     """Debug logger for API requests and responses"""
@@ -153,7 +153,9 @@ class DebugLogger:
             if (
                 len(data) > max_length and self._is_base64_data_uri(data)
             ) or len(data) > string_limit:
-                return f"{data[:preview_len]}... (truncated, total {len(data)} chars)"
+                preview = redact_sensitive_text(data[:preview_len])
+                return f"{preview}... (truncated, total {len(data)} chars)"
+            return redact_sensitive_text(data, redact_signed_urls=False)
         return data
 
     def log_request(
@@ -177,32 +179,19 @@ class DebugLogger:
 
             # Basic info
             self.logger.info(f"Method: {method}")
-            self.logger.info(f"URL: {url}")
+            self.logger.info(f"URL: {redact_sensitive_text(url)}")
 
             # Headers
             self.logger.info("\n📋 Headers:")
-            masked_headers = dict(headers)
-            if "Authorization" in masked_headers or "authorization" in masked_headers:
-                auth_key = (
-                    "Authorization"
-                    if "Authorization" in masked_headers
-                    else "authorization"
-                )
-                auth_value = masked_headers[auth_key]
+            masked_headers = redact_headers(headers)
+            if "Authorization" in masked_headers and isinstance(headers.get("Authorization"), str):
+                auth_value = headers["Authorization"]
                 if auth_value.startswith("Bearer "):
-                    token = auth_value[7:]
-                    masked_headers[auth_key] = f"Bearer {self._mask_token(token)}"
-
-            # Mask Cookie header (ST token)
-            if "Cookie" in masked_headers:
-                cookie_value = masked_headers["Cookie"]
-                if "__Secure-next-auth.session-token=" in cookie_value:
-                    parts = cookie_value.split("=", 1)
-                    if len(parts) == 2:
-                        st_token = parts[1].split(";")[0]
-                        masked_headers["Cookie"] = (
-                            f"__Secure-next-auth.session-token={self._mask_token(st_token)}"
-                        )
+                    masked_headers["Authorization"] = f"Bearer {self._mask_token(auth_value[7:])}"
+            elif "authorization" in masked_headers and isinstance(headers.get("authorization"), str):
+                auth_value = headers["authorization"]
+                if auth_value.startswith("Bearer "):
+                    masked_headers["authorization"] = f"Bearer {self._mask_token(auth_value[7:])}"
 
             for key, value in masked_headers.items():
                 self.logger.info(f"  {key}: {value}")
@@ -211,14 +200,13 @@ class DebugLogger:
             if body is not None:
                 self.logger.info("\n📦 Request Body:")
                 if isinstance(body, (dict, list)):
-                    body_to_log = self._truncate_large_fields(body)
+                    body_to_log = redact_structure(self._truncate_large_fields(body))
                     body_str = json.dumps(body_to_log, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
                 elif isinstance(body, str) and len(body) > 2000:
-                    self.logger.info(f"{body[:2000]}... (truncated)")
+                    self.logger.info(f"{redact_sensitive_text(body[:2000])}... (truncated)")
                 else:
-                    self.logger.info(str(body))
-
+                    self.logger.info(redact_sensitive_text(str(body)))
             # Files
             if files:
                 self.logger.info("\n📎 Files:")
@@ -270,14 +258,14 @@ class DebugLogger:
 
             # Headers
             self.logger.info("\n📋 Response Headers:")
-            for key, value in headers.items():
+            for key, value in redact_headers(headers).items():
                 self.logger.info(f"  {key}: {value}")
 
             # Body
             self.logger.info("\n📦 Response Body:")
             if isinstance(body, (dict, list)):
                 # 对大字段进行截断处理
-                body_to_log = self._truncate_large_fields(body)
+                body_to_log = redact_structure(self._truncate_large_fields(body))
                 body_str = json.dumps(body_to_log, indent=2, ensure_ascii=False)
                 self.logger.info(body_str)
             elif isinstance(body, str):
@@ -285,17 +273,18 @@ class DebugLogger:
                 try:
                     parsed = json.loads(body)
                     # 对大字段进行截断处理
-                    parsed = self._truncate_large_fields(parsed)
+                    parsed = redact_structure(self._truncate_large_fields(parsed))
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
-                except:
+                except Exception:
                     # Not JSON, log as text (limit length)
-                    if len(body) > 2000:
-                        self.logger.info(f"{body[:2000]}... (truncated)")
+                    scrubbed_body = redact_sensitive_text(body)
+                    if len(scrubbed_body) > 2000:
+                        self.logger.info(f"{scrubbed_body[:2000]}... (truncated)")
                     else:
-                        self.logger.info(body)
+                        self.logger.info(scrubbed_body)
             else:
-                self.logger.info(str(body))
+                self.logger.info(redact_sensitive_text(str(body)))
 
             self._write_separator()
             self.logger.info("")  # Empty line
@@ -322,22 +311,22 @@ class DebugLogger:
             if status_code:
                 self.logger.info(f"Status Code: {status_code}")
 
-            self.logger.info(f"Error Message: {error_message}")
+            self.logger.info(f"Error Message: {redact_sensitive_text(error_message)}")
 
             if response_text:
                 self.logger.info("\n📦 Error Response:")
                 # Try to parse as JSON
                 try:
-                    parsed = json.loads(response_text)
+                    parsed = redact_structure(json.loads(response_text), redact_urls=True)
                     body_str = json.dumps(parsed, indent=2, ensure_ascii=False)
                     self.logger.info(body_str)
-                except:
+                except Exception:
                     # Not JSON, log as text
-                    if len(response_text) > 2000:
-                        self.logger.info(f"{response_text[:2000]}... (truncated)")
+                    scrubbed_resp = redact_sensitive_text(response_text)
+                    if len(scrubbed_resp) > 2000:
+                        self.logger.info(f"{scrubbed_resp[:2000]}... (truncated)")
                     else:
-                        self.logger.info(response_text)
-
+                        self.logger.info(scrubbed_resp)
             self._write_separator()
             self.logger.info("")  # Empty line
 
@@ -349,7 +338,7 @@ class DebugLogger:
         if not config.debug_enabled:
             return
         try:
-            self.logger.info(f"ℹ️  [{self._format_timestamp()}] {message}")
+            self.logger.info(f"ℹ️  [{self._format_timestamp()}] {redact_sensitive_text(message)}")
         except Exception as e:
             self.logger.error(f"Error logging info: {e}")
 
@@ -358,7 +347,7 @@ class DebugLogger:
         if not config.debug_enabled:
             return
         try:
-            self.logger.warning(f"⚠️  [{self._format_timestamp()}] {message}")
+            self.logger.warning(f"⚠️  [{self._format_timestamp()}] {redact_sensitive_text(message)}")
         except Exception as e:
             self.logger.error(f"Error logging warning: {e}")
 

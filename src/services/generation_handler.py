@@ -9,8 +9,11 @@ from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
+from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.monitoring import record_generation_result
 from ..core.models import Task, RequestLog
+from ..core.prompt_tools import jitter_sleep, strip_sd_banned_keywords
+from ..core.redaction import redact_sensitive_text
 from ..core.account_tiers import (
     PAYGATE_TIER_NOT_PAID,
     get_paygate_tier_label,
@@ -1017,18 +1020,17 @@ class GenerationHandler:
             if uuid_match
             else str(media_generation_id or media_lookup_id or "")
         )
-
         return {
             "media_name": media_name or media_generation_id,
             "video_url": video_url,
             "video_media_id": video_media_id,
             "aspect_ratio": video_info.get("aspectRatio", "VIDEO_ASPECT_RATIO_LANDSCAPE"),
             "model": video_info.get("model"),
+            "observed_model": video_info.get("observedModel") or video_info.get("model"),
             "duration": video_info.get("duration"),
             "metadata": metadata,
             "video_info": video_info,
         }
-
     def _normalize_error_message(self, error_message: Any, max_length: int = 1000) -> str:
         """归一化错误文本，避免写入超长内容。"""
         text = str(error_message or "").strip() or "未知错误"
@@ -1116,9 +1118,10 @@ class GenerationHandler:
 
         semaphore = asyncio.Semaphore(1)
 
-        async def _upload_single(image_bytes: bytes) -> str:
+        async def _upload_single(idx: int, image_bytes: bytes) -> str:
             async with semaphore:
-                await asyncio.sleep(0.6)
+                if idx > 0:
+                    await jitter_sleep(0.6, low_ratio=0.7, high_ratio=1.5)
                 return await self.flow_client.upload_image(
                     token.at,
                     image_bytes,
@@ -1129,9 +1132,8 @@ class GenerationHandler:
                 )
 
         return list(
-            await asyncio.gather(*(_upload_single(img) for img in images))
+            await asyncio.gather(*(_upload_single(i, img) for i, img in enumerate(images)))
         )
-
     async def handle_generation(
         self,
         model: str,
@@ -1191,6 +1193,13 @@ class GenerationHandler:
             if video_type_for_op == "extend"
             else f"generate_{generation_type}"
         )
+        if getattr(config, "flow_clean_prompt", False):
+            cleaned_prompt, removed_terms = strip_sd_banned_keywords(prompt)
+            if removed_terms:
+                debug_logger.log_info(
+                    f"[GENERATION] 已清理提示词冗余标签: removed={removed_terms}"
+                )
+                prompt = cleaned_prompt
         prompt_for_log = (
             prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
         )
@@ -1494,26 +1503,32 @@ class GenerationHandler:
                     raise
             # 6. 记录使用
             if not generation_result.get("success"):
-                error_msg = generation_result.get("error_message") or "生成未成功完成"
+                error_msg = redact_sensitive_text(
+                    generation_result.get("error_message") or "生成未成功完成"
+                )
+                classified_err = classify_flow_error(error_msg)
                 debug_logger.log_warning(
                     f"[GENERATION] 生成未成功，不扣次数: {error_msg}"
                 )
-                if token:
+                if token and self._should_count_token_error(RuntimeError(error_msg)):
                     await self.token_manager.record_error(token.id)
                 duration = time.time() - start_time
                 record_generation_result(generation_type, "failed", duration)
                 perf_trace["status"] = "failed"
                 perf_trace["total_ms"] = int(duration * 1000)
                 perf_trace["error"] = error_msg
-                prompt_for_log = (
-                    prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-                )
+                perf_trace["error_category"] = classified_err.category.value
                 await self._log_request(
                     token.id if token else None,
                     request_operation,
                     request_payload,
-                    {"error": error_msg, "performance": perf_trace},
-                    500,
+                    {
+                        "error": error_msg,
+                        "error_category": classified_err.category.value,
+                        "remediation_hint": classified_err.remediation_hint,
+                        "performance": perf_trace,
+                    },
+                    classified_err.http_status,
                     duration,
                     log_id=request_log_state.get("id"),
                     status_text="failed",
@@ -1522,9 +1537,10 @@ class GenerationHandler:
                 if not generation_result.get("error_emitted"):
                     if stream:
                         yield self._create_stream_chunk(f"错误: {error_msg}\n")
-                    yield self._create_error_response(error_msg, status_code=500)
+                    yield self._create_error_response(
+                        error_msg, status_code=classified_err.http_status
+                    )
                 return
-
             is_video = generation_type == "video"
             await self.token_manager.record_usage(token.id, is_video=is_video)
 
@@ -1613,18 +1629,18 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
-            error_msg = f"生成失败: {str(e).strip() or type(e).__name__}"
+            classified_err = classify_flow_error(e)
+            error_msg = redact_sensitive_text(
+                f"生成失败: {str(e).strip() or type(e).__name__}"
+            )
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
-                err_lower = error_msg.lower()
-                is_auth_suspect = any(
-                    m in error_msg or m in err_lower
-                    for m in ("登录态已失效", "登录已失效", "code=401", "unauthenticated", "认证失败")
-                )
-                if is_auth_suspect:
+                if classified_err.category == FlowErrorCategory.AUTH_EXPIRED:
                     if hasattr(self.load_balancer, "mark_token_cooldown"):
                         self.load_balancer.mark_token_cooldown(
-                            token.id, seconds=120.0, reason=error_msg[:120]
+                            token.id,
+                            seconds=classified_err.cooldown_seconds or 120.0,
+                            reason=error_msg[:120],
                         )
                     if hasattr(self.token_manager, "schedule_auth_recovery"):
                         self.token_manager.schedule_auth_recovery(token.id)
@@ -1633,16 +1649,15 @@ class GenerationHandler:
                 else:
                     if (
                         hasattr(self.load_balancer, "mark_token_cooldown")
-                        and any(
-                            m in err_lower
-                            for m in ("public_error_unusual_activity", "too much traffic", "429", "too many requests")
-                        )
+                        and classified_err.cooldown_seconds > 0
                     ):
                         self.load_balancer.mark_token_cooldown(
-                            token.id, seconds=180.0, reason=error_msg[:120]
+                            token.id,
+                            seconds=classified_err.cooldown_seconds,
+                            reason=error_msg[:120],
                         )
                     debug_logger.log_info(
-                        f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, reason={str(e)[:200]}"
+                        f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, category={classified_err.category.value}, reason={error_msg[:200]}"
                     )
 
             # 先将最终失败状态落库，再返回错误响应，避免日志停在 102。
@@ -1651,12 +1666,18 @@ class GenerationHandler:
             perf_trace["status"] = "failed"
             perf_trace["total_ms"] = int(duration * 1000)
             perf_trace["error"] = error_msg
+            perf_trace["error_category"] = classified_err.category.value
             await self._log_request(
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
                 request_payload if "request_payload" in locals() else {"model": model},
-                {"error": error_msg, "performance": perf_trace},
-                500,
+                {
+                    "error": error_msg,
+                    "error_category": classified_err.category.value,
+                    "remediation_hint": classified_err.remediation_hint,
+                    "performance": perf_trace,
+                },
+                classified_err.http_status,
                 duration,
                 log_id=request_log_state.get("id"),
                 status_text="failed",
@@ -1664,7 +1685,9 @@ class GenerationHandler:
             )
             if stream:
                 yield self._create_stream_chunk(f"错误: {error_msg}\n")
-            yield self._create_error_response(error_msg, status_code=500)
+            yield self._create_error_response(
+                error_msg, status_code=classified_err.http_status
+            )
         finally:
             if pending_token_state.get("active") and token and self.load_balancer:
                 await self.load_balancer.release_pending(
@@ -1682,47 +1705,18 @@ class GenerationHandler:
             return "没有可用的Token进行视频生成。所有Token都处于禁用、冷却、配额耗尽或已过期状态。"
 
     def _should_count_token_error(self, error: Exception) -> bool:
-        """判断失败是否应计入 token 连续错误。
-
-        reCAPTCHA 获取失败、验证码供应商错误、打码资源不足等问题通常不是账号本身异常；
-        若将其纳入连续错误，会在回归测试或代理波动时把 token 自动打成 inactive。
-        """
+        """判断失败是否应计入 token 连续错误（内容安全、权限、验证码波动与限流均不计入）。"""
         error_text = str(error or "").strip().lower()
         if not error_text:
             return True
-
-        non_token_fault_markers = (
-            "failed to obtain recaptcha token",
-            "recaptcha evaluation failed",
-            "recaptcha 验证失败",
-            "recaptcha 错误",
-            "public_error_unusual_activity",
-            "too much traffic",
-            "model_access_denied",
-            "public_error_unsafe_generation",
-            "public_error_prominent_people_filter_failed",
-            "首尾帧模型需要",
-            "最多支持",
-            "当前提供了",
-            "browser captcha queue wait timeout",
-            "客户端连接已断开",
-            "登录态已失效",
-            "登录已失效",
-            "code=401",
-            "认证失败",
-        )
-        if any(marker in error_text for marker in non_token_fault_markers):
-            return False
-
         if "没有可用的token进行" in error_text:
             return False
-
-        return True
+        return classify_flow_error(error).counts_toward_ban
 
     def _should_failover_token(
         self, error: Exception, generation_result: Optional[Dict[str, Any]] = None
     ) -> bool:
-        """Only fail over to another account on clean pre-submission rejections."""
+        """Only fail over to another account on clean pre-submission account/rate rejections."""
         if isinstance(generation_result, dict) and (
             generation_result.get("submitted") or generation_result.get("error_emitted")
         ):
@@ -1731,23 +1725,10 @@ class GenerationHandler:
             error, "outcome_unknown", False
         ):
             return False
-        error_text = str(error or "").strip().lower()
+        error_text = str(error or "").strip()
         if not error_text:
             return False
-        return any(
-            marker in error_text
-            for marker in (
-                "public_error_unusual_activity",
-                "too much traffic",
-                "登录态已失效",
-                "登录已失效",
-                "code=401",
-                "认证失败",
-                "failed to obtain recaptcha token",
-                "429",
-                "too many requests",
-            )
-        )
+        return classify_flow_error(error).failover_other_token
 
     async def _handle_image_generation(
         self,
@@ -1901,11 +1882,18 @@ class GenerationHandler:
 
             image_url = media[0]["image"]["generatedImage"]["fifeUrl"]
             media_id = media[0].get("name")  # 用于 upsample
+            observed_model = media[0].get("observedModel") or result.get("observedModel")
+            requested_model = model_config.get("model_name")
+            if observed_model and requested_model and observed_model != requested_model:
+                debug_logger.log_warning(
+                    f"[IMAGE] 模型归因不一致: requested={requested_model}, observed={observed_model}"
+                )
             response_state["generated_assets"] = {
                 "type": "image",
                 "origin_image_url": image_url,
+                "requested_model": requested_model,
+                "observed_model": observed_model or requested_model,
             }
-
             # 检查是否需要 upsample
             upsample_resolution = model_config.get("upsample")
             if upsample_resolution and media_id:
@@ -1949,12 +1937,13 @@ class GenerationHandler:
                                 )
 
                             # 2K/4K 图片统一落盘为真实文件，日志里只保留链接。
-                            response_state["generated_assets"] = {
-                                "type": "image",
-                                "origin_image_url": image_url,
-                                "upscaled_image": {"resolution": resolution_name},
-                            }
-
+                            response_state.setdefault("generated_assets", {}).update(
+                                {
+                                    "type": "image",
+                                    "origin_image_url": image_url,
+                                    "upscaled_image": {"resolution": resolution_name},
+                                }
+                            )
                             if str(encoded_image).startswith("https://"):
                                 response_state["url"] = encoded_image
                                 response_state["generated_assets"]["upscaled_image"][
@@ -2067,20 +2056,29 @@ class GenerationHandler:
                             break  # 空结果不重试
 
                     except Exception as e:
-                        error_str = str(e)
-                        debug_logger.log_error(
-                            f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}): {error_str}"
+                        error_str = redact_sensitive_text(str(e))
+                        classified_upsample = classify_flow_error(
+                            e,
+                            target_resolution=upsample_resolution,
+                            operation="upsample",
                         )
-                        
-                        # 检查是否是可重试错误（403、reCAPTCHA、超时等）
+                        debug_logger.log_error(
+                            f"[UPSAMPLE] 放大失败 (尝试 {retry_attempt + 1}/{max_retries}, category={classified_upsample.category.value}): {error_str}"
+                        )
+                        if not classified_upsample.retryable_same_token:
+                            if stream:
+                                yield self._create_stream_chunk(
+                                    f"⚠️ 放大受限 ({classified_upsample.remediation_hint})，返回原图...\n"
+                                )
+                            break
+
                         retry_reason = self.flow_client._get_retry_reason(error_str)
                         if retry_reason and retry_attempt < max_retries - 1:
                             if stream:
                                 yield self._create_stream_chunk(
                                     f"⚠️ 放大遇到{retry_reason}，正在重试 ({retry_attempt + 2}/{max_retries})...\n"
                                 )
-                            # 等待一小段时间后重试
-                            await asyncio.sleep(1)
+                            await jitter_sleep(1.0, low_ratio=0.75, high_ratio=1.35)
                             continue
                         else:
                             if stream:
@@ -2146,6 +2144,8 @@ class GenerationHandler:
                 "type": "image",
                 "origin_image_url": image_url,
                 "final_image_url": local_url,
+                "requested_model": requested_model,
+                "observed_model": observed_model or requested_model,
             }
             # 保留放大失败回退标记（如有），便于调用方感知实际交付分辨率
             upscaled_marker = (response_state.get("generated_assets") or {}).get(
@@ -2919,6 +2919,16 @@ class GenerationHandler:
                     )
 
                     # 存储URL用于日志记录
+                    requested_video_model = model_config.get("model_key")
+                    observed_video_model = resolved_video.get("observed_model") or requested_video_model
+                    if (
+                        observed_video_model
+                        and requested_video_model
+                        and observed_video_model != requested_video_model
+                    ):
+                        debug_logger.log_warning(
+                            f"[VIDEO] 模型归因提示: requested={requested_video_model}, observed={observed_video_model}"
+                        )
                     response_state["url"] = local_url
                     response_state["generated_assets"] = {
                         "type": "video",
@@ -2927,9 +2937,15 @@ class GenerationHandler:
                         "mediaName": media_name,
                         "aspectRatio": aspect_ratio,
                         "model": resolved_video.get("model"),
+                        "requested_model": requested_video_model,
+                        "observed_model": observed_video_model,
                         "duration": resolved_video.get("duration"),
                     }
-
+                    if model_config.get("video_type") == "extend":
+                        response_state["generated_assets"]["extend_clip_metadata"] = {
+                            "nominal_seconds": 8.0,
+                            "effective_tail_trim_hint_seconds": 7.0,
+                        }
                     # 返回结果
                     self._mark_generation_succeeded(generation_result)
 

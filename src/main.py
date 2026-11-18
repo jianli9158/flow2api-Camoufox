@@ -23,8 +23,7 @@ from .services.load_balancer import LoadBalancer
 from .services.concurrency_manager import ConcurrencyManager
 from .services.generation_handler import GenerationHandler
 from .services.flow_features import FlowFeatureService
-from .api import routes, admin, flow_routes
-
+from .api import routes, admin, flow_routes, mcp_routes
 
 _LOCAL_NO_PROXY_HOSTS = ("127.0.0.1", "localhost", "::1")
 
@@ -246,7 +245,7 @@ flow_feature_service = FlowFeatureService(
 routes.set_generation_handler(generation_handler)
 admin.set_dependencies(token_manager, proxy_manager, db, concurrency_manager)
 flow_routes.set_flow_feature_service(flow_feature_service)
-# Create FastAPI app
+mcp_routes.set_mcp_dependencies(flow_feature_service, generation_handler)
 app = FastAPI(
     title="Flow2API",
     description="OpenAI-compatible API for Google VideoFX (Veo)",
@@ -268,7 +267,7 @@ app.add_middleware(I18nMiddleware)
 app.include_router(routes.router)
 app.include_router(admin.router)
 app.include_router(flow_routes.router)
-
+app.include_router(mcp_routes.router)
 # Static files - serve tmp directory for cached files
 tmp_dir = Path(__file__).parent.parent / "tmp"
 tmp_dir.mkdir(exist_ok=True)
