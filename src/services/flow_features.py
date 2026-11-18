@@ -1399,7 +1399,8 @@ class FlowFeatureService:
             if mid:
                 media_ids.append(mid)
         has_refs = bool(media_ids or character_refs or voice_refs)
-        mode = "references" if has_refs else "text"
+        is_start_i2v = "_i2v_" in str(model_key or "") and bool(media_ids)
+        mode = "start" if is_start_i2v else ("references" if has_refs else "text")
 
         async def _op(token: Token, resolved_project_id: str) -> Dict[str, Any]:
             submission = await self.flow_client._current_generate_video(
@@ -1408,7 +1409,8 @@ class FlowFeatureService:
                 model_key=model_key,
                 aspect_ratio=aspect_ratio,
                 mode=mode,
-                reference_media_ids=media_ids or None,
+                reference_media_ids=None if is_start_i2v else (media_ids or None),
+                start_media_id=media_ids[0] if is_start_i2v else None,
                 reference_entity_ids=character_refs or None,
                 reference_audio_ids=voice_refs or None,
                 resolution=resolution,

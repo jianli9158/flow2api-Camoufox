@@ -1114,10 +1114,11 @@ class GenerationHandler:
             )
             return [media_id]
 
-        semaphore = asyncio.Semaphore(3)
+        semaphore = asyncio.Semaphore(1)
 
         async def _upload_single(image_bytes: bytes) -> str:
             async with semaphore:
+                await asyncio.sleep(0.6)
                 return await self.flow_client.upload_image(
                     token.at,
                     image_bytes,

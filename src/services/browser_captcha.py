@@ -700,6 +700,8 @@ class BrowserCaptchaService:
                     selected_slot = unleased_idle_slot
                 else:
                     selected_slot = leased_idle_slot
+
+                if selected_slot is not None:
                     self._round_robin_index = (selected_slot + 1) % self._browser_count
                     self._reserve_slot_locked(selected_slot)
                     self._admitted_requests += 1
