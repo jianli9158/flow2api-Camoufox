@@ -858,7 +858,12 @@ class CamoufoxWorker:
                     except Exception:
                         pass
                 if signature_refreshed:
+                    self._cached_wiz = {"bl": "", "fSid": "", "at": ""}
                     if browser_cookies:
+                        try:
+                            await self._bidi.command("storage.deleteCookies", {})
+                        except Exception:
+                            pass
                         await self._install_cookies_via_bidi(browser_cookies)
                 elif not has_native_session_cookies:
                     ss_cookies_loaded = False
@@ -1281,13 +1286,30 @@ class CamoufoxWorker:
                 )
                 if isinstance(page_check, dict):
                     href_now = str(page_check.get("href") or "")
+                    # If Flow automatically bounced to accounts.google.com SSO, wait for redirect chain to settle
+                    if "accounts.google.com" in href_now:
+                        for _ in range(18):
+                            await asyncio.sleep(0.5)
+                            page_check = await self._bidi.evaluate(
+                                context_id,
+                                """({
+                                    href: String(location.href || ''),
+                                    hasSNlM0e: Boolean(window.WIZ_global_data && window.WIZ_global_data.SNlM0e),
+                                    hasEmail: Boolean(window.WIZ_global_data && window.WIZ_global_data.oPEP7c),
+                                    hasLoginInput: Boolean(document.querySelector('input[type="email"], input[type="password"]'))
+                                })""",
+                                await_promise=False,
+                            )
+                            href_now = str((page_check or {}).get("href") or "")
+                            if "accounts.google.com" not in href_now or (page_check or {}).get("hasLoginInput"):
+                                break
                     is_unauthed_flow = (
                         "accounts.google.com" in href_now
                         or href_now.rstrip("/").endswith("/about")
                         or (
                             href_now.startswith(f"{FLOW_ORIGIN}/")
-                            and not page_check.get("hasSNlM0e")
-                            and not page_check.get("hasEmail")
+                            and not (page_check or {}).get("hasSNlM0e")
+                            and not (page_check or {}).get("hasEmail")
                             and "/about" in href_now
                         )
                     )
@@ -1304,21 +1326,29 @@ class CamoufoxWorker:
                                 {
                                     "context": context_id,
                                     "url": passive_url,
-                                    "wait": "interactive",
+                                    "wait": "complete",
                                 },
-                                timeout=20.0,
+                                timeout=25.0,
                             )
-                            await asyncio.sleep(1.8)
-                            page_check = await self._bidi.evaluate(
-                                context_id,
-                                """({
-                                    href: String(location.href || ''),
-                                    hasSNlM0e: Boolean(window.WIZ_global_data && window.WIZ_global_data.SNlM0e),
-                                    hasEmail: Boolean(window.WIZ_global_data && window.WIZ_global_data.oPEP7c)
-                                })""",
-                                await_promise=False,
-                            )
-                            href_now = str((page_check or {}).get("href") or "")
+                            for _ in range(20):
+                                await asyncio.sleep(0.5)
+                                page_check = await self._bidi.evaluate(
+                                    context_id,
+                                    """({
+                                        href: String(location.href || ''),
+                                        hasSNlM0e: Boolean(window.WIZ_global_data && window.WIZ_global_data.SNlM0e),
+                                        hasEmail: Boolean(window.WIZ_global_data && window.WIZ_global_data.oPEP7c),
+                                        hasLoginInput: Boolean(document.querySelector('input[type="email"], input[type="password"]'))
+                                    })""",
+                                    await_promise=False,
+                                )
+                                href_now = str((page_check or {}).get("href") or "")
+                                if href_now.startswith(f"{FLOW_ORIGIN}/") and (
+                                    (page_check or {}).get("hasSNlM0e") or (page_check or {}).get("hasEmail")
+                                ):
+                                    break
+                                if "accounts.google.com" in href_now and (page_check or {}).get("hasLoginInput"):
+                                    break
                             is_unauthed_flow = (
                                 "accounts.google.com" in href_now
                                 or href_now.rstrip("/").endswith("/about")
@@ -1335,7 +1365,6 @@ class CamoufoxWorker:
                         raise RuntimeError(
                             "Flow 账号登录态已失效（页面已跳转至未登录页），请在后台点击该账号的「重登」重新登录"
                         )
-            except RuntimeError:
                 raise
             except Exception:
                 pass
@@ -1635,6 +1664,12 @@ class CamoufoxWorker:
                         if (window.WIZ_global_data) window.WIZ_global_data.SNlM0e = refreshedAt;
                         at = refreshedAt;
                         result = await postOnce(refreshedAt);
+                    } else if (result.status === 401 || /UNAUTHENTICATED|,\s*16\s*\]/.test(result.text || '')) {
+                        await fetchBootstrap('/projects');
+                        if (at) {
+                            if (window.WIZ_global_data) window.WIZ_global_data.SNlM0e = at;
+                            result = await postOnce(at);
+                        }
                     }
                     return result;
                 }
@@ -3068,30 +3103,44 @@ class CamoufoxWorker:
                     )
                     current_url = str((page_meta or {}).get("url") or "")
                     email = str((page_meta or {}).get("email") or "")
-                    if not email and "accounts.google.com" not in current_url:
-                        passive_url = (
-                            "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
-                            f"&continue={quote(FLOW_PROJECTS_URL, safe='')}"
-                            f"&followup={quote(FLOW_PROJECTS_URL, safe='')}"
-                        )
-                        try:
-                            await bidi.command(
-                                "browsingContext.navigate",
-                                {
-                                    "context": context_id,
-                                    "url": passive_url,
-                                    "wait": "complete",
-                                },
-                                timeout=25.0,
+                    if not email:
+                        if "accounts.google.com" not in current_url:
+                            passive_url = (
+                                "https://accounts.google.com/ServiceLogin?passive=1209600&osid=1"
+                                f"&continue={quote(FLOW_PROJECTS_URL, safe='')}"
+                                f"&followup={quote(FLOW_PROJECTS_URL, safe='')}"
                             )
-                            await asyncio.sleep(0.8)
-                            page_meta = await bidi.evaluate(
-                                context_id, eval_meta_js, await_promise=False
-                            )
-                            current_url = str((page_meta or {}).get("url") or "")
-                            email = str((page_meta or {}).get("email") or "")
-                        except Exception:
-                            pass
+                            try:
+                                await bidi.command(
+                                    "browsingContext.navigate",
+                                    {
+                                        "context": context_id,
+                                        "url": passive_url,
+                                        "wait": "complete",
+                                    },
+                                    timeout=25.0,
+                                )
+                            except Exception:
+                                pass
+                        for _ in range(20):
+                            await asyncio.sleep(0.5)
+                            try:
+                                page_meta = await bidi.evaluate(
+                                    context_id, eval_meta_js, await_promise=False
+                                )
+                                current_url = str((page_meta or {}).get("url") or "")
+                                email = str((page_meta or {}).get("email") or "")
+                                if urlparse(current_url).hostname == "flow.google.com" and email:
+                                    break
+                                has_input = await bidi.evaluate(
+                                    context_id,
+                                    "Boolean(document.querySelector('input[type=\"email\"], input[type=\"password\"]'))",
+                                    await_promise=False,
+                                )
+                                if "accounts.google.com" in current_url and has_input:
+                                    break
+                            except Exception:
+                                pass
                     if urlparse(current_url).hostname != "flow.google.com":
                         raise RuntimeError(
                             "Flow 登录已失效，请重新同步 Google Cookies"

@@ -1457,13 +1457,15 @@ class GenerationHandler:
                         and self._should_failover_token(e, generation_result)
                     ):
                         err_msg = str(e or "")
-                        if "登录态已失效" in err_msg or "登录已失效" in err_msg:
-                            await self.token_manager.record_error(token.id)
-                            await self.token_manager.disable_token(token.id)
-                        elif hasattr(self.load_balancer, "mark_token_cooldown"):
+                        if hasattr(self.load_balancer, "mark_token_cooldown"):
                             self.load_balancer.mark_token_cooldown(
                                 token.id, seconds=180.0, reason=err_msg[:120]
                             )
+                        if any(
+                            m in err_msg
+                            for m in ("登录态已失效", "登录已失效", "code=401", "认证失败")
+                        ) and hasattr(self.token_manager, "schedule_auth_recovery"):
+                            self.token_manager.schedule_auth_recovery(token.id)
                         if pending_token_state.get("active") and self.load_balancer:
                             await self.load_balancer.release_pending(
                                 token.id,
@@ -1613,16 +1615,25 @@ class GenerationHandler:
             error_msg = f"生成失败: {str(e).strip() or type(e).__name__}"
             debug_logger.log_error(f"[GENERATION] 生成失败: {error_msg}")
             if token:
-                if "登录态已失效" in error_msg or "登录已失效" in error_msg:
-                    await self.token_manager.record_error(token.id)
-                    await self.token_manager.disable_token(token.id)
+                err_lower = error_msg.lower()
+                is_auth_suspect = any(
+                    m in error_msg or m in err_lower
+                    for m in ("登录态已失效", "登录已失效", "code=401", "unauthenticated", "认证失败")
+                )
+                if is_auth_suspect:
+                    if hasattr(self.load_balancer, "mark_token_cooldown"):
+                        self.load_balancer.mark_token_cooldown(
+                            token.id, seconds=120.0, reason=error_msg[:120]
+                        )
+                    if hasattr(self.token_manager, "schedule_auth_recovery"):
+                        self.token_manager.schedule_auth_recovery(token.id)
                 elif self._should_count_token_error(e):
                     await self.token_manager.record_error(token.id)
                 else:
                     if (
                         hasattr(self.load_balancer, "mark_token_cooldown")
                         and any(
-                            m in error_msg.lower()
+                            m in err_lower
                             for m in ("public_error_unusual_activity", "too much traffic", "429", "too many requests")
                         )
                     ):
@@ -1686,6 +1697,18 @@ class GenerationHandler:
             "recaptcha 错误",
             "public_error_unusual_activity",
             "too much traffic",
+            "model_access_denied",
+            "public_error_unsafe_generation",
+            "public_error_prominent_people_filter_failed",
+            "首尾帧模型需要",
+            "最多支持",
+            "当前提供了",
+            "browser captcha queue wait timeout",
+            "客户端连接已断开",
+            "登录态已失效",
+            "登录已失效",
+            "code=401",
+            "认证失败",
         )
         if any(marker in error_text for marker in non_token_fault_markers):
             return False
@@ -1717,6 +1740,9 @@ class GenerationHandler:
                 "too much traffic",
                 "登录态已失效",
                 "登录已失效",
+                "code=401",
+                "认证失败",
+                "failed to obtain recaptcha token",
                 "429",
                 "too many requests",
             )

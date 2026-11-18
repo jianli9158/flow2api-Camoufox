@@ -1214,15 +1214,8 @@ class TokenManager:
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 协议刷新失败 - {exc}")
             return None
 
-    async def _try_refresh_st(
-        self,
-        token_id: int,
-        token: Token,
-        *,
-        prefer_http_when_cold: bool = False,
-    ) -> Optional[str]:
-        """Refresh full current-Flow Cookies, avoiding unnecessary Camoufox slot evictions."""
-        camoufox_svc = None
+    async def _try_refresh_st(self, token_id: int, token: Token) -> Optional[str]:
+        """Refresh full current-Flow Cookies via Camoufox when active, or protocol+browser fallback otherwise."""
         use_camoufox = False
         try:
             from .browser_captcha import BrowserCaptchaService as _CamoufoxCaptchaService
@@ -1235,40 +1228,19 @@ class TokenManager:
                 .lower()
                 == "camoufox"
             )
-            if use_camoufox:
-                camoufox_svc = _CamoufoxCaptchaService._instance
         except Exception:
             use_camoufox = False
 
         if use_camoufox:
-            warm_idle_hit = False
-            if prefer_http_when_cold and camoufox_svc is not None:
-                get_warm = getattr(camoufox_svc, "get_warm_bound_token_ids", None)
-                if callable(get_warm):
-                    try:
-                        warm_ids = get_warm(idle_only=True)
-                        if isinstance(warm_ids, set):
-                            warm_idle_hit = int(token_id) in warm_ids
-                    except Exception:
-                        warm_idle_hit = False
-
-            # Cold/busy background refreshes try fast curl_cffi HTTP first so 9+ accounts
-            # never thrash 3 warm Camoufox browser slots every 30 minutes.
-            if prefer_http_when_cold and not warm_idle_hit:
-                refreshed = await self._try_protocol_refresh_st(token_id, token)
-                if refreshed:
-                    return refreshed
-                latest = await self.db.get_token(token_id)
-                if not latest or latest.google_cookies != token.google_cookies:
-                    return None
-
+            # Never mix curl_cffi ProtocolLogin with Camoufox profiles: curl_cffi rotates
+            # __Secure-1PSIDTS/SIDCC in a separate TLS session and breaks in-page maseQ/StreamChat!
             try:
                 service = await _CamoufoxCaptchaService.get_instance(self.db)
                 result = await asyncio.wait_for(
                     service.refresh_google_cookies(
                         token.current_project_id, token_id=token_id
                     ),
-                    timeout=45.0,
+                    timeout=55.0,
                 )
                 return await self._save_refreshed_cookies(token_id, token, result)
             except Exception as exc:
@@ -1277,16 +1249,7 @@ class TokenManager:
                 debug_logger.log_warning(
                     f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}"
                 )
-                if (
-                    not (prefer_http_when_cold and not warm_idle_hit)
-                    and "登录已失效" not in error
-                    and "登录态已失效" not in error
-                ):
-                    refreshed = await self._try_protocol_refresh_st(token_id, token)
-                    if refreshed:
-                        return refreshed
                 return None
-
         refreshed = await self._try_protocol_refresh_st(token_id, token)
         if refreshed:
             return refreshed
@@ -1335,6 +1298,32 @@ class TokenManager:
                 self._clear_at_validation_cache(token_id)
             return False
 
+    def schedule_auth_recovery(self, token_id: int) -> None:
+        """Verify an account asynchronously via refresh_cookies before ever disabling it."""
+        if not hasattr(self, "_auth_recovery_tasks"):
+            self._auth_recovery_tasks: Dict[int, asyncio.Task] = {}
+        tid = int(token_id)
+        existing = self._auth_recovery_tasks.get(tid)
+        if existing and not existing.done():
+            return
+
+        async def _run_recovery() -> None:
+            try:
+                ok = await self.refresh_cookies(tid)
+                if ok:
+                    await self.db.reset_error_count(tid)
+                    debug_logger.log_info(
+                        f"[AUTH_RECOVERY] Token {tid}: 登录态自愈校验成功，保持启用状态"
+                    )
+            except Exception as exc:
+                debug_logger.log_warning(
+                    f"[AUTH_RECOVERY] Token {tid}: 登录态自愈校验异常 - {exc}"
+                )
+            finally:
+                self._auth_recovery_tasks.pop(tid, None)
+
+        self._auth_recovery_tasks[tid] = asyncio.create_task(_run_recovery())
+
     async def _refresh_protocol_token(self, token: Token, now: datetime) -> None:
         token_id = int(token.id)
         refresh_lock = await self._get_token_lock(
@@ -1347,7 +1336,7 @@ class TokenManager:
             if not (latest.google_cookies or "").strip():
                 return
             # Cookie and AT metadata are committed together after current RPC validation.
-            if not await self._try_refresh_st(token_id, latest, prefer_http_when_cold=True):
+            if not await self._try_refresh_st(token_id, latest):
                 refreshed_snapshot = await self.db.get_token(token_id)
                 if refreshed_snapshot and (
                     "登录已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
@@ -1368,38 +1357,78 @@ class TokenManager:
             return
         tokens = await self.db.get_active_tokens()
         now = datetime.now(timezone.utc)
-        for token in tokens:
-            try:
-                if not token.auto_refresh_enabled:
-                    continue
-                if not (token.google_cookies or "").strip():
-                    continue
 
-                interval_minutes = (
-                    token.refresh_interval_minutes
-                    or refresh_config.refresh_interval_minutes
-                    or 30
-                )
-                interval_minutes = self._normalize_refresh_interval(interval_minutes)
-                last_result = str(token.last_st_refresh_result or "").strip().lower()
-                effective_interval = (
-                    min(interval_minutes, 5)
-                    if last_result not in {"", "success"}
-                    else interval_minutes
-                )
-                last_refresh = self._as_utc(token.last_st_refresh_at)
-                at_expires_utc = self._as_utc(token.at_expires)
-                is_display_expired = (
-                    at_expires_utc is not None
-                    and at_expires_utc <= now
-                    and last_result in {"", "success"}
-                )
-                if (
-                    not is_display_expired
-                    and last_refresh
-                    and now - last_refresh < timedelta(minutes=effective_interval)
-                ):
-                    continue
+        camoufox_svc = None
+        warm_idle_ids: set[int] = set()
+        try:
+            from .browser_captcha import BrowserCaptchaService as _CamoufoxCaptchaService
+            if (
+                _CamoufoxCaptchaService._instance is not None
+                and str(getattr(config, "captcha_method", "") or "").strip().lower()
+                in {"browser", "camoufox"}
+                and str(getattr(config, "browser_captcha_engine", "camoufox") or "camoufox")
+                .strip()
+                .lower()
+                == "camoufox"
+            ):
+                camoufox_svc = _CamoufoxCaptchaService._instance
+                get_warm = getattr(camoufox_svc, "get_warm_bound_token_ids", None)
+                if callable(get_warm):
+                    res_ids = get_warm(idle_only=True)
+                    if isinstance(res_ids, set):
+                        warm_idle_ids = res_ids
+        except Exception:
+            camoufox_svc = None
+
+        due_tokens: List[Token] = []
+        for token in tokens:
+            if not token.auto_refresh_enabled:
+                continue
+            if not (token.google_cookies or "").strip():
+                continue
+
+            interval_minutes = (
+                token.refresh_interval_minutes
+                or refresh_config.refresh_interval_minutes
+                or 30
+            )
+            interval_minutes = self._normalize_refresh_interval(interval_minutes)
+            last_result = str(token.last_st_refresh_result or "").strip().lower()
+            effective_interval = (
+                min(interval_minutes, 5)
+                if last_result not in {"", "success"}
+                else interval_minutes
+            )
+            last_refresh = self._as_utc(token.last_st_refresh_at)
+            at_expires_utc = self._as_utc(token.at_expires)
+            is_display_expired = (
+                at_expires_utc is not None
+                and at_expires_utc <= now
+                and last_result in {"", "success"}
+            )
+            if (
+                not is_display_expired
+                and last_refresh
+                and now - last_refresh < timedelta(minutes=effective_interval)
+            ):
+                continue
+            due_tokens.append(token)
+
+        # Refresh warm-idle slots first (zero cold restart); stagger cold slots (max 1 per tick when idle)
+        due_tokens.sort(key=lambda t: (0 if int(t.id) in warm_idle_ids else 1, int(t.id)))
+        cold_refreshed_count = 0
+        for token in due_tokens:
+            try:
+                is_warm_idle = int(token.id) in warm_idle_ids
+                if camoufox_svc is not None and not is_warm_idle:
+                    has_idle_fn = getattr(camoufox_svc, "has_any_idle_slot", None)
+                    if callable(has_idle_fn) and isinstance(has_idle_fn(), bool) and not has_idle_fn():
+                        # All browser slots are busy serving live generations; defer cold refresh to next tick
+                        continue
+                    if cold_refreshed_count >= 1:
+                        # Stagger cold refreshes (1 per minute) to preserve warm browser pool
+                        continue
+                    cold_refreshed_count += 1
 
                 await self._refresh_protocol_token(token, now)
             except Exception as e:

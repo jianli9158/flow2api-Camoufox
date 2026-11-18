@@ -371,6 +371,15 @@ class BrowserCaptchaService:
             if self._slot_bound_token_id(slot_id) is None:
                 return True
         return False
+
+    def has_any_idle_slot(self) -> bool:
+        """Return True if at least one slot is currently idle (not executing BiDi ops or recovering)."""
+        if self._closed:
+            return False
+        for slot_id in range(self._browser_count):
+            if not self._is_slot_busy_for_allocation(slot_id):
+                return True
+        return False
     def _reserve_slot_locked(self, slot_id: int):
         self._slot_reservations[slot_id] = self._slot_reservations.get(slot_id, 0) + 1
 
@@ -619,6 +628,7 @@ class BrowserCaptchaService:
                         else:
                             state.phase = "probe"
                 matching_idle_slot: Optional[int] = None
+                matching_busy_slot: Optional[int] = None
                 unbound_warm_idle_slot: Optional[int] = None
                 cold_idle_slot: Optional[int] = None
                 unleased_idle_slot: Optional[int] = None
@@ -626,23 +636,22 @@ class BrowserCaptchaService:
 
                 for offset in range(self._browser_count):
                     slot_id = (self._round_robin_index + offset) % self._browser_count
+                    bound_token_id = self._slot_bound_token_id(slot_id)
+                    is_bound_to_expected = expected_token_id is not None and (
+                        bound_token_id == expected_token_id
+                        or any(
+                            r.slot_id == slot_id
+                            and CamoufoxWorker._normalize_token_key(r.token_id)
+                            == expected_token_id
+                            for r in self._requests.values()
+                        )
+                    )
                     if self._is_slot_busy_for_allocation(slot_id):
+                        if is_bound_to_expected and matching_busy_slot is None:
+                            matching_busy_slot = slot_id
                         continue
 
-                    bound_token_id = self._slot_bound_token_id(slot_id)
-                    if (
-                        expected_token_id is not None
-                        and bound_token_id == expected_token_id
-                    ):
-                        matching_idle_slot = slot_id
-                        break
-                    if expected_token_id is not None and any(
-                        r.slot_id == slot_id
-                        and r.hold
-                        and CamoufoxWorker._normalize_token_key(r.token_id)
-                        == expected_token_id
-                        for r in self._requests.values()
-                    ):
+                    if is_bound_to_expected:
                         matching_idle_slot = slot_id
                         break
 
@@ -677,8 +686,12 @@ class BrowserCaptchaService:
                         if unbound_warm_idle_slot is None:
                             unbound_warm_idle_slot = slot_id
 
+                # NEVER launch a second Camoufox process on an account's Firefox profile
+                # while another slot already holds that account's profile open!
                 if matching_idle_slot is not None:
                     selected_slot = matching_idle_slot
+                elif matching_busy_slot is not None:
+                    selected_slot = None
                 elif unbound_warm_idle_slot is not None:
                     selected_slot = unbound_warm_idle_slot
                 elif cold_idle_slot is not None:
@@ -687,7 +700,6 @@ class BrowserCaptchaService:
                     selected_slot = unleased_idle_slot
                 else:
                     selected_slot = leased_idle_slot
-                if selected_slot is not None:
                     self._round_robin_index = (selected_slot + 1) % self._browser_count
                     self._reserve_slot_locked(selected_slot)
                     self._admitted_requests += 1
@@ -802,10 +814,19 @@ class BrowserCaptchaService:
             raise ValueError("Cookie 刷新必须指定 Token ID")
         token_proxy_url = await self._resolve_token_proxy_url(token_id)
         async with self._borrow_browser(project_id, token_id) as request:
-            return await request.browser.refresh_google_cookies(
-                token_id=token_id, token_proxy_url=token_proxy_url
-            )
-
+            try:
+                return await request.browser.refresh_google_cookies(
+                    token_id=token_id, token_proxy_url=token_proxy_url
+                )
+            except Exception as exc:
+                if "登录已失效" in str(exc) or "登录态已失效" in str(exc):
+                    try:
+                        await request.browser.recycle_browser(
+                            reason="login_expired", rotate_profile=False
+                        )
+                    except Exception:
+                        pass
+                raise
     async def get_custom_token(
         self,
         website_url: str,

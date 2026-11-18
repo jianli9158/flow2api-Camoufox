@@ -421,24 +421,43 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(clean_logout.status_code, 200)
         admin_api._login_failure_tracker.clear()
 
-    async def test_background_cookie_refresher_tiered_cold_warm_and_expiry_sync(self):
+    async def test_background_cookie_refresher_staggered_camoufox_and_anti_instaban(self):
         from datetime import datetime, timedelta, timezone
         import inspect
         import src.main as main_mod
+        from src.services.browser_captcha import BrowserCaptchaQueueTimeout
         from src.services.token_manager import TokenManager
 
-        # Ensure lifespan starts and stops protocol refresher
+        # 1. Ensure lifespan starts and stops protocol refresher
         lifespan_src = inspect.getsource(main_mod.lifespan)
         self.assertIn("token_manager.start_protocol_refresher()", lifespan_src)
         self.assertIn("token_manager.stop_protocol_refresher()", lifespan_src)
 
+        # 2. Verify BrowserCaptchaService NEVER launches a 2nd slot on an account's busy profile
+        svc = BrowserCaptchaService(db=None)
+        svc._browser_count = 2
+        svc._browsers = {
+            0: types.SimpleNamespace(
+                has_shared_browser=lambda: True,
+                is_busy=lambda: True,  # Slot 0 is currently busy with token 3
+                _shared_bound_token_id=3,
+            ),
+            1: types.SimpleNamespace(
+                has_shared_browser=lambda: True,
+                is_busy=lambda: False,  # Slot 1 is idle (bound to token 4)
+                _shared_bound_token_id=4,
+            ),
+        }
+        with self.assertRaises(BrowserCaptchaQueueTimeout):
+            await svc._select_browser_id("proj-3", token_id=3, timeout_seconds=0.05)
+
+        # 3. Verify Camoufox refresher never calls curl_cffi protocol_loginer and staggers cold tokens (max 1/tick)
         raw_cookies = json.dumps(
             [
                 {"name": "OSID", "value": "osid-1", "domain": "flow.google.com", "hostOnly": True, "path": "/", "secure": True, "httpOnly": True},
                 {"name": "SID", "value": "sid-1", "domain": ".google.com", "path": "/", "secure": True},
             ]
         )
-        rotated_http = raw_cookies.replace("osid-1", "osid-http")
         rotated_browser = raw_cookies.replace("osid-1", "osid-browser")
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -459,16 +478,29 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
                         last_st_refresh_result="success",
                     )
                 )
-                cold_tid = await db.add_token(
+                cold1_tid = await db.add_token(
                     Token(
-                        st="frontend-cold",
+                        st="frontend-cold1",
                         at="flow-frontend-cookie",
                         at_expires=now - timedelta(minutes=10),
-                        email="cold@example.com",
-                        login_account="cold@example.com",
+                        email="cold1@example.com",
+                        login_account="cold1@example.com",
                         google_cookies=raw_cookies,
                         refresh_interval_minutes=90,
                         last_st_refresh_at=now - timedelta(minutes=5),
+                        last_st_refresh_result="success",
+                    )
+                )
+                cold2_tid = await db.add_token(
+                    Token(
+                        st="frontend-cold2",
+                        at="flow-frontend-cookie",
+                        at_expires=now - timedelta(minutes=10),
+                        email="cold2@example.com",
+                        login_account="cold2@example.com",
+                        google_cookies=raw_cookies,
+                        refresh_interval_minutes=90,
+                        last_st_refresh_at=now - timedelta(minutes=95),
                         last_st_refresh_result="success",
                     )
                 )
@@ -487,11 +519,14 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
                 )
                 manager = TokenManager(db, flow)
 
+                async def fake_camoufox_refresh(_pid, *, token_id):
+                    tok = await db.get_token(token_id)
+                    return {"google_cookies": rotated_browser, "email": tok.email}
+
                 fake_camoufox = MagicMock()
                 fake_camoufox.get_warm_bound_token_ids = lambda idle_only=False: {warm_tid}
-                fake_camoufox.refresh_google_cookies = AsyncMock(
-                    return_value={"google_cookies": rotated_browser, "email": "warm@example.com"}
-                )
+                fake_camoufox.has_any_idle_slot = lambda: True
+                fake_camoufox.refresh_google_cookies = AsyncMock(side_effect=fake_camoufox_refresh)
 
                 with (
                     patch("src.services.token_manager.config") as mock_cfg,
@@ -499,39 +534,34 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
                     patch.object(BrowserCaptchaService, "get_instance", AsyncMock(return_value=fake_camoufox)),
                     patch(
                         "src.services.protocol_login.protocol_loginer.login",
-                        AsyncMock(
-                            return_value={
-                                "success": True,
-                                "google_cookies": rotated_http,
-                                "email": "cold@example.com",
-                            }
-                        ),
-                    ) as mock_http_login,
+                        AsyncMock(side_effect=AssertionError("Must never mix curl_cffi ProtocolLogin with Camoufox")),
+                    ),
                 ):
                     mock_cfg.captcha_method = "camoufox"
                     mock_cfg.browser_captcha_engine = "camoufox"
                     await manager.run_protocol_refresh_once()
 
-                # Warm-idle token refreshed via Camoufox; cold display-expired token refreshed via HTTP without touching Camoufox
-                fake_camoufox.refresh_google_cookies.assert_awaited_once_with(None, token_id=warm_tid)
-                mock_http_login.assert_awaited_once()
+                # Warm-idle token + at most 1 cold token refreshed in tick 1; cold2 deferred to next tick
+                refreshed_tids = [c.kwargs["token_id"] for c in fake_camoufox.refresh_google_cookies.call_args_list]
+                self.assertEqual(refreshed_tids, [warm_tid, cold1_tid])
 
                 warm_after = await db.get_token(warm_tid)
-                cold_after = await db.get_token(cold_tid)
+                cold2_after = await db.get_token(cold2_tid)
                 self.assertEqual(warm_after.google_cookies, rotated_browser)
-                self.assertEqual(cold_after.google_cookies, rotated_http)
-                # Expiry horizon extends beyond 90-minute interval (>= 100 min from now)
+                self.assertEqual(cold2_after.google_cookies, raw_cookies)
                 self.assertGreater(
                     (warm_after.at_expires.replace(tzinfo=timezone.utc) if warm_after.at_expires.tzinfo is None else warm_after.at_expires) - now,
                     timedelta(minutes=100),
                 )
-                self.assertGreater(
-                    (cold_after.at_expires.replace(tzinfo=timezone.utc) if cold_after.at_expires.tzinfo is None else cold_after.at_expires) - now,
-                    timedelta(minutes=100),
-                )
+
+                # 4. Verify _should_count_token_error never counts 401/auth jitter or client validation errors toward error_ban_threshold
+                gh = GenerationHandler.__new__(GenerationHandler)
+                self.assertFalse(gh._should_count_token_error(RuntimeError("首尾帧模型需要 1-2 张图片，当前提供了 0 张")))
+                self.assertFalse(gh._should_count_token_error(RuntimeError("Flow 登录认证失败 (rpc=maseQ, code=401)")))
+                self.assertFalse(gh._should_count_token_error(RuntimeError("Flow 账号登录态已失效")))
+                self.assertFalse(gh._should_count_token_error(RuntimeError("PUBLIC_ERROR_MODEL_ACCESS_DENIED")))
             finally:
                 await db.close()
-
 
 if __name__ == "__main__":
     unittest.main()
