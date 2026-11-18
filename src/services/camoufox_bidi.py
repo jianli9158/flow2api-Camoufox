@@ -614,7 +614,7 @@ class CamoufoxWorker:
         for cookie in cookies:
             name = str(cookie.get("name") or "").strip()
             value = str(cookie.get("value") or "")
-            if not name:
+            if not name or name == "_GRECAPTCHA":
                 continue
             domain = str(cookie.get("domain") or "").strip()
             url = str(cookie.get("url") or "").strip()
@@ -709,7 +709,7 @@ class CamoufoxWorker:
                 else str(val_obj or "")
             )
             name = str(item.get("name") or "").strip()
-            if not name:
+            if not name or name == "_GRECAPTCHA":
                 continue
             same_site_raw = str(item.get("sameSite") or "lax").strip().lower()
             same_site = (
