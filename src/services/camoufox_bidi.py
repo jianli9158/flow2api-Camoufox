@@ -143,6 +143,8 @@ class CamoufoxWorker:
         self._stdout_drain_task: Optional[asyncio.Task] = None
         self._bidi: Optional[BiDiClient] = None
         self._context_id: Optional[str] = None
+        self._captcha_context_id: Optional[str] = None
+        self._captcha_context_dirty: bool = False
         self._relay: Optional[LocalSocks5Relay] = None
         self._profile_dir: Optional[Path] = None
         self._account_dir: Optional[Path] = None
@@ -199,9 +201,93 @@ class CamoufoxWorker:
         return self._last_harvest_session_id
 
     def note_recaptcha_rejected(self) -> None:
-        """Mark resident projects as needing fresh human warmup on next retry without killing the browser."""
+        """Mark resident captcha tab & warmup dirty so next solve rebuilds a clean Captcha Tab without disturbing the API Tab."""
+        self._consecutive_risk_failures += 1
+        self._captcha_context_dirty = True
         self._warmed_projects.clear()
 
+    async def _clear_recaptcha_cookies(self) -> None:
+        """Clear poisoned _GRECAPTCHA cookies inside the browser without touching Google login cookies."""
+        if not self._bidi or self._bidi._closed:
+            return
+        try:
+            await self._bidi.command(
+                "storage.deleteCookies",
+                {"filter": {"name": "_GRECAPTCHA"}},
+                timeout=5.0,
+            )
+        except Exception:
+            pass
+
+    async def _ensure_captcha_context_id(
+        self,
+        *,
+        force_recreate: bool = False,
+        fallback_context_id: Optional[str] = None,
+    ) -> str:
+        """Return an isolated Captcha Tab context distinct from the resident API Tab (`self._context_id`)."""
+        if not self._bidi or getattr(self._bidi, "_closed", False):
+            fallback = fallback_context_id or self._context_id
+            if fallback:
+                return fallback
+            raise RuntimeError("Camoufox BiDi 未连接")
+        if force_recreate:
+            await self._clear_recaptcha_cookies()
+            self._warmed_projects.clear()
+        if force_recreate and self._captcha_context_id:
+            old_ctx = self._captcha_context_id
+            self._captcha_context_id = None
+            try:
+                await self._bidi.evaluate(
+                    old_ctx,
+                    '(() => { try { localStorage.removeItem("_grecaptcha"); } catch (e) {} return true; })()',
+                    await_promise=False,
+                    timeout=3.0,
+                )
+            except Exception:
+                pass
+            if old_ctx != self._context_id:
+                try:
+                    await self._bidi.command(
+                        "browsingContext.close",
+                        {"context": old_ctx},
+                        timeout=5.0,
+                    )
+                except Exception:
+                    pass
+        if self._captcha_context_id:
+            try:
+                alive = await self._bidi.evaluate(
+                    self._captcha_context_id,
+                    "1",
+                    await_promise=False,
+                    timeout=3.0,
+                )
+                if alive == 1:
+                    return self._captcha_context_id
+            except Exception:
+                self._captcha_context_id = None
+        try:
+            created = await self._bidi.command(
+                "browsingContext.create",
+                {"type": "tab"},
+                timeout=15.0,
+            )
+            new_ctx = str((created or {}).get("context") or "").strip() if isinstance(created, dict) else ""
+            if new_ctx:
+                self._captcha_context_id = new_ctx
+                debug_logger.log_info(
+                    f"[Camoufox] Slot-{self.token_id} 已创建独立打码 Tab (captcha_ctx={new_ctx[:12]}, api_ctx={str(self._context_id or '')[:12]})"
+                )
+                return new_ctx
+        except Exception as exc:
+            debug_logger.log_warning(
+                f"[Camoufox] Slot-{self.token_id} 创建独立打码 Tab 失败，回退默认 context: {exc}"
+            )
+        fallback = fallback_context_id or self._context_id
+        if not fallback:
+            raise RuntimeError("Camoufox BiDi context 不可用")
+        return fallback
     @staticmethod
     def _normalize_token_key(token_id: Optional[int]) -> Optional[int]:
         try:
@@ -472,6 +558,8 @@ class CamoufoxWorker:
             self._process = None
             self._bidi = None
             self._context_id = None
+            self._captcha_context_id = None
+            self._captcha_context_dirty = False
             self._relay = None
             self._profile_dir = None
             self._shared_browser_pid = None
@@ -971,6 +1059,10 @@ class CamoufoxWorker:
         self._stdout_drain_task = None
         self._bidi = None
         self._context_id = None
+        self._captcha_context_id = None
+        self._captcha_context_dirty = False
+        self._warmed_projects.clear()
+        self._cached_wiz = {}
         self._relay = None
         self._profile_dir = None
         self._account_dir = None
@@ -993,7 +1085,9 @@ class CamoufoxWorker:
                 )
             except Exception:
                 pass
-            await bidi.close()
+            close_fn = getattr(bidi, "close", None)
+            if callable(close_fn):
+                await close_fn()
 
         if proc is not None:
             if proc.returncode is None:
@@ -1131,13 +1225,15 @@ class CamoufoxWorker:
                 break
 
     async def _perform_human_warmup(
-        self, context_id: str, project_id: Optional[str]
+        self, context_id: str, project_id: Optional[str], action: str = ""
     ) -> None:
         """Simulate realistic multi-point Bézier mouse trajectories, wheel scroll, and focus inside the Flow page so reCAPTCHA Enterprise scores >= 0.7-0.9."""
         if not self._bidi:
             return
         project_key = str(project_id or "__projects__").strip() or "__projects__"
-        first_warmup = project_key not in self._warmed_projects
+        action_key = str(action or "").strip().upper()
+        warmup_key = f"{project_key}:{action_key}" if action_key else project_key
+        first_warmup = warmup_key not in self._warmed_projects
         rounds = 2 if first_warmup else 1
         for r in range(rounds):
             x0, y0 = random.randint(240, 480), random.randint(220, 420)
@@ -1199,8 +1295,10 @@ class CamoufoxWorker:
                 await self._send_trusted_gesture(context_id)
             if first_warmup:
                 await asyncio.sleep(1.1 if r == 0 else 0.9)
+            else:
+                await asyncio.sleep(0.25)
         if first_warmup:
-            self._warmed_projects.add(project_key)
+            self._warmed_projects.add(warmup_key)
 
     async def _ensure_flow_page_ready(
         self,
@@ -1365,9 +1463,9 @@ class CamoufoxWorker:
                         raise RuntimeError(
                             "Flow 账号登录态已失效（页面已跳转至未登录页），请在后台点击该账号的「重登」重新登录"
                         )
-                raise
-            except Exception:
-                pass
+            except Exception as unauth_exc:
+                if "登录态已失效" in str(unauth_exc):
+                    raise
 
             await self._dismiss_flow_overlays(context_id)
             try:
@@ -1484,10 +1582,19 @@ class CamoufoxWorker:
                 for attempt in range(max_retries):
                     try:
                         start_ts = time.time()
-                        _, bidi, context_id = await self._get_or_create_shared_browser(
+                        _, bidi, _api_ctx = await self._get_or_create_shared_browser(
                             token_proxy_url=token_proxy_url, token_id=token_id
                         )
-                        used_force_reload = bool(attempt > 0 or self._consecutive_risk_failures > 0)
+                        should_recreate_captcha_tab = bool(
+                            attempt > 0
+                            or self._consecutive_risk_failures > 0
+                            or self._captcha_context_dirty
+                        )
+                        context_id = await self._ensure_captcha_context_id(
+                            force_recreate=should_recreate_captcha_tab,
+                            fallback_context_id=_api_ctx,
+                        )
+                        used_force_reload = bool(should_recreate_captcha_tab)
                         ready = await self._ensure_flow_page_ready(
                             context_id,
                             project_id,
@@ -1498,7 +1605,9 @@ class CamoufoxWorker:
                             raise RuntimeError("Camoufox 页面 grecaptcha.enterprise 未就绪")
 
                         async with self._boost_frames():
-                            await self._perform_human_warmup(context_id, project_id)
+                            await self._perform_human_warmup(
+                                context_id, project_id, action=action
+                            )
                             script = build_recaptcha_execute_script(
                                 website_key or FLOW_WEBSITE_KEY,
                                 str(action or "IMAGE_GENERATION").strip().upper(),
@@ -1517,6 +1626,7 @@ class CamoufoxWorker:
                             if token:
                                 self._solve_count += 1
                                 self._consecutive_browser_failures = 0
+                                self._captcha_context_dirty = False
                                 if used_force_reload:
                                     self._consecutive_risk_failures = 0
                                 session_id = (
@@ -3196,7 +3306,8 @@ class CamoufoxWorker:
             self._solve_inflight += 1
             try:
                 started_at = time.time()
-                _, bidi, context_id = await self._get_or_create_shared_browser()
+                _, bidi, _api_ctx = await self._get_or_create_shared_browser()
+                context_id = await self._ensure_captcha_context_id()
                 async with self._boost_frames():
                     await bidi.command(
                         "browsingContext.navigate",

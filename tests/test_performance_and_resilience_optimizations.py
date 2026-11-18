@@ -563,5 +563,120 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await db.close()
 
+    async def test_dual_tab_captcha_api_isolation_and_risk_reset_retry(self):
+        from src.services.camoufox_bidi import CamoufoxWorker
+        from src.services.flow_client import FlowClient
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = CamoufoxWorker(1, tmp_dir, db=None)
+            worker._process = types.SimpleNamespace(returncode=None)
+            worker._context_id = "api-tab-1"
+            worker._cached_wiz = {"bl": "bl-1", "fSid": "fsid-1", "at": "at-1"}
+            worker._shared_bound_token_id = 5
+            created_counter = 0
+            commands = []
+            evaluated_contexts = []
+
+            class FakeBidi:
+                _closed = False
+
+                async def command(self, method, params=None, timeout=None):
+                    nonlocal created_counter
+                    commands.append((method, params))
+                    if method == "browsingContext.create":
+                        created_counter += 1
+                        return {"context": f"captcha-tab-{created_counter}"}
+                    return {}
+
+                async def evaluate(self, ctx, expr, await_promise=False, user_activation=False, timeout=None):
+                    evaluated_contexts.append((ctx, expr[:40]))
+                    if expr.strip() == "1":
+                        return 1
+                    if user_activation and "grecaptcha" in expr:
+                        return {"ok": True, "token": "tok-fresh"}
+                    if "grecaptcha" in expr:
+                        return True
+                    if "location.href" in expr:
+                        return "https://flow.google.com/project/p1"
+                    return "complete"
+
+                async def call_function(self, ctx, fn_decl, arguments=None, await_promise=True, user_activation=True, timeout=None):
+                    evaluated_contexts.append((ctx, "call_function"))
+                    return {"ok": True, "status": 200, "text": ")]}'\n\n10\n[[\"wrb.fr\"]]", "bl": "bl-1", "fSid": "fsid-1", "at": "at-1"}
+
+            worker._bidi = FakeBidi()
+            worker._get_or_create_shared_browser = AsyncMock(return_value=(worker._process, worker._bidi, "api-tab-1"))
+            worker._ensure_flow_page_ready = AsyncMock(return_value=True)
+            worker._perform_human_warmup = AsyncMock()
+            worker._sync_live_cookies_to_db = AsyncMock()
+
+            # 1. Captcha solve uses separate captcha-tab-1, leaving api-tab-1 untouched
+            tok1, _ = await worker.get_token("p1", action="UPLOAD_IMAGE", token_id=5)
+            self.assertEqual(tok1, "tok-fresh")
+            self.assertEqual(worker._captcha_context_id, "captcha-tab-1")
+            self.assertEqual(worker._context_id, "api-tab-1")
+
+            # 2. Frontend RPC executes inside api-tab-1 (NOT captcha-tab-1)
+            rpc_res = await worker.execute_flow_frontend_rpc(rpc_id="maseQ", argument=[], project_id="p1", token_id=5)
+            self.assertEqual(rpc_res["status"], 200)
+            self.assertEqual(evaluated_contexts[-1][0], "api-tab-1")
+
+            # 3. Risk rejection marks captcha tab dirty, clears _GRECAPTCHA cookies & recreates captcha-tab-2, preserving api-tab-1 and _cached_wiz
+            worker.note_recaptcha_rejected()
+            self.assertTrue(worker._captcha_context_dirty)
+            tok2, _ = await worker.get_token("p1", action="VIDEO_GENERATION", token_id=5)
+            self.assertEqual(tok2, "tok-fresh")
+            self.assertEqual(worker._captcha_context_id, "captcha-tab-2")
+            self.assertEqual(worker._context_id, "api-tab-1")
+            self.assertEqual(worker._cached_wiz["at"], "at-1")
+            self.assertIn(("storage.deleteCookies", {"filter": {"name": "_GRECAPTCHA"}}), commands)
+            self.assertIn(("browsingContext.close", {"context": "captcha-tab-1"}), commands)
+
+            # 4. BrowserCaptchaService flags HTTP 200 batchexecute PUBLIC_ERROR_UNUSUAL_ACTIVITY as recaptcha rejection
+            svc = BrowserCaptchaService(db=None)
+            svc._browser_count = 1
+            svc._browsers = {0: worker}
+            self.assertTrue(svc._is_recaptcha_rejection('Flow frontend RPC rejected: rpc=MZZa6b, error=PUBLIC_ERROR_UNUSUAL_ACTIVITY'))
+            svc._select_browser_id = AsyncMock(return_value=0)
+            svc._get_or_create_browser = AsyncMock(return_value=worker)
+            worker.execute_flow_frontend_rpc = AsyncMock(
+                return_value={"status": 200, "text": '[["er","MZZa6b",null,null,null,null,null,["PUBLIC_ERROR_UNUSUAL_ACTIVITY"]]]'}
+            )
+            svc.report_error = AsyncMock()
+            await svc.execute_flow_frontend_rpc(rpc_id="MZZa6b", argument=[], project_id="p1", token_id=5)
+            svc.report_error.assert_awaited_once()
+
+            # 5. jwpduf is HTTP-first control plane RPC, and _current_generate_video retries once after PUBLIC_ERROR_UNUSUAL_ACTIVITY
+            client = FlowClient(None)
+            self.assertIn("jwpduf", client.HTTP_FIRST_CONTROL_PLANE_RPCS)
+            client._frontend_cookie = AsyncMock(return_value="SID=s")
+            client._get_recaptcha_token = AsyncMock(side_effect=[("tok-bad", "0:lease-1/"), ("tok-good", "0:lease-2/")])
+            client._notify_browser_captcha_error = AsyncMock()
+            client._notify_browser_captcha_request_finished = AsyncMock()
+            op_uuid = "11111111-1111-1111-1111-111111111111"
+            proj_uuid = "22222222-2222-2222-2222-222222222222"
+            media_uuid = "33333333-3333-3333-3333-333333333333"
+            client._current_rpc = AsyncMock(
+                side_effect=[
+                    RuntimeError("Flow frontend RPC rejected: rpc=MZZa6b, error=PUBLIC_ERROR_UNUSUAL_ACTIVITY"),
+                    [[[op_uuid, proj_uuid, media_uuid]]],
+                ]
+            )
+            with patch("src.services.flow_current.asyncio.sleep", AsyncMock()):
+                out = await client._current_generate_video(
+                    project_id=proj_uuid,
+                    prompt="hello",
+                    model_key="macaron_cookie_r2v_4s",
+                    aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+                    mode="references",
+                    reference_media_ids=["img-1"],
+                    token_id=5,
+                    token_video_concurrency=None,
+                    google_cookies="SID=s",
+                )
+            self.assertEqual(client._current_rpc.await_count, 2)
+            client._notify_browser_captcha_error.assert_awaited_once()
+            self.assertEqual(out["operations"][0]["name"], op_uuid)
+
 if __name__ == "__main__":
     unittest.main()

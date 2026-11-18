@@ -81,6 +81,7 @@ class CurrentFlowClientMixin:
     HTTP_FIRST_CONTROL_PLANE_RPCS = frozenset(
         {
             "Zzl0ze",  # GetProject (voices, characters, settings, workflows)
+            "jwpduf",  # CheckVideoStatus polling
             "as29s",   # GetMedia / GetMediaUrlRedirect
             "nzlxg",   # GetCredits
             "wDg3C",   # GetEntities
@@ -812,13 +813,14 @@ class CurrentFlowClientMixin:
         # same duration/mode without the suffix before repeating the same request.
         if "_relaxed" in model_keys[0]:
             model_keys.append(model_keys[0].replace("_relaxed", ""))
-        attempt_budget = max(max_retries, len(model_keys))
+        attempt_budget = max(max_retries, len(model_keys), 2)
         fallback_model_key: Optional[str] = None
         last_error: Optional[Exception] = None
+        risk_retries = 0
         for retry_attempt in range(attempt_budget):
             browser_id = None
-            submission_accepted = False
             request_model_key = fallback_model_key or model_keys[0]
+            submission_accepted = False
             try:
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -871,13 +873,33 @@ class CurrentFlowClientMixin:
                     or bool(getattr(error, "submission_uncertain", False))
                 ):
                     raise
-                # 账号权限/风控/内容安全/登录失效等错误不重复提交同一账号
                 error_text = str(error).lower()
+                is_risk = "public_error_unusual_activity" in error_text
+                if is_risk:
+                    notify_err = getattr(self, "_notify_browser_captcha_error", None)
+                    if callable(notify_err):
+                        try:
+                            await notify_err(
+                                browser_id=getattr(error, "browser_ref", None) or browser_id,
+                                project_id=project_id,
+                                error_reason="reCAPTCHA verification failed: PUBLIC_ERROR_UNUSUAL_ACTIVITY",
+                                error_message=str(error),
+                            )
+                        except Exception:
+                            pass
+                    if risk_retries < 1 and retry_attempt < attempt_budget - 1:
+                        risk_retries += 1
+                        debug_logger.log_warning(
+                            f"[VIDEO] RPC ({rpc_id}) 遇到 PUBLIC_ERROR_UNUSUAL_ACTIVITY，重置独立打码 Tab 后重试一次"
+                        )
+                        await asyncio.sleep(1.5)
+                        continue
+                    raise
+                # 账号权限/内容安全/登录失效等错误不重复提交同一账号
                 if any(
                     marker in error_text
                     for marker in (
                         "model_access_denied",
-                        "public_error_unusual_activity",
                         "public_error_unsafe_generation",
                         "public_error_prominent_people_filter_failed",
                         "too much traffic",

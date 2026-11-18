@@ -887,6 +887,8 @@ class BrowserCaptchaService:
     @staticmethod
     def _is_recaptcha_rejection(error_text: str) -> bool:
         normalized = str(error_text or "").lower()
+        if "public_error_unusual_activity" in normalized:
+            return True
         return "recaptcha" in normalized and any(
             marker in normalized
             for marker in (
@@ -1007,10 +1009,12 @@ class BrowserCaptchaService:
                 raise error from exc
             request.generation = getattr(request.browser, "_runtime_generation", 0)
             request.fingerprint = deepcopy(request.browser.get_last_fingerprint())
-            if isinstance(response, dict) and int(response.get("status") or 0) >= 400:
+            resp_status = int(response.get("status") or 0) if isinstance(response, dict) else 0
+            resp_text = str(response.get("text") or "") if isinstance(response, dict) else ""
+            if resp_status >= 400 or self._is_recaptcha_rejection(resp_text):
                 request.failed = True
                 await self.report_error(
-                    request.ref, error_reason=response.get("text") or ""
+                    request.ref, error_reason=resp_text
                 )
             return response
 

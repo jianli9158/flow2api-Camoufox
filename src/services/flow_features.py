@@ -1390,12 +1390,6 @@ class FlowFeatureService:
         email: Optional[str] = None,
         token_id: Optional[int] = None,
     ) -> Dict[str, Any]:
-        token, resolved_project_id = await self.resolve_account_context(
-            email=email,
-            token_id=token_id,
-            project_id=project_id,
-            require_project=True,
-        )
         media_ids: List[str] = []
         for iref in image_refs or []:
             if isinstance(iref, dict):
@@ -1406,65 +1400,76 @@ class FlowFeatureService:
                 media_ids.append(mid)
         has_refs = bool(media_ids or character_refs or voice_refs)
         mode = "references" if has_refs else "text"
-        submission = await self.flow_client._current_generate_video(
-            project_id=resolved_project_id,
-            prompt=prompt,
-            model_key=model_key,
-            aspect_ratio=aspect_ratio,
-            mode=mode,
-            reference_media_ids=media_ids or None,
-            reference_entity_ids=character_refs or None,
-            reference_audio_ids=voice_refs or None,
-            resolution=resolution,
-            token_id=token.id,
-            token_video_concurrency=None,
-            google_cookies=token.google_cookies,
-        )
-        ops = submission.get("operations") or []
-        if not wait or not ops:
-            submission["projectId"] = resolved_project_id
-            submission["tokenId"] = token.id
-            submission["email"] = token.email
-            return submission
-        deadline = asyncio.get_event_loop().time() + max(timeout, 30)
-        last_status = submission
-        while asyncio.get_event_loop().time() < deadline:
-            await asyncio.sleep(poll_interval)
-            last_status = await self.flow_client.check_video_status(
-                at=token.at or "",
-                operations=ops,
+
+        async def _op(token: Token, resolved_project_id: str) -> Dict[str, Any]:
+            submission = await self.flow_client._current_generate_video(
+                project_id=resolved_project_id,
+                prompt=prompt,
+                model_key=model_key,
+                aspect_ratio=aspect_ratio,
+                mode=mode,
+                reference_media_ids=media_ids or None,
+                reference_entity_ids=character_refs or None,
+                reference_audio_ids=voice_refs or None,
+                resolution=resolution,
                 token_id=token.id,
+                token_video_concurrency=None,
                 google_cookies=token.google_cookies,
             )
-            checked_ops = last_status.get("operations") or []
-            if checked_ops:
-                first_op = checked_ops[0]
-                status = str(first_op.get("status") or "")
-                meta_video = ((first_op.get("operation") or {}).get("metadata") or {}).get("video") or {}
-                fife_url = meta_video.get("fifeUrl")
-                if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and fife_url:
-                    self.remember_asset_owner(
-                        (first_op.get("operation") or {}).get("name")
-                        or meta_video.get("mediaGenerationId"),
-                        token.id,
-                        resolved_project_id,
-                    )
-                    return {
-                        "status": status,
-                        "videoUrl": fife_url,
-                        "mediaId": (first_op.get("operation") or {}).get("name") or meta_video.get("mediaGenerationId"),
-                        "projectId": resolved_project_id,
-                        "tokenId": token.id,
-                        "email": token.email,
-                        "operations": checked_ops,
-                    }
-                if "FAILED" in status:
-                    raise RuntimeError(f"Flow video generation failed: {first_op}")
-        return {
-            "status": "TIMEOUT",
-            "projectId": resolved_project_id,
-            "tokenId": token.id,
-            "email": token.email,
-            "lastStatus": last_status,
-        }
+            ops = submission.get("operations") or []
+            if not wait or not ops:
+                submission["projectId"] = resolved_project_id
+                submission["tokenId"] = token.id
+                submission["email"] = token.email
+                return submission
+            deadline = asyncio.get_event_loop().time() + max(timeout, 30)
+            last_status = submission
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(poll_interval)
+                last_status = await self.flow_client.check_video_status(
+                    at=token.at or "",
+                    operations=ops,
+                    token_id=token.id,
+                    google_cookies=token.google_cookies,
+                )
+                checked_ops = last_status.get("operations") or []
+                if checked_ops:
+                    first_op = checked_ops[0]
+                    status = str(first_op.get("status") or "")
+                    meta_video = ((first_op.get("operation") or {}).get("metadata") or {}).get("video") or {}
+                    fife_url = meta_video.get("fifeUrl")
+                    if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and fife_url:
+                        self.remember_asset_owner(
+                            (first_op.get("operation") or {}).get("name")
+                            or meta_video.get("mediaGenerationId"),
+                            token.id,
+                            resolved_project_id,
+                        )
+                        return {
+                            "status": status,
+                            "videoUrl": fife_url,
+                            "mediaId": (first_op.get("operation") or {}).get("name") or meta_video.get("mediaGenerationId"),
+                            "projectId": resolved_project_id,
+                            "tokenId": token.id,
+                            "email": token.email,
+                            "operations": checked_ops,
+                        }
+                    if "FAILED" in status:
+                        raise RuntimeError(f"Flow video generation failed: {first_op}")
+            return {
+                "status": "TIMEOUT",
+                "projectId": resolved_project_id,
+                "tokenId": token.id,
+                "email": token.email,
+                "lastStatus": last_status,
+            }
 
+        return await self._run_with_account_failover(
+            _op,
+            email=email,
+            token_id=token_id,
+            project_id=project_id,
+            require_project=True,
+            prefer_warm_browser=True,
+            max_attempts=1 if (has_refs and bool(str(project_id or "").strip())) else 2,
+        )
