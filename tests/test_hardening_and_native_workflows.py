@@ -473,6 +473,220 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(blocked.status_code, 429)
                 self.assertEqual(blocked.json()["error"]["code"], -32029)
 
+    async def test_p0_p1_caching_bucket_cooldown_tier_routing_billing_safety_and_capabilities(self):
+        import threading
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.api import admin as admin_api, flow_routes, mcp_routes
+        from src.core.browser_runtime_status import get_runtime_status
+        from src.core.database import Database
+        from src.core.flow_errors import (
+            FlowErrorCategory,
+            classify_flow_error,
+            extract_retry_after_seconds,
+            resolve_cooldown_bucket,
+        )
+        from src.core.models import Token
+        from src.services.camoufox_profile import acquire_profile_lease
+        from src.services.flow_client import FlowClient
+        from src.services.load_balancer import LoadBalancer
+        from src.services.proxy_manager import ProxyManager
+
+        # 1. _normalize_runtime_method & browser_runtime_status accept "camoufox"
+        self.assertEqual(admin_api._normalize_runtime_method("camoufox"), "browser")
+        self.assertEqual(admin_api._normalize_runtime_method("unknown"), "browser")
+        self.assertIn("state", get_runtime_status("camoufox"))
+
+        # 2. Database write-through cache for active tokens & proxy config + ProxyManager single read
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / "cache_test.db"))
+            await db.init_db()
+            try:
+                tid = await db.add_token(
+                    Token(st="st1", email="cache@test.com", is_active=True)
+                )
+                first = await db.get_active_tokens()
+                self.assertEqual([t.id for t in first], [tid])
+                # Second call hits cache even if underlying DB connection would fail
+                with patch.object(db, "_connect", side_effect=AssertionError("should hit cache")):
+                    second = await db.get_active_tokens()
+                self.assertEqual([t.id for t in second], [tid])
+                # Mutation invalidates immediately
+                await db.update_token(tid, is_active=False)
+                third = await db.get_active_tokens()
+                self.assertEqual(third, [])
+
+                pm = ProxyManager(db)
+                await pm.update_proxy_config(True, "http://127.0.0.1:7890")
+                self.assertEqual(await pm.get_media_proxy_url(), "http://127.0.0.1:7890")
+                with patch.object(db, "_connect", side_effect=AssertionError("proxy should hit cache")):
+                    self.assertEqual(await pm.get_media_proxy_url(), "http://127.0.0.1:7890")
+            finally:
+                await db.close()
+
+        # 3. Per-model-family cooldown & tier-aware routing in LoadBalancer
+        t_free = Token(
+            id=1, st="s1", at="a1", email="free@test.com",
+            user_paygate_tier="PAYGATE_TIER_NOT_PAID", is_active=True,
+        )
+        t_ultra = Token(
+            id=2, st="s2", at="a2", email="ultra@test.com",
+            user_paygate_tier="PAYGATE_TIER_TWO", is_active=True,
+        )
+        tm = MagicMock()
+        tm.get_active_tokens = AsyncMock(return_value=[t_ultra, t_free])
+        tm.ensure_valid_token = AsyncMock(side_effect=lambda t: t)
+        tm.needs_at_refresh = MagicMock(return_value=False)
+        lb = LoadBalancer(tm)
+        # Cheap model prefers Free over Ultra when both idle
+        picked_free = await lb.select_token(
+            for_image_generation=True,
+            model="gemini-3.1-flash-image-landscape",
+            prefer_warm_browser=False,
+        )
+        self.assertEqual(picked_free.id, 1)
+        # 4K model requires Ultra
+        picked_4k = await lb.select_token(
+            for_image_generation=True,
+            model="gemini-3.1-flash-image-landscape-4k",
+            prefer_warm_browser=False,
+        )
+        self.assertEqual(picked_4k.id, 2)
+        # Cooling Token 1 only on image:GEM_PIX_2 does NOT cool BELUGA or video
+        bucket = resolve_cooldown_bucket("gemini-3.0-pro-image-landscape", for_image=True)
+        self.assertEqual(bucket, "image:GEM_PIX_2")
+        lb.mark_token_cooldown(1, seconds=120.0, reason="daily quota", bucket=bucket)
+        self.assertTrue(lb.is_token_in_cooldown(1, bucket="image:GEM_PIX_2"))
+        self.assertFalse(lb.is_token_in_cooldown(1, bucket="image:BELUGA"))
+        self.assertFalse(lb.is_token_in_cooldown(1, bucket="video"))
+        picked_pro_img = await lb.select_token(
+            for_image_generation=True,
+            model="gemini-3.0-pro-image-landscape",
+            prefer_warm_browser=False,
+        )
+        self.assertEqual(picked_pro_img.id, 2)
+        picked_beluga = await lb.select_token(
+            for_image_generation=True,
+            model="gemini-3.1-flash-image-landscape",
+            prefer_warm_browser=False,
+        )
+        self.assertEqual(picked_beluga.id, 1)
+
+        # 4. Retry-After parsing, /about identity_recheck_required, and post-submit paid video guard
+        self.assertEqual(extract_retry_after_seconds("429 Too Many Requests; Retry-After: 45s"), 45.0)
+        recheck = classify_flow_error("identity_recheck_required: redirected to /about")
+        self.assertEqual(recheck.category, FlowErrorCategory.AUTH_EXPIRED)
+        self.assertEqual(recheck.next_action, "reauth")
+        post_err = classify_flow_error(
+            "HTTP Error 504: Gateway Timeout", post_submit=True, billed_operation=True
+        )
+        self.assertEqual(post_err.charged, "maybe")
+        self.assertEqual(post_err.next_action, "reconcile")
+        self.assertFalse(post_err.retryable_same_token)
+        self.assertFalse(post_err.failover_other_token)
+
+        # Post-submit timeout on _current_generate_video must NEVER blindly retry _current_rpc
+        client = FlowClient(proxy_manager=MagicMock())
+        client._frontend_cookie = AsyncMock(return_value="SID=1")
+        client._get_recaptcha_token = AsyncMock(return_value=("rc-tok", "1:req"))
+        client._notify_browser_captcha_request_finished = AsyncMock()
+        client._current_rpc = AsyncMock(side_effect=RuntimeError("XHR timeout after submit"))
+        with self.assertRaises(RuntimeError) as ctx:
+            await client._current_generate_video(
+                project_id="proj-1",
+                prompt="test",
+                model_key="veo_3_1_t2v_lite",
+                aspect_ratio="VIDEO_ASPECT_RATIO_LANDSCAPE",
+                mode="t2v",
+                token_id=1,
+                token_video_concurrency=None,
+                google_cookies="SID=1",
+            )
+        self.assertTrue(getattr(ctx.exception, "submission_uncertain", False))
+        self.assertEqual(client._current_rpc.await_count, 1)
+
+        # 5. ProfileLease wait_seconds waits briefly for release
+        with tempfile.TemporaryDirectory() as tmpdir:
+            acc = Path(tmpdir) / "token_wait"
+            l1 = acquire_profile_lease(acc, holder="first")
+            def _release_soon():
+                import time as _t
+                _t.sleep(0.12)
+                l1.release()
+            th = threading.Thread(target=_release_soon, daemon=True)
+            th.start()
+            l2 = acquire_profile_lease(acc, holder="second", wait_seconds=1.5, poll_interval=0.04)
+            try:
+                self.assertTrue(l2.active)
+            finally:
+                l2.release()
+                th.join(timeout=2.0)
+
+        # 6. GET /v1/flow/capabilities + MCP capabilities://self + no_spend mode
+        app = FastAPI()
+        app.include_router(flow_routes.router)
+        app.include_router(mcp_routes.router)
+        app.dependency_overrides[flow_routes.verify_api_key_flexible] = lambda: "k"
+        app.dependency_overrides[mcp_routes.verify_api_key_flexible] = lambda: "k"
+        mcp_routes.set_mcp_dependencies(MagicMock(), MagicMock())
+        mcp_routes.spend_limiter.reset()
+        tc = TestClient(app)
+
+        cap_normal = tc.get("/v1/flow/capabilities")
+        self.assertEqual(cap_normal.status_code, 200)
+        self.assertEqual(cap_normal.json()["capabilities"]["generate.video"], "yes")
+        self.assertEqual(cap_normal.json()["capabilities"]["idempotent_submit"], "no")
+
+        cap_ns = tc.get("/v1/flow/capabilities", headers={"X-Flow-No-Spend": "1"})
+        self.assertEqual(cap_ns.status_code, 200)
+        self.assertTrue(cap_ns.json()["noSpend"])
+        self.assertEqual(cap_ns.json()["capabilities"]["generate.video"], "no")
+
+        res_list = tc.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "resources/list", "params": {}},
+        )
+        self.assertEqual(res_list.status_code, 200)
+        self.assertEqual(res_list.json()["result"]["resources"][0]["uri"], "capabilities://self")
+
+        res_read = tc.post(
+            "/mcp",
+            headers={"X-Flow-No-Spend": "true"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": "capabilities://self"},
+            },
+        )
+        self.assertEqual(res_read.status_code, 200)
+        res_caps = json.loads(res_read.json()["result"]["contents"][0]["text"])
+        self.assertTrue(res_caps["noSpend"])
+
+        ns_tools = tc.post(
+            "/mcp",
+            headers={"X-Flow-No-Spend": "true"},
+            json={"jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}},
+        )
+        self.assertNotIn(
+            "flow_generate_video",
+            [t["name"] for t in ns_tools.json()["result"]["tools"]],
+        )
+
+        ns_blocked = tc.post(
+            "/mcp",
+            headers={"X-Flow-No-Spend": "true"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {"name": "flow_generate_video", "arguments": {"prompt": "hi"}},
+            },
+        )
+        self.assertEqual(ns_blocked.status_code, 403)
+        self.assertEqual(ns_blocked.json()["error"]["code"], -32030)
+        self.assertEqual(ns_blocked.json()["error"]["data"]["charged"], "no")
+
 
 if __name__ == "__main__":
     unittest.main()

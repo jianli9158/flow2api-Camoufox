@@ -121,110 +121,6 @@ class Config:
             return self.flow_timeout
 
     @property
-    def flow_image_timeout_retry_count(self) -> int:
-        """图片生成遇到网络超时时的快速重试次数。"""
-        retry_count = self._config.get("flow", {}).get("image_timeout_retry_count", 1)
-        try:
-            return max(0, min(3, int(retry_count)))
-        except Exception:
-            return 1
-
-    @property
-    def flow_image_timeout_retry_delay(self) -> float:
-        """图片生成网络超时重试前等待秒数。"""
-        delay = self._config.get("flow", {}).get("image_timeout_retry_delay", 0.8)
-        try:
-            return max(0.0, min(5.0, float(delay)))
-        except Exception:
-            return 0.8
-
-    @property
-    def flow_image_timeout_use_media_proxy_fallback(self) -> bool:
-        """网络超时时是否切换媒体代理重试。"""
-        return bool(
-            self._config.get("flow", {}).get(
-                "image_timeout_use_media_proxy_fallback", True
-            )
-        )
-
-    @property
-    def flow_image_prefer_media_proxy(self) -> bool:
-        """图片生成是否优先走媒体代理链路。"""
-        return bool(self._config.get("flow", {}).get("image_prefer_media_proxy", False))
-
-    @property
-    def flow_image_slot_wait_timeout(self) -> float:
-        """图片硬并发槽位等待超时(秒)。"""
-        timeout = self._config.get("flow", {}).get("image_slot_wait_timeout", 120)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 120.0
-
-    @property
-    def flow_image_launch_soft_limit(self) -> int:
-        """图片生成前置发车软并发上限(0 表示关闭软整形，仅使用硬并发)。"""
-        value = self._config.get("flow", {}).get("image_launch_soft_limit", 0)
-        try:
-            return max(0, min(200, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_image_launch_wait_timeout(self) -> float:
-        """图片前置发车软并发等待超时(秒)。"""
-        timeout = self._config.get("flow", {}).get("image_launch_wait_timeout", 180)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 180.0
-
-    @property
-    def flow_image_launch_stagger_ms(self) -> int:
-        """图片请求前置发车间隔(毫秒)，用于平滑同批突发。"""
-        value = self._config.get("flow", {}).get("image_launch_stagger_ms", 0)
-        try:
-            return max(0, min(5000, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_video_slot_wait_timeout(self) -> float:
-        """视频硬并发槽位等待超时(秒)。"""
-        timeout = self._config.get("flow", {}).get("video_slot_wait_timeout", 120)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 120.0
-
-    @property
-    def flow_video_launch_soft_limit(self) -> int:
-        """视频生成前置发车软并发上限(0 表示关闭软整形，仅使用硬并发)。"""
-        value = self._config.get("flow", {}).get("video_launch_soft_limit", 0)
-        try:
-            return max(0, min(200, int(value)))
-        except Exception:
-            return 0
-
-    @property
-    def flow_video_launch_wait_timeout(self) -> float:
-        """视频前置发车软并发等待超时(秒)。"""
-        timeout = self._config.get("flow", {}).get("video_launch_wait_timeout", 180)
-        try:
-            return max(1.0, min(600.0, float(timeout)))
-        except Exception:
-            return 180.0
-
-    @property
-    def flow_video_launch_stagger_ms(self) -> int:
-        """视频请求前置发车间隔(毫秒)，用于平滑同批突发。"""
-        value = self._config.get("flow", {}).get("video_launch_stagger_ms", 0)
-        try:
-            return max(0, min(5000, int(value)))
-        except Exception:
-            return 0
-
-    @property
     def poll_interval(self) -> float:
         return self._config["flow"]["poll_interval"]
 
@@ -247,6 +143,15 @@ class Config:
                 except ValueError:
                     pass
         return int(self._config["server"]["port"])
+
+    @property
+    def server_path_prefix(self) -> str:
+        raw = os.environ.get("FLOW2API_PATH_PREFIX", "").strip()
+        if not raw:
+            raw = str(self._config.get("server", {}).get("path_prefix", "") or "").strip()
+        if not raw or raw == "/":
+            return ""
+        return "/" + raw.strip("/")
 
     @property
     def debug_enabled(self) -> bool:
@@ -404,24 +309,14 @@ class Config:
 
     @property
     def browser_engine(self) -> str:
-        """浏览器模式内核: camoufox (AIStudio2API 风格 Camoufox+BiDi) 或 playwright。"""
-        env_val = os.getenv("FLOW2API_BROWSER_ENGINE")
-        raw = (
-            env_val
-            if env_val is not None
-            else self._config.get("captcha", {}).get("browser_engine", "camoufox")
-        )
-        normalized = str(raw or "camoufox").strip().lower()
-        return normalized if normalized in {"camoufox", "playwright"} else "camoufox"
+        """浏览器模式内核（固定为 Camoufox + WebDriver BiDi）。"""
+        return "camoufox"
 
     def set_browser_engine(self, engine: str):
-        normalized = str(engine or "camoufox").strip().lower()
-        if normalized not in {"camoufox", "playwright"}:
-            normalized = "camoufox"
+        _ = engine
         if "captcha" not in self._config:
             self._config["captcha"] = {}
-        self._config["captcha"]["browser_engine"] = normalized
-
+        self._config["captcha"]["browser_engine"] = "camoufox"
     @property
     def browser_in_page_rpc(self) -> bool:
         """Camoufox 模式下是否直接在页面内通过 XHR/ProtectedSend 执行 Flow batchexecute RPC。"""
@@ -431,17 +326,6 @@ class Config:
         return bool(
             self._config.get("captcha", {}).get("browser_in_page_rpc", True)
         )
-
-    @property
-    def browser_launch_background(self) -> bool:
-        """有头浏览器打码是否默认后台启动，避免抢占前台窗口。"""
-        return self._config.get("captcha", {}).get("browser_launch_background", True)
-
-    def set_browser_launch_background(self, enabled: bool):
-        """设置有头浏览器打码是否后台启动。"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["browser_launch_background"] = bool(enabled)
 
     @property
     def browser_count(self) -> int:
@@ -458,35 +342,6 @@ class Config:
             self._config["captcha"] = {}
         self._config["captcha"]["browser_count"] = max(1, min(20, int(value)))
 
-    @property
-    def browser_recaptcha_settle_seconds(self) -> float:
-        """自定义站点分数测试在 reload/clr 就绪后的额外等待秒数。"""
-        value = self._config.get("captcha", {}).get(
-            "browser_recaptcha_settle_seconds", 3.0
-        )
-        try:
-            return max(0.0, min(10.0, float(value)))
-        except Exception:
-            return 3.0
-
-    @property
-    def browser_flow_page_warmup_seconds(self) -> float:
-        """browser harvest 打开真实 Flow 页面后的稳定等待秒数。"""
-        value = self._config.get("captcha", {}).get(
-            "browser_flow_page_warmup_seconds", 6.0
-        )
-        try:
-            return max(0.0, min(30.0, float(value)))
-        except Exception:
-            return 6.0
-
-    def set_browser_flow_page_warmup_seconds(self, value: float):
-        """设置 browser harvest 页面预热等待秒数。"""
-        if "captcha" not in self._config:
-            self._config["captcha"] = {}
-        self._config["captcha"]["browser_flow_page_warmup_seconds"] = max(
-            0.0, min(30.0, float(value))
-        )
 
     @property
     def browser_idle_ttl_seconds(self) -> int:
@@ -556,6 +411,16 @@ class Config:
     def flow_clean_prompt(self) -> bool:
         """是否自动清理 Stable Diffusion 遗留冗余标签（如 8k、masterpiece）。"""
         return bool(self._config.get("flow", {}).get("clean_prompt", False))
+
+    @property
+    def mcp_no_spend(self) -> bool:
+        """MCP 禁扣费模式：开启后隐藏并拦截会消耗 Veo 积分的付费视频生成工具。"""
+        env_val = os.environ.get("FLOW2API_MCP_NO_SPEND", "").strip().lower()
+        if env_val in {"1", "true", "yes", "on"}:
+            return True
+        if env_val in {"0", "false", "no", "off"}:
+            return False
+        return bool(self._config.get("mcp", {}).get("no_spend", False))
 
 
 # Global config instance

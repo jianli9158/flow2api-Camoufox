@@ -10,6 +10,8 @@ from pydantic import BaseModel, Field, ValidationError
 from ..core.auth import verify_api_key_flexible
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
+from ..core.config import config
+from .mcp_routes import build_flow_capabilities
 from ..services.flow_features import (
     FlowFeatureService,
     get_resolved_flow_token_id,
@@ -35,21 +37,40 @@ def _ensure_service() -> FlowFeatureService:
     return flow_feature_service
 
 
-def _translate_service_error(exc: Exception) -> HTTPException:
+def _translate_service_error(
+    exc: Exception, *, billed_operation: bool = False
+) -> HTTPException:
     if isinstance(exc, HTTPException):
         return HTTPException(
             status_code=exc.status_code,
             detail=redact_sensitive_text(str(exc.detail or "")),
+            headers=getattr(exc, "headers", None),
         )
     if isinstance(exc, ValueError):
-        return HTTPException(status_code=400, detail=redact_sensitive_text(str(exc)))
+        return HTTPException(
+            status_code=400,
+            detail=redact_sensitive_text(str(exc)),
+            headers={"X-Flow-Charged": "no", "X-Flow-Next-Action": "fix_input"},
+        )
     msg = redact_sensitive_text(str(exc or "Flow request failed"))
-    classified = classify_flow_error(msg)
+    post_submit = bool(
+        getattr(exc, "submission_uncertain", False)
+        or getattr(exc, "outcome_unknown", False)
+    )
+    classified = classify_flow_error(
+        msg, post_submit=post_submit, billed_operation=billed_operation
+    )
     status = classified.http_status
     if status == 500:
         status = 502
-    return HTTPException(status_code=status, detail=msg)
-
+    headers = {
+        "X-Flow-Error-Category": classified.category.value,
+        "X-Flow-Charged": classified.charged,
+        "X-Flow-Next-Action": classified.next_action,
+    }
+    if classified.retry_after_seconds:
+        headers["Retry-After"] = str(int(round(classified.retry_after_seconds)))
+    return HTTPException(status_code=status, detail=msg, headers=headers)
 
 def _sanitize_flow_response_for_log(result: Any) -> Any:
     if isinstance(result, dict) and "audioBytes" in result:
@@ -121,7 +142,10 @@ async def _execute_logged_flow_call(
         return result
     except Exception as exc:
         duration = time.perf_counter() - started
-        http_exc = _translate_service_error(exc)
+        http_exc = _translate_service_error(
+            exc,
+            billed_operation=(operation in {"flow_generate_video", "flow_chain_videos"}),
+        )
         resolved_token_id = get_resolved_flow_token_id() or explicit_token_id
         await _safe_log_flow_call(
             svc,
@@ -1114,6 +1138,17 @@ async def list_flow_models(
         explicit_token_id=token_id,
         fn=lambda: svc.list_models(email=email, token_id=token_id),
     )
+
+
+@router.get("/capabilities")
+async def get_flow_capabilities(
+    request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    _ = api_key
+    hdr = str(request.headers.get("x-flow-no-spend") or "").strip().lower()
+    no_spend = config.mcp_no_spend or (hdr in {"1", "true", "yes", "on"})
+    return build_flow_capabilities(no_spend=no_spend)
 
 
 @router.post("/videos")

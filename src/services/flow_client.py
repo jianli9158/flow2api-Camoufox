@@ -21,22 +21,10 @@ except ImportError:
 from ..core.config import config
 from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
-from ..core.prompt_tools import jitter_seconds
+from ..core.prompt_tools import detect_image_mime_type, jitter_seconds
 from .flow_cookies import FlowCookieJar
-from .flow_current import CurrentFlowClientMixin
+from .flow_current import CurrentFlowClientMixin, _safe_updated_flow_cookies
 from .flow_frontend import FlowFrontendMixin
-
-
-def _safe_updated_flow_cookies(owner, original) -> str:
-    """读取 Cookie 最新快照，缺失实现时安全降级。"""
-    getter = getattr(owner, "get_updated_flow_cookies", None)
-    if getter is None:
-        return str(original or "").strip()
-    try:
-        return getter(original)
-    except Exception:
-        return str(original or "").strip()
-
 
 class _FlowClientBase(FlowFrontendMixin):
     """VideoFX API 客户端基础层"""
@@ -451,217 +439,6 @@ class _FlowClientBase(FlowFrontendMixin):
                     return project_id
         return None
 
-    async def _make_request(
-        self,
-        method: str,
-        url: str,
-        headers: Optional[Dict] = None,
-        json_data: Optional[Dict] = None,
-        raw_body: Optional[Union[str, bytes]] = None,
-        use_st: bool = False,
-        st_token: Optional[str] = None,
-        use_at: bool = False,
-        at_token: Optional[str] = None,
-        timeout: Optional[int] = None,
-        use_media_proxy: bool = False,
-        respect_fingerprint_proxy: bool = True,
-        force_no_proxy: bool = False,
-        apply_default_client_headers: bool = True,
-        impersonate: str = "chrome",
-    ) -> Dict[str, Any]:
-        """统一 HTTP 请求处理"""
-        fingerprint = self._request_fingerprint_ctx.get()
-
-        proxy_url = None
-        if not force_no_proxy:
-            if self.proxy_manager:
-                if use_media_proxy and hasattr(
-                    self.proxy_manager, "get_media_proxy_url"
-                ):
-                    proxy_url = await self.proxy_manager.get_media_proxy_url()
-                elif hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
-
-            if (
-                respect_fingerprint_proxy
-                and isinstance(fingerprint, dict)
-                and "proxy_url" in fingerprint
-            ):
-                proxy_url = fingerprint.get("proxy_url")
-                if proxy_url == "":
-                    proxy_url = None
-        request_timeout = timeout or self.timeout
-
-        headers = dict(headers) if headers else {}
-
-        if use_st and st_token:
-            headers["Cookie"] = f"__Secure-next-auth.session-token={st_token}"
-        if use_at and at_token:
-            headers["authorization"] = f"Bearer {at_token}"
-
-        account_id = (
-            st_token[:16] if st_token else (at_token[:16] if at_token else None)
-        )
-        fingerprint_user_agent = (
-            fingerprint.get("user_agent") if isinstance(fingerprint, dict) else None
-        )
-        effective_user_agent = str(
-            fingerprint_user_agent or self._generate_user_agent(account_id)
-        ).strip()
-        headers.setdefault("Content-Type", "application/json")
-        headers.setdefault("User-Agent", effective_user_agent)
-        headers.setdefault(
-            "Accept-Language",
-            self._get_primary_accept_language(fallback="zh-CN,zh;q=0.9"),
-        )
-
-        if isinstance(fingerprint, dict):
-            if fingerprint.get("accept_language"):
-                headers.setdefault("Accept-Language", fingerprint["accept_language"])
-            if fingerprint.get("sec_ch_ua"):
-                headers["sec-ch-ua"] = self._normalize_sec_ch_ua_header(
-                    fingerprint["sec_ch_ua"],
-                    user_agent=headers.get("User-Agent"),
-                )
-            if fingerprint.get("sec_ch_ua_mobile"):
-                headers["sec-ch-ua-mobile"] = fingerprint["sec_ch_ua_mobile"]
-            if fingerprint.get("sec_ch_ua_platform"):
-                headers["sec-ch-ua-platform"] = fingerprint["sec_ch_ua_platform"]
-
-        if apply_default_client_headers:
-            for key, value in self._default_client_headers.items():
-                headers.setdefault(key, value)
-
-        inferred_fingerprint = self._build_fingerprint_from_user_agent(
-            headers.get("User-Agent"),
-            accept_language=headers.get("Accept-Language"),
-            proxy_url=proxy_url,
-        )
-        if not headers.get("sec-ch-ua") and inferred_fingerprint.get("sec_ch_ua"):
-            headers["sec-ch-ua"] = inferred_fingerprint["sec_ch_ua"]
-        if not headers.get("sec-ch-ua-platform") and inferred_fingerprint.get(
-            "sec_ch_ua_platform"
-        ):
-            headers["sec-ch-ua-platform"] = inferred_fingerprint["sec_ch_ua_platform"]
-        if not headers.get("sec-ch-ua-mobile") and inferred_fingerprint.get(
-            "sec_ch_ua_mobile"
-        ):
-            headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
-
-        if isinstance(
-            fingerprint, dict
-        ) and self._should_attach_runtime_session_cookies(url):
-            origin = (
-                str(fingerprint.get("origin") or "").strip()
-                or "https://flow.google.com"
-            )
-            referer = str(fingerprint.get("referer") or "").strip()
-            if not referer:
-                fingerprint_project_id = str(
-                    fingerprint.get("project_id") or ""
-                ).strip()
-                if fingerprint_project_id:
-                    referer = self._build_flow_project_page_url(fingerprint_project_id)
-            if origin:
-                headers.setdefault("Origin", origin)
-            if referer:
-                headers.setdefault("Referer", referer)
-            merged_cookie_header = self._merge_cookie_header(
-                headers.get("Cookie"),
-                fingerprint.get("session_cookies"),
-            )
-            if merged_cookie_header:
-                headers["Cookie"] = merged_cookie_header
-
-        if self._should_attach_runtime_session_cookies(url):
-            derived_project_id = self._extract_project_id_from_request_payload(
-                json_data
-            )
-            headers.setdefault("Origin", "https://flow.google.com")
-            if derived_project_id:
-                headers.setdefault(
-                    "Referer", self._build_flow_project_page_url(derived_project_id)
-                )
-
-        request_body_for_log = raw_body if raw_body is not None else json_data
-        if config.debug_enabled:
-            debug_logger.log_request(
-                method=method,
-                url=url,
-                headers=headers,
-                body=request_body_for_log,
-                proxy=proxy_url,
-            )
-
-        start_time = time.time()
-
-        try:
-            pool_key, session = await self._get_http_session(
-                impersonate=impersonate,
-                proxy_url=proxy_url,
-            )
-            try:
-                if method.upper() == "GET":
-                    response = await session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy_url,
-                        timeout=request_timeout,
-                        impersonate=impersonate,
-                    )
-                else:
-                    request_kwargs = {
-                        "headers": headers,
-                        "proxy": proxy_url,
-                        "timeout": request_timeout,
-                        "impersonate": impersonate,
-                    }
-                    if raw_body is not None:
-                        request_kwargs["data"] = raw_body
-                    else:
-                        request_kwargs["json"] = json_data
-                    response = await session.post(url, **request_kwargs)
-            except BaseException:
-                await self._evict_http_session(pool_key, session)
-                raise
-
-            duration_ms = (time.time() - start_time) * 1000
-            if config.debug_enabled:
-                debug_logger.log_response(
-                    status_code=response.status_code,
-                    headers=dict(response.headers),
-                    body=response.text,
-                    duration_ms=duration_ms,
-                )
-
-            if response.status_code >= 400:
-                error_reason = f"HTTP Error {response.status_code}"
-                try:
-                    error_body = response.json()
-                    if "error" in error_body:
-                        error_info = error_body["error"]
-                        error_message = error_info.get("message", "")
-                        details = error_info.get("details", [])
-                        for detail in details:
-                            if detail.get("reason"):
-                                error_reason = detail.get("reason")
-                                break
-                        if error_message:
-                            error_reason = f"{error_reason}: {error_message}"
-                except Exception:
-                    error_reason = (
-                        f"HTTP Error {response.status_code}: {response.text[:200]}"
-                    )
-                raise Exception(error_reason)
-
-            return response.json()
-
-        except Exception as e:
-            error_msg = str(e)
-            raise Exception(f"Flow API request failed: {error_msg}")
-
     async def _make_text_request(
         self,
         method: str,
@@ -1023,21 +800,7 @@ class _FlowClientBase(FlowFrontendMixin):
         return
 
     def _detect_image_mime_type(self, image_bytes: bytes) -> str:
-        if len(image_bytes) < 12:
-            return "image/jpeg"
-        if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
-            return "image/webp"
-        if image_bytes[:4] == b"\x89PNG":
-            return "image/png"
-        if image_bytes[:3] == b"\xff\xd8\xff":
-            return "image/jpeg"
-        if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
-            return "image/gif"
-        if image_bytes[:2] == b"BM":
-            return "image/bmp"
-        if image_bytes[:6] == b"\x00\x00\x00\x0cjP":
-            return "image/jp2"
-        return "image/jpeg"
+        return detect_image_mime_type(image_bytes, fallback="image/jpeg")
 
     async def _handle_retryable_generation_error(
         self,
@@ -1082,20 +845,6 @@ class _FlowClientBase(FlowFrontendMixin):
         await asyncio.sleep(retry_delay)
         return True
 
-    @staticmethod
-    def _extract_browser_captcha_session_id(
-        browser_ref: Optional[Union[int, str]],
-    ) -> Optional[str]:
-        if not isinstance(browser_ref, str):
-            return None
-        raw = browser_ref.strip()
-        browser_id, separator, request_ref = raw.partition(":")
-        if not separator or not browser_id.isdigit() or not request_ref:
-            return None
-        if request_ref.startswith("lease-"):
-            return request_ref.partition("/")[2] or None
-        return request_ref
-
     def _get_retry_reason(self, error_str: str) -> Optional[str]:
         error_lower = str(error_str or "").lower()
         classified = classify_flow_error(error_str)
@@ -1131,23 +880,6 @@ class _FlowClientBase(FlowFrontendMixin):
         if "recaptcha" in error_lower:
             return round(jitter_seconds(2.0, low_ratio=0.75, high_ratio=1.35), 2)
         return round(jitter_seconds(1.0, low_ratio=0.7, high_ratio=1.4), 2)
-
-    def _merge_request_fingerprint(self, patch: Optional[Dict[str, Any]]):
-        if not isinstance(patch, dict) or not patch:
-            return
-        current = self.get_request_fingerprint() or {}
-        merged = dict(current)
-        for key, value in patch.items():
-            if value is None:
-                continue
-            if isinstance(value, str):
-                normalized = value.strip()
-                if not normalized:
-                    continue
-                merged[key] = normalized
-            else:
-                merged[key] = value
-        self._set_request_fingerprint(merged if merged else None)
 
     async def _notify_browser_captcha_error(
         self,

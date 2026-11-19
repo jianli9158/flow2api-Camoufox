@@ -11,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from ..core.auth import verify_api_key_flexible
+from ..core.config import config
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
+from ..services.video_chain import check_ffmpeg_available
 
 router = APIRouter(tags=["mcp"])
 
@@ -64,7 +66,62 @@ _SPEND_PROTECTED_TOOLS = frozenset(
         "flow_create_character",
     }
 )
+_PAID_CREDIT_TOOLS = frozenset({"flow_generate_video"})
 
+
+def build_flow_capabilities(*, no_spend: bool = False) -> Dict[str, Any]:
+    """Zero-upstream capability declaration for REST (`GET /v1/flow/capabilities`) and MCP (`capabilities://self`)."""
+    ffmpeg_ok, _ffmpeg_msg = check_ffmpeg_available()
+    return {
+        "schema": 1,
+        "adapter": "flow2api-camoufox-bidi",
+        "noSpend": bool(no_spend),
+        "capabilities": {
+            "generate.image": "yes",
+            "generate.video": "no" if no_spend else "yes",
+            "video.chain": "no" if (no_spend or not ffmpeg_ok) else "yes",
+            "submit.no_wait": "yes",
+            "status": "yes",
+            "download": "yes",
+            "upload": "yes",
+            "abort.local": "yes",
+            "cancel.server": "no",
+            "idempotent_submit": "no",
+            "credits.balance": "yes",
+            "characters.saga": "yes",
+            "mentions": "yes",
+        },
+        "notes": {
+            "generate.video": (
+                "Disabled because mcp.no_spend / X-Flow-No-Spend is enabled."
+                if no_spend
+                else "Enabled; consumes Google Flow Veo credits."
+            ),
+            "video.chain": (
+                "Requires local ffmpeg/ffprobe and spend mode enabled."
+                if (no_spend or not ffmpeg_ok)
+                else "Available via local ffmpeg/ffprobe tail-frame extraction and concat."
+            ),
+            "cancel.server": "Google Flow does not cancel accepted generations server-side.",
+            "idempotent_submit": "Paid video submits are non-idempotent; post-submit timeouts return charged=maybe and next_action=reconcile.",
+        },
+    }
+
+
+def _is_no_spend_active(request: Optional[Request] = None) -> bool:
+    if config.mcp_no_spend:
+        return True
+    if request is not None:
+        hdr = str(request.headers.get("x-flow-no-spend") or "").strip().lower()
+        if hdr in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def _visible_mcp_tools(*, no_spend: bool) -> List[Dict[str, Any]]:
+    if not no_spend:
+        return list(MCP_TOOL_DEFINITIONS)
+    return [t for t in MCP_TOOL_DEFINITIONS if t["name"] not in _PAID_CREDIT_TOOLS]
 MCP_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     {
         "name": "flow_list_models",
@@ -219,9 +276,16 @@ async def _dispatch_mcp_tool(
     args: Dict[str, Any],
     *,
     caller_key: str,
+    no_spend: bool = False,
 ) -> Dict[str, Any]:
     if _flow_feature_service is None:
         raise RuntimeError("Flow feature service is not initialized")
+
+    if no_spend and tool_name in _PAID_CREDIT_TOOLS:
+        raise HTTPException(
+            status_code=403,
+            detail=f"MCP no-spend mode blocks paid credit tool '{tool_name}'",
+        )
 
     needs_spend_token = tool_name in _SPEND_PROTECTED_TOOLS
     if tool_name == "flow_create_character" and not (
@@ -236,7 +300,6 @@ async def _dispatch_mcp_tool(
                 status_code=429,
                 detail=f"MCP spend-protection bucket exhausted; retry in {int(retry_after)}s",
             )
-
     svc = _flow_feature_service
     if tool_name == "flow_list_models":
         return await svc.list_models(
@@ -330,14 +393,20 @@ async def _dispatch_mcp_tool(
 
 
 @router.get("/mcp")
-async def mcp_server_info(api_key: str = Depends(verify_api_key_flexible)):
+async def mcp_server_info(
+    request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
     _ = api_key
+    no_spend = _is_no_spend_active(request)
     return {
         "name": "flow2api-mcp",
         "version": "1.0.0",
         "protocolVersion": "2025-03-26",
         "transport": "streamable-http",
-        "tools": [t["name"] for t in MCP_TOOL_DEFINITIONS],
+        "noSpend": no_spend,
+        "tools": [t["name"] for t in _visible_mcp_tools(no_spend=no_spend)],
+        "resources": ["capabilities://self"],
     }
 
 
@@ -367,6 +436,7 @@ async def mcp_rpc_endpoint(
     req_id = body.get("id")
     method = str(body.get("method") or "").strip()
     params = body.get("params") if isinstance(body.get("params"), dict) else {}
+    no_spend = _is_no_spend_active(request)
 
     if method == "notifications/initialized":
         return JSONResponse(status_code=202, content={"ok": True})
@@ -378,14 +448,57 @@ async def mcp_rpc_endpoint(
                 req_id,
                 {
                     "protocolVersion": "2025-03-26",
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": {
+                        "tools": {"listChanged": False},
+                        "resources": {"listChanged": False},
+                    },
                     "serverInfo": {"name": "flow2api-mcp", "version": "1.0.0"},
+                },
+            )
+        )
+    if method == "resources/list":
+        return JSONResponse(
+            content=_jsonrpc_result(
+                req_id,
+                {
+                    "resources": [
+                        {
+                            "uri": "capabilities://self",
+                            "name": "Flow2API Capabilities",
+                            "description": "Zero-upstream capability declaration including noSpend and video.chain availability.",
+                            "mimeType": "application/json",
+                        }
+                    ]
+                },
+            )
+        )
+    if method == "resources/read":
+        uri = str(params.get("uri") or "").strip()
+        if uri != "capabilities://self":
+            return JSONResponse(
+                status_code=404,
+                content=_jsonrpc_error(req_id, -32002, f"Resource not found: {uri}"),
+            )
+        caps = build_flow_capabilities(no_spend=no_spend)
+        return JSONResponse(
+            content=_jsonrpc_result(
+                req_id,
+                {
+                    "contents": [
+                        {
+                            "uri": "capabilities://self",
+                            "mimeType": "application/json",
+                            "text": json.dumps(caps, ensure_ascii=False),
+                        }
+                    ]
                 },
             )
         )
     if method == "tools/list":
         return JSONResponse(
-            content=_jsonrpc_result(req_id, {"tools": MCP_TOOL_DEFINITIONS})
+            content=_jsonrpc_result(
+                req_id, {"tools": _visible_mcp_tools(no_spend=no_spend)}
+            )
         )
     if method == "tools/call":
         tool_name = str(params.get("name") or "").strip()
@@ -397,9 +510,10 @@ async def mcp_rpc_endpoint(
                 status_code=400,
                 content=_jsonrpc_error(req_id, -32602, "Missing tool name"),
             )
+        is_billed_tool = tool_name in _PAID_CREDIT_TOOLS
         try:
             tool_result = await _dispatch_mcp_tool(
-                tool_name, tool_args, caller_key=api_key
+                tool_name, tool_args, caller_key=api_key, no_spend=no_spend
             )
             return JSONResponse(
                 content=_jsonrpc_result(
@@ -416,18 +530,37 @@ async def mcp_rpc_endpoint(
                 )
             )
         except HTTPException as http_exc:
-            classified = classify_flow_error(str(http_exc.detail or ""))
+            detail_text = redact_sensitive_text(str(http_exc.detail or ""))
+            if http_exc.status_code == 403 and "no-spend" in detail_text.lower():
+                payload = {
+                    "error": detail_text,
+                    "status_code": 403,
+                    "category": "no_spend_blocked",
+                    "retryable": False,
+                    "charged": "no",
+                    "next_action": "fix_input",
+                    "remediation_hint": "MCP no-spend 模式已禁用付费视频工具，如需使用请关闭 FLOW2API_MCP_NO_SPEND 或移除 X-Flow-No-Spend 请求头。",
+                }
+                return JSONResponse(
+                    status_code=403,
+                    content=_jsonrpc_error(req_id, -32030, detail_text, data=payload),
+                )
+            classified = classify_flow_error(
+                detail_text, billed_operation=is_billed_tool
+            )
             payload = {
-                "error": redact_sensitive_text(str(http_exc.detail or "")),
+                "error": detail_text,
                 "status_code": http_exc.status_code,
                 "category": classified.category.value,
                 "retryable": classified.retryable_same_token,
+                "charged": classified.charged,
+                "next_action": classified.next_action,
                 "remediation_hint": classified.remediation_hint,
             }
             if http_exc.status_code == 429:
                 return JSONResponse(
                     status_code=429,
-                    content=_jsonrpc_error(req_id, -32029, str(http_exc.detail), data=payload),
+                    content=_jsonrpc_error(req_id, -32029, detail_text, data=payload),
                 )
             return JSONResponse(
                 content=_jsonrpc_result(
@@ -439,12 +572,20 @@ async def mcp_rpc_endpoint(
                 )
             )
         except Exception as exc:
-            classified = classify_flow_error(exc)
+            post_submit = bool(
+                getattr(exc, "submission_uncertain", False)
+                or getattr(exc, "outcome_unknown", False)
+            )
+            classified = classify_flow_error(
+                exc, post_submit=post_submit, billed_operation=is_billed_tool
+            )
             payload = {
                 "error": redact_sensitive_text(str(exc)),
                 "status_code": classified.http_status,
                 "category": classified.category.value,
                 "retryable": classified.retryable_same_token,
+                "charged": classified.charged,
+                "next_action": classified.next_action,
                 "remediation_hint": classified.remediation_hint,
             }
             return JSONResponse(

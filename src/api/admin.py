@@ -241,8 +241,8 @@ def _validate_browser_proxy_url_local(proxy_url: str) -> tuple[bool, Optional[st
 
 def _normalize_runtime_method(method: Optional[str]) -> str:
     normalized = (method or "").strip().lower()
-    if normalized not in {"browser", "camoufox", ""}:
-        return "camoufox"
+    if normalized in {"browser", "camoufox", ""}:
+        return "browser"
     return "browser"
 
 
@@ -1839,27 +1839,11 @@ async def get_proxy_config_alias(token: str = Depends(verify_admin_token)):
 
 
 @router.post("/api/proxy/config")
-async def update_proxy_config_alias(
-    request: ProxyConfigRequest, token: str = Depends(verify_admin_token)
-):
-    """Update proxy configuration (alias for frontend compatibility)"""
-    try:
-        await proxy_manager.update_proxy_config(
-            enabled=request.proxy_enabled,
-            proxy_url=request.proxy_url,
-            media_proxy_enabled=request.media_proxy_enabled,
-            media_proxy_url=request.media_proxy_url,
-        )
-    except ValueError as e:
-        return {"success": False, "message": str(e)}
-    return {"success": True, "message": "代理配置更新成功"}
-
-
 @router.post("/api/config/proxy")
 async def update_proxy_config(
     request: ProxyConfigRequest, token: str = Depends(verify_admin_token)
 ):
-    """Update proxy configuration"""
+    """Update proxy configuration (serves both /api/config/proxy and /api/proxy/config)."""
     try:
         await proxy_manager.update_proxy_config(
             enabled=request.proxy_enabled,
@@ -1870,7 +1854,6 @@ async def update_proxy_config(
     except ValueError as e:
         return {"success": False, "message": str(e)}
     return {"success": True, "message": "代理配置更新成功"}
-
 
 @router.post("/api/proxy/test")
 async def test_proxy_connectivity(

@@ -170,15 +170,9 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
 
 
 def _detect_image_mime_type(image_bytes: bytes, fallback: str = "image/png") -> str:
-    if image_bytes.startswith(b"\xff\xd8\xff"):
-        return "image/jpeg"
-    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if image_bytes.startswith(b"GIF87a") or image_bytes.startswith(b"GIF89a"):
-        return "image/gif"
-    if image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
-        return "image/webp"
-    return fallback
+    from ..core.prompt_tools import detect_image_mime_type
+
+    return detect_image_mime_type(image_bytes, fallback=fallback)
 
 
 def _guess_mime_type(uri: str, fallback: str) -> str:

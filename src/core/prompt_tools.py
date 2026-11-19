@@ -260,3 +260,22 @@ def validate_base64_media_payload(
             raise ValueError("Decoded payload is not a valid video (magic-byte check failed)")
 
     return decoded
+
+
+def detect_image_mime_type(image_bytes: bytes, fallback: str = "image/jpeg") -> str:
+    """Detect common image MIME types from magic bytes with caller-specified fallback."""
+    if not image_bytes or len(image_bytes) < 2:
+        return fallback
+    if len(image_bytes) >= 12 and image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n") or image_bytes[:4] == b"\x89PNG":
+        return "image/png"
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if image_bytes[:2] == b"BM":
+        return "image/bmp"
+    if image_bytes[:6] == b"\x00\x00\x00\x0cjP":
+        return "image/jp2"
+    return fallback

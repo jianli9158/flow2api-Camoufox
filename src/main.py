@@ -250,9 +250,9 @@ app = FastAPI(
     title="Flow2API",
     description="OpenAI-compatible API for Google VideoFX (Veo)",
     version="1.0.0",
+    root_path=config.server_path_prefix,
     lifespan=lifespan,
 )
-
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,

@@ -447,7 +447,9 @@ class CamoufoxWorker:
                 self._profile_lease.release()
                 self._profile_lease = None
             self._profile_lease = acquire_profile_lease(
-                account_dir, holder=f"camoufox_slot_{self.token_id}_token_{token_id}"
+                account_dir,
+                holder=f"camoufox_slot_{self.token_id}_token_{token_id}",
+                wait_seconds=2.0,
             )
         fp_config = load_or_create_account_camoufox_config(
             account_dir, CAMOUFOX_FIREFOX_MAJOR, "en-US", "America/New_York"
@@ -463,15 +465,15 @@ class CamoufoxWorker:
                     relay_addr = await self._relay.start()
 
             if token_id:
+                self._is_persistent_profile = True
                 profile_dir = account_dir / "firefox-profile"
                 profile_dir.mkdir(parents=True, exist_ok=True)
                 _clear_stale_firefox_profile_locks(profile_dir)
-                self._is_persistent_profile = True
             else:
+                self._is_persistent_profile = False
                 profile_dir = Path(
                     tempfile.mkdtemp(prefix=f"flow2api-camoufox-{self.token_id}-")
                 )
-                self._is_persistent_profile = False
             self._profile_dir = profile_dir
             self._account_dir = account_dir
             self._warmed_projects.clear()
@@ -1479,13 +1481,16 @@ class CamoufoxWorker:
                         except Exception:
                             pass
                     if is_unauthed_flow:
+                        if href_now.rstrip("/").endswith("/about") or "/about" in href_now:
+                            raise RuntimeError(
+                                "Flow 账号登录态已失效（identity_recheck_required：页面持续跳转 /about，需要 Google 二次身份核验），请在后台点击该账号的「重登」并完成“验证是您本人”"
+                            )
                         raise RuntimeError(
                             "Flow 账号登录态已失效（页面已跳转至未登录页），请在后台点击该账号的「重登」重新登录"
                         )
             except Exception as unauth_exc:
                 if "登录态已失效" in str(unauth_exc):
                     raise
-
             await self._dismiss_flow_overlays(context_id)
             try:
                 cookie_bar_rect = await self._bidi.evaluate(
@@ -1735,78 +1740,11 @@ class CamoufoxWorker:
                     separators=(",", ":"),
                 )
 
-                rpc_fn = r"""
-                async (cfg) => {
-                    let wiz = window.WIZ_global_data || {};
-                    let bl = wiz.cfb2h || cfg.cachedBl || '';
-                    let fSid = wiz.FdrFJe || cfg.cachedFSid || '';
-                    let at = wiz.SNlM0e || cfg.cachedAt || '';
-
-                    const fetchBootstrap = async (pathOverride) => {
-                        const targetPath = pathOverride || ((cfg.sourcePath && cfg.sourcePath.includes('/edit/')) ? '/projects' : (cfg.sourcePath || '/projects'));
-                        const pageResp = await fetch(targetPath, { credentials: 'include' });
-                        const html = await pageResp.text();
-                        const blMatch = html.match(/boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+/);
-                        const sidMatch = html.match(/"FdrFJe":"(-?[0-9]+)"/);
-                        const atMatch = html.match(/"SNlM0e"\s*:\s*"((?:\\.|[^"\\])+)"/);
-                        if (blMatch) bl = blMatch[0];
-                        if (sidMatch) fSid = sidMatch[1];
-                        if (atMatch) {
-                            try { at = JSON.parse('"' + atMatch[1] + '"'); } catch (_) { at = atMatch[1]; }
-                        }
-                    };
-
-                    if (!bl || !fSid || !at) {
-                        await fetchBootstrap();
-                        if (!at) {
-                            await fetchBootstrap('/projects');
-                        }
-                    }
-                    if (!bl || !fSid) {
-                        return { ok: false, error: 'Flow WIZ_global_data metadata unavailable' };
-                    }
-
-                    const postOnce = (xsrfToken) => new Promise((resolve, reject) => {
-                        const reqId = Math.floor(10000 + Math.random() * 80000);
-                        const url = `/_/AiSandboxAngularFrontend/data/batchexecute?rpcids=${encodeURIComponent(cfg.rpcId)}&source-path=${encodeURIComponent(cfg.sourcePath)}&bl=${encodeURIComponent(bl)}&f.sid=${encodeURIComponent(fSid)}&hl=en&_reqid=${reqId}&rt=c`;
-                        const params = new URLSearchParams();
-                        params.set('f.req', cfg.fReq);
-                        if (xsrfToken) params.set('at', xsrfToken);
-
-                        const xhr = new XMLHttpRequest();
-                        xhr.open('POST', url, true);
-                        xhr.withCredentials = true;
-                        xhr.timeout = cfg.timeoutMs;
-                        xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded;charset=UTF-8');
-                        xhr.setRequestHeader('x-same-domain', '1');
-                        xhr.onload = () => resolve({ ok: true, status: xhr.status, text: xhr.responseText || '', bl, fSid, at: xsrfToken });
-                        xhr.onerror = () => reject(new Error('XHR network error'));
-                        xhr.ontimeout = () => reject(new Error('XHR timeout'));
-                        xhr.send(params.toString());
-                    });
-
-                    let result = await postOnce(at);
-                    const xsrfMatch = (result.text || '').match(/\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"/);
-                    if (xsrfMatch) {
-                        let refreshedAt = xsrfMatch[1];
-                        try { refreshedAt = JSON.parse('"' + refreshedAt + '"'); } catch (_) {}
-                        if (window.WIZ_global_data) window.WIZ_global_data.SNlM0e = refreshedAt;
-                        at = refreshedAt;
-                        result = await postOnce(refreshedAt);
-                    } else if (result.status === 401 || /UNAUTHENTICATED|,\s*16\s*\]/.test(result.text || '')) {
-                        await fetchBootstrap('/projects');
-                        if (at) {
-                            if (window.WIZ_global_data) window.WIZ_global_data.SNlM0e = at;
-                            result = await postOnce(at);
-                        }
-                    }
-                    return result;
-                }
-                """
+                from .bidi_scripts import FLOW_BATCHEXECUTE_XHR_FN
 
                 res = await bidi.call_function(
                     context_id,
-                    rpc_fn,
+                    FLOW_BATCHEXECUTE_XHR_FN,
                     arguments=[
                         _to_bidi_local_value(
                             {

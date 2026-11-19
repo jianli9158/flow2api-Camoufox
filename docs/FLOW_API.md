@@ -365,7 +365,12 @@ curl -s -X PATCH "http://127.0.0.1:8001/v1/flow/projects/<project_uuid>/settings
   - `concat: bool = true`（使用 `ffmpeg` 拼接为单条成片返回 `/tmp/chain_*.mp4`）
   - `clean_prompt: bool = false`、`resolve_mentions: bool = true`、`poll_interval: float = 5.0`、`timeout: int = 360`
 
-#### 26) 内置 Streamable HTTP MCP 服务端：`GET / POST /mcp`
+#### 26) 能力自描述与防重复扣费语义：`GET /v1/flow/capabilities`
+- 零上游调用，返回 `noSpend`、`capabilities`（`generate.image` / `generate.video` / `video.chain` / `cancel.server: "no"` / `idempotent_submit: "no"` 等）与 `notes`。
+- `/v1/flow/*` 错误响应附带 `X-Flow-Error-Category`、`X-Flow-Charged`（`no` / `maybe` / `yes`）、`X-Flow-Next-Action`（`retry` / `retry_after` / `reauth` / `fix_input` / `reconcile` / `none`）及 `Retry-After` 响应头。
+
+#### 27) 内置 Streamable HTTP MCP 服务端：`GET / POST /mcp`
 - 使用标准 `Authorization: Bearer <api_key>` 或 `x-goog-api-key` 鉴权。
-- 支持 JSON-RPC 2.0 `initialize`、`ping`、`tools/list`、`tools/call`（内置 9 个工具：`flow_list_models`、`flow_get_project`、`flow_list_voices`、`flow_list_characters`、`flow_create_character`、`flow_generate_image`、`flow_generate_video`、`flow_get_asset`、`flow_tts`）。
+- 支持 JSON-RPC 2.0 `initialize`、`ping`、`resources/list`、`resources/read`（`capabilities://self`）、`tools/list`、`tools/call`（内置 9 个工具）。
+- 支持 `no_spend` 禁扣费模式（`[mcp].no_spend = true`、`FLOW2API_MCP_NO_SPEND=1` 或请求头 `X-Flow-No-Spend: 1`）：隐藏并拦截消耗 Veo 积分的 `flow_generate_video`（返回 HTTP `403` / JSON-RPC `-32030`）。
 - 高消费工具内置令牌桶限流（容量 8，每 20s 恢复 1 枚），超限返回 JSON-RPC `-32029`（HTTP `429`）。

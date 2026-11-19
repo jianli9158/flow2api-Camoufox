@@ -956,6 +956,7 @@ class CamoufoxLoginSession:
                             "localStorage": ls_items,
                         }
 
+                is_about_landing = parsed.path.rstrip("/").endswith("/about")
                 if info.get("is_flow_origin") and not info.get("is_auth_page"):
                     cookie_res = await bidi.command("storage.getCookies", {}, timeout=8.0)
                     raw_cookies = cookie_res.get("cookies") or []
@@ -965,6 +966,14 @@ class CamoufoxLoginSession:
                         if isinstance(c, dict)
                         and str(c.get("name") or "") in session_cookie_names
                     }
+                    if is_about_landing:
+                        if len(found_session_cookies) >= 2:
+                            self.set_state(
+                                "waiting",
+                                "检测到账号停留在 Flow /about 页面（可能需要 Google 二次身份核验），请在浏览器中点击页面主按钮并完成“验证是您本人”...",
+                            )
+                        await asyncio.sleep(0.7)
+                        continue
                     has_auth_signal = bool(
                         info.get("xsrf_token") or info.get("email")
                     )

@@ -3,6 +3,7 @@
 import asyncio
 import aiosqlite
 import json
+import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from typing import Optional, List, Dict, Any
@@ -51,6 +52,16 @@ class Database:
         self._read_lock: Optional[asyncio.Lock] = None
         self._write_lock = asyncio.Lock()
         self._request_logs_columns_cache: Optional[set[str]] = None
+        self._active_tokens_cache: Optional[tuple[float, List[Token]]] = None
+        self._active_tokens_cache_ttl: float = 15.0
+        self._proxy_config_cache: Optional[tuple[float, Optional[ProxyConfig]]] = None
+        self._proxy_config_cache_ttl: float = 15.0
+
+    def invalidate_active_tokens_cache(self) -> None:
+        self._active_tokens_cache = None
+
+    def invalidate_proxy_config_cache(self) -> None:
+        self._proxy_config_cache = None
 
     def db_exists(self) -> bool:
         """Check if database file exists"""
@@ -125,6 +136,8 @@ class Database:
         self._read_pool_conns = []
         self._conn_loop = None
         self._request_logs_columns_cache = None
+        self._active_tokens_cache = None
+        self._proxy_config_cache = None
         for rconn in pooled_reads:
             await self._close_conn_instance(rconn)
         await self._close_conn_instance(read_conn)
@@ -1306,6 +1319,7 @@ class Database:
                 (token_id,),
             )
             await db.commit()
+            self.invalidate_active_tokens_cache()
 
             return token_id
 
@@ -1455,15 +1469,20 @@ class Database:
             }
 
     async def get_active_tokens(self) -> List[Token]:
-        """Get all active tokens"""
+        """Get all active tokens (served from write-through short-TTL cache)."""
+        cached = self._active_tokens_cache
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < self._active_tokens_cache_ttl:
+            return [tok.model_copy() for tok in cached[1]]
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM tokens WHERE is_active = 1 ORDER BY last_used_at ASC"
             )
             rows = await cursor.fetchall()
-            return [Token(**dict(row)) for row in rows]
-
+            tokens = [Token(**dict(row)) for row in rows]
+            self._active_tokens_cache = (time.monotonic(), tokens)
+            return [tok.model_copy() for tok in tokens]
     async def update_token(self, token_id: int, **kwargs):
         """Update token fields"""
         async with self._connect(write=True) as db:
@@ -1497,6 +1516,7 @@ class Database:
                 query = f"UPDATE tokens SET {', '.join(updates)} WHERE id = ?"
                 await db.execute(query, params)
                 await db.commit()
+                self.invalidate_active_tokens_cache()
 
     async def update_token_if_cookie_matches(
         self, token_id: int, expected_cookies: str, **kwargs
@@ -1516,6 +1536,8 @@ class Database:
                 [*kwargs.values(), token_id, expected_cookies or ""],
             )
             await db.commit()
+            if cursor.rowcount > 0:
+                self.invalidate_active_tokens_cache()
             return cursor.rowcount > 0
 
     async def delete_token(self, token_id: int):
@@ -1530,6 +1552,7 @@ class Database:
             await db.execute("DELETE FROM projects WHERE token_id = ?", (token_id,))
             await db.execute("DELETE FROM tokens WHERE id = ?", (token_id,))
             await db.commit()
+            self.invalidate_active_tokens_cache()
 
     # Project operations
     async def add_project(self, project: Project) -> int:
@@ -1803,15 +1826,19 @@ class Database:
                 await db.commit()
 
     async def get_proxy_config(self) -> Optional[ProxyConfig]:
-        """Get proxy configuration"""
+        """Get proxy configuration (served from write-through short-TTL cache)."""
+        cached = self._proxy_config_cache
+        now = time.monotonic()
+        if cached is not None and (now - cached[0]) < self._proxy_config_cache_ttl:
+            cfg = cached[1]
+            return cfg.model_copy() if cfg is not None else None
         async with self._connect() as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute("SELECT * FROM proxy_config WHERE id = 1")
             row = await cursor.fetchone()
-            if row:
-                return ProxyConfig(**dict(row))
-            return None
-
+            cfg = ProxyConfig(**dict(row)) if row else None
+            self._proxy_config_cache = (time.monotonic(), cfg)
+            return cfg.model_copy() if cfg is not None else None
     async def update_proxy_config(
         self,
         enabled: bool,
@@ -1862,6 +1889,7 @@ class Database:
                 )
 
             await db.commit()
+            self.invalidate_proxy_config_cache()
 
     async def get_generation_config(self) -> Optional[GenerationConfig]:
         """Get generation configuration"""
@@ -2633,6 +2661,7 @@ class Database:
                 "UPDATE tokens SET refresh_interval_minutes = ?", (normalized,)
             )
             await db.commit()
+            self.invalidate_active_tokens_cache()
             return cursor.rowcount
 
     async def update_token_refresh_config(

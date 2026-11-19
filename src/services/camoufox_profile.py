@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 try:
@@ -115,62 +116,79 @@ def _read_lock_holder_diag(lock_path: Path) -> str:
 def acquire_profile_lease(
     account_dir: Union[str, Path],
     holder: str = "worker",
+    *,
+    wait_seconds: float = 0.0,
+    poll_interval: float = 0.15,
 ) -> ProfileLease:
     """Acquire exclusive in-process and OS kernel lock (`flock`/`msvcrt`) on `account_dir`.
 
     Byte 0 holds the kernel lock and diagnostic metadata lives at offset 1+. The lock
     file is intentionally never unlinked on release so concurrent processes share one inode.
+    When `wait_seconds > 0`, retries briefly before raising `ProfileLeaseBusyError`.
     """
     target_dir = _canonical_lease_path(Path(account_dir))
     target_dir.mkdir(parents=True, exist_ok=True)
     lock_path = target_dir / PROFILE_KERNEL_LOCK_FILENAME
+    deadline = time.monotonic() + max(0.0, float(wait_seconds or 0.0))
+    step = max(0.02, min(0.5, float(poll_interval or 0.15)))
 
-    with _PROFILE_LOGIN_LEASE_LOCK:
-        active_entry = _ACTIVE_PROFILE_KERNEL_LEASES.get(target_dir)
-        if active_entry is not None and active_entry[0].active:
-            raise ProfileLeaseBusyError(
-                f"浏览器资料目录 {target_dir.name} 已被本进程持有 ({active_entry[1]})"
-            )
+    while True:
+        busy_err: Optional[ProfileLeaseBusyError] = None
+        with _PROFILE_LOGIN_LEASE_LOCK:
+            active_entry = _ACTIVE_PROFILE_KERNEL_LEASES.get(target_dir)
+            if active_entry is not None and active_entry[0].active:
+                busy_err = ProfileLeaseBusyError(
+                    f"浏览器资料目录 {target_dir.name} 已被本进程持有 ({active_entry[1]})"
+                )
+            else:
+                fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    if _fcntl is not None:
+                        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                    elif _msvcrt is not None:
+                        os.lseek(fd, 0, os.SEEK_END)
+                        if os.lseek(fd, 0, os.SEEK_CUR) == 0:
+                            os.write(fd, b"\x00")
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
+                except OSError as exc:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    diag = _read_lock_holder_diag(lock_path)
+                    busy_err = ProfileLeaseBusyError(
+                        f"浏览器资料目录 {target_dir.name} 已被其他进程锁定 ({diag})"
+                    )
+                    busy_err.__cause__ = exc
+                else:
+                    meta = json.dumps(
+                        {
+                            "pid": os.getpid(),
+                            "holder": str(holder or "worker"),
+                            "acquired_at": datetime.now(timezone.utc).isoformat(),
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8")
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        os.ftruncate(fd, 0)
+                        os.write(fd, b"\x00" + meta)
+                    except OSError:
+                        pass
 
-        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            if _fcntl is not None:
-                _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-            elif _msvcrt is not None:
-                os.lseek(fd, 0, os.SEEK_END)
-                if os.lseek(fd, 0, os.SEEK_CUR) == 0:
-                    os.write(fd, b"\x00")
-                os.lseek(fd, 0, os.SEEK_SET)
-                _msvcrt.locking(fd, _msvcrt.LK_NBLCK, 1)
-        except OSError as exc:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            diag = _read_lock_holder_diag(lock_path)
-            raise ProfileLeaseBusyError(
-                f"浏览器资料目录 {target_dir.name} 已被其他进程锁定 ({diag})"
-            ) from exc
+                    lease = ProfileLease(
+                        target_dir, lock_path, fd, str(holder or "worker")
+                    )
+                    _ACTIVE_PROFILE_KERNEL_LEASES[target_dir] = (
+                        lease,
+                        str(holder or "worker"),
+                    )
+                    return lease
 
-        meta = json.dumps(
-            {
-                "pid": os.getpid(),
-                "holder": str(holder or "worker"),
-                "acquired_at": datetime.now(timezone.utc).isoformat(),
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.ftruncate(fd, 0)
-            os.write(fd, b"\x00" + meta)
-        except OSError:
-            pass
-
-        lease = ProfileLease(target_dir, lock_path, fd, str(holder or "worker"))
-        _ACTIVE_PROFILE_KERNEL_LEASES[target_dir] = (lease, str(holder or "worker"))
-        return lease
-
+        if time.monotonic() >= deadline:
+            raise busy_err
+        time.sleep(min(step, max(0.01, deadline - time.monotonic())))
 
 def get_active_profile_lease_holder(account_dir: Path) -> Optional[str]:
     key = _canonical_lease_path(account_dir)

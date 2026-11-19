@@ -116,18 +116,19 @@ class ProxyManager:
 
     async def get_request_proxy_url(self) -> Optional[str]:
         """Get request proxy URL if enabled, otherwise return None"""
-        config = await self.db.get_proxy_config()
+        config = await self.get_proxy_config()
         if config and config.enabled and config.proxy_url:
             return config.proxy_url
         return None
 
     async def get_media_proxy_url(self) -> Optional[str]:
-        """Get media upload/download proxy URL, fallback to request proxy"""
-        config = await self.db.get_proxy_config()
+        """Get media upload/download proxy URL, fallback to request proxy (single read)."""
+        config = await self.get_proxy_config()
         if config and config.media_proxy_enabled and config.media_proxy_url:
             return config.media_proxy_url
-        return await self.get_request_proxy_url()
-
+        if config and config.enabled and config.proxy_url:
+            return config.proxy_url
+        return None
     async def update_proxy_config(
         self,
         enabled: bool,

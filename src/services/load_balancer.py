@@ -8,13 +8,14 @@ from ..core.models import Token
 from ..core.config import config
 from ..core.account_tiers import (
     get_paygate_tier_label,
+    get_paygate_tier_rank,
     get_required_paygate_tier_for_model,
     normalize_user_paygate_tier,
     supports_model_for_tier,
 )
+from ..core.flow_errors import resolve_cooldown_bucket
 from .concurrency_manager import ConcurrencyManager
 from ..core.logger import debug_logger
-
 
 class LoadBalancer:
     """Token load balancer with load-aware selection"""
@@ -41,31 +42,57 @@ class LoadBalancer:
             "default": 0,
         }
         self._token_cooldowns: Dict[int, float] = {}
+        self._bucket_cooldowns: Dict[tuple[int, str], float] = {}
 
     def mark_token_cooldown(
-        self, token_id: Optional[int], seconds: float = 180.0, reason: str = ""
+        self,
+        token_id: Optional[int],
+        seconds: float = 180.0,
+        reason: str = "",
+        *,
+        bucket: Optional[str] = None,
     ) -> None:
         if token_id is None:
             return
         ttl = max(5.0, float(seconds or 180.0))
-        self._token_cooldowns[int(token_id)] = time.monotonic() + ttl
-        debug_logger.log_warning(
-            f"[LOAD_BALANCER] Token {token_id} 进入风控冷却 {ttl:.0f}s"
-            + (f" ({reason})" if reason else "")
-        )
+        until = time.monotonic() + ttl
+        normalized_bucket = str(bucket or "").strip()
+        if normalized_bucket:
+            self._bucket_cooldowns[(int(token_id), normalized_bucket)] = until
+            debug_logger.log_warning(
+                f"[LOAD_BALANCER] Token {token_id} 模型族 [{normalized_bucket}] 进入冷却 {ttl:.0f}s"
+                + (f" ({reason})" if reason else "")
+            )
+        else:
+            self._token_cooldowns[int(token_id)] = until
+            debug_logger.log_warning(
+                f"[LOAD_BALANCER] Token {token_id} 进入风控冷却 {ttl:.0f}s"
+                + (f" ({reason})" if reason else "")
+            )
 
-    def is_token_in_cooldown(self, token_id: Optional[int]) -> bool:
+    def is_token_in_cooldown(
+        self, token_id: Optional[int], *, bucket: Optional[str] = None
+    ) -> bool:
         if token_id is None:
             return False
         key = int(token_id)
+        now = time.monotonic()
         until = self._token_cooldowns.get(key)
-        if until is None:
-            return False
-        if time.monotonic() >= until:
-            self._token_cooldowns.pop(key, None)
-            return False
-        return True
-
+        if until is not None:
+            if now >= until:
+                self._token_cooldowns.pop(key, None)
+            else:
+                return True
+        normalized_bucket = str(bucket or "").strip()
+        if normalized_bucket:
+            bkey = (key, normalized_bucket)
+            b_until = self._bucket_cooldowns.get(bkey)
+            if b_until is not None:
+                if now >= b_until:
+                    self._bucket_cooldowns.pop(bkey, None)
+                else:
+                    return True
+        return False
     async def _get_pending_count(
         self, token_id: int, for_image_generation: bool, for_video_generation: bool
     ) -> int:
@@ -247,7 +274,12 @@ class LoadBalancer:
         available_tokens = []
         filtered_reasons = {}
         required_tier = get_required_paygate_tier_for_model(model)
-
+        required_tier_rank = get_paygate_tier_rank(required_tier)
+        cooldown_bucket = resolve_cooldown_bucket(
+            model,
+            for_image=for_image_generation,
+            for_video=for_video_generation,
+        )
         for token in active_tokens:
             if excluded_token_ids and token.id in excluded_token_ids:
                 filtered_reasons[token.id] = "当前请求已跳过"
@@ -289,19 +321,22 @@ class LoadBalancer:
                 for_image_generation=for_image_generation,
                 for_video_generation=for_video_generation,
             )
+            tier_rank = get_paygate_tier_rank(normalized_tier)
             available_tokens.append(
                 {
                     "token": token,
                     "inflight": inflight,
                     "remaining": remaining,
                     "needs_refresh": self.token_manager.needs_at_refresh(token),
-                    "in_cooldown": self.is_token_in_cooldown(token.id),
+                    "in_cooldown": self.is_token_in_cooldown(
+                        token.id, bucket=cooldown_bucket
+                    ),
+                    "tier_overkill": max(0, tier_rank - required_tier_rank),
                     "warm_idle": False,
                     "warm_bound": False,
                     "random": random.random(),
                 }
             )
-
         if filtered_reasons:
             debug_logger.log_info(f"[LOAD_BALANCER] 已过滤Token:")
             for token_id, reason in filtered_reasons.items():
@@ -389,12 +424,12 @@ class LoadBalancer:
                     1 if item["needs_refresh"] else 0,
                     item["inflight"],
                     0 if item["warm_idle"] else (1 if item["warm_bound"] else 2),
+                    item["tier_overkill"],
                     0 if item["remaining"] is None else 1,
                     -(item["remaining"] or 0),
                     item["random"],
                 )
             )
-
         ready_candidates = [
             item
             for item in available_tokens

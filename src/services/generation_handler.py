@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from ..core.logger import debug_logger
 from ..core.config import config
-from ..core.flow_errors import FlowErrorCategory, classify_flow_error
+from ..core.flow_errors import FlowErrorCategory, classify_flow_error, resolve_cooldown_bucket
 from ..core.monitoring import record_generation_result
 from ..core.models import Task, RequestLog
 from ..core.prompt_tools import jitter_sleep, strip_sd_banned_keywords
@@ -36,883 +36,11 @@ def _video_poll_attempt_budget(
     return attempts * (3 if upsample else 1)
 
 
-# Model configuration
-MODEL_CONFIG = {
-    # 图片生成 - GEM_PIX_2 (Gemini 3.0 Pro)
-    "gemini-3.0-pro-image-landscape": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-    },
-    "gemini-3.0-pro-image-portrait": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-    },
-    "gemini-3.0-pro-image-square": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-    },
-    "gemini-3.0-pro-image-four-three": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-    },
-    "gemini-3.0-pro-image-three-four": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-    },
-    # 图片生成 - GEM_PIX_2 (Gemini 3.0 Pro) 2K 放大版
-    "gemini-3.0-pro-image-landscape-2k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.0-pro-image-portrait-2k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.0-pro-image-square-2k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.0-pro-image-four-three-2k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.0-pro-image-three-four-2k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    # 图片生成 - GEM_PIX_2 (Gemini 3.0 Pro) 4K 放大版
-    "gemini-3.0-pro-image-landscape-4k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.0-pro-image-portrait-4k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.0-pro-image-square-4k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.0-pro-image-four-three-4k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.0-pro-image-three-four-4k": {
-        "type": "image",
-        "model_name": "GEM_PIX_2",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    # 图片生成 - BELUGA (Nano Banana 2.1)
-    "gemini-3.1-flash-image-landscape": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-    },
-    "gemini-3.1-flash-image-portrait": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-    },
-    "gemini-3.1-flash-image-square": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-    },
-    "gemini-3.1-flash-image-four-three": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-    },
-    "gemini-3.1-flash-image-three-four": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-    },
-    "gemini-3.1-flash-image-landscape-2k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.1-flash-image-portrait-2k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.1-flash-image-square-2k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.1-flash-image-four-three-2k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.1-flash-image-three-four-2k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-    },
-    "gemini-3.1-flash-image-landscape-4k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.1-flash-image-portrait-4k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.1-flash-image-square-4k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_SQUARE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.1-flash-image-four-three-4k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    "gemini-3.1-flash-image-three-four-4k": {
-        "type": "image",
-        "model_name": "BELUGA",
-        "aspect_ratio": "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR",
-        "upsample": "UPSAMPLE_IMAGE_RESOLUTION_4K",
-    },
-    # ========== 文生视频 (T2V - Text to Video) ==========
-    # veo_3_1_t2v_lite（横竖屏）
-    "veo_3_1_t2v_lite_portrait": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_3_1_t2v_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": False,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    "veo_3_1_t2v_lite_landscape": {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": "veo_3_1_t2v_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": False,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    # ========== 首尾帧模型 (I2V - Image to Video) ==========
-    # veo_3_1_i2v_lite（横竖屏，仅首帧）
-    "veo_3_1_i2v_lite_portrait": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_3_1_i2v_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 1,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    "veo_3_1_i2v_lite_landscape": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_3_1_i2v_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": True,
-        "min_images": 1,
-        "max_images": 1,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    # veo_3_1_interpolation_lite（横竖屏，首尾帧）
-    "veo_3_1_interpolation_lite_portrait": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_3_1_interpolation_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": True,
-        "min_images": 2,
-        "max_images": 2,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    "veo_3_1_interpolation_lite_landscape": {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": "veo_3_1_interpolation_lite",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": True,
-        "min_images": 2,
-        "max_images": 2,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-    },
-    # ========== Omni 1.2 Flash (macaron_cookie) 默认简写 ==========
-    "omni": {
-        "type": "video",
-        "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_LANDSCAPE",
-        "supports_images": True,
-        "min_images": 0,
-        "max_images": 3,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
-        "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
-    },
-    "omni_portrait": {
-        "type": "video",
-        "video_type": "omni",
-        "model_key": "macaron_cookie_t2v_8s",
-        "aspect_ratio": "VIDEO_ASPECT_RATIO_PORTRAIT",
-        "supports_images": True,
-        "min_images": 0,
-        "max_images": 3,
-        "use_v2_model_config": True,
-        "allow_tier_upgrade": False,
-        "reference_model_key": "macaron_cookie_r2v_8s",
-        "reference_duration": 8,
-        "reference_model_display_name": "Omni 1.2 Flash",
-    },
-}
-
-
-def _make_t2v_config(
-    model_key: str,
-    aspect_ratio: str,
-    *,
-    use_v2_model_config: bool = False,
-    allow_tier_upgrade: bool = True,
-    upsample: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {
-        "type": "video",
-        "video_type": "t2v",
-        "model_key": model_key,
-        "aspect_ratio": aspect_ratio,
-        "supports_images": False,
-    }
-    if use_v2_model_config:
-        cfg["use_v2_model_config"] = True
-    if not allow_tier_upgrade:
-        cfg["allow_tier_upgrade"] = False
-    if upsample:
-        cfg["upsample"] = upsample
-    return cfg
-
-
-def _make_i2v_config(
-    model_key: str,
-    aspect_ratio: str,
-    *,
-    min_images: int = 1,
-    max_images: int = 2,
-    use_v2_model_config: bool = False,
-    allow_tier_upgrade: bool = True,
-    upsample: Optional[Dict[str, str]] = None,
-) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {
-        "type": "video",
-        "video_type": "i2v",
-        "model_key": model_key,
-        "aspect_ratio": aspect_ratio,
-        "supports_images": True,
-        "min_images": min_images,
-        "max_images": max_images,
-    }
-    if use_v2_model_config:
-        cfg["use_v2_model_config"] = True
-    if not allow_tier_upgrade:
-        cfg["allow_tier_upgrade"] = False
-    if upsample:
-        cfg["upsample"] = upsample
-    return cfg
-
-
-def _apply_veo_3_1_model_updates():
-    """Retain hidden legacy Veo 3.1 Lite aliases alongside the public catalog."""
-    landscape = "VIDEO_ASPECT_RATIO_LANDSCAPE"
-    portrait = "VIDEO_ASPECT_RATIO_PORTRAIT"
-
-    def add_alias(alias: str, target: str):
-        MODEL_CONFIG[alias] = dict(MODEL_CONFIG[target])
-
-    for seconds in (4, 6):
-        suffix = f"{seconds}s"
-
-        MODEL_CONFIG[f"veo_3_1_t2v_lite_{suffix}_landscape"] = _make_t2v_config(
-            f"veo_3_1_t2v_lite_{suffix}",
-            landscape,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-        MODEL_CONFIG[f"veo_3_1_t2v_lite_{suffix}_portrait"] = _make_t2v_config(
-            f"veo_3_1_t2v_lite_{suffix}",
-            portrait,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-        MODEL_CONFIG[f"veo_3_1_i2v_lite_{suffix}_landscape"] = _make_i2v_config(
-            f"veo_3_1_i2v_s_lite_{suffix}",
-            landscape,
-            min_images=1,
-            max_images=1,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-        MODEL_CONFIG[f"veo_3_1_i2v_lite_{suffix}_portrait"] = _make_i2v_config(
-            f"veo_3_1_i2v_s_lite_{suffix}",
-            portrait,
-            min_images=1,
-            max_images=1,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-        MODEL_CONFIG[f"veo_3_1_interpolation_lite_{suffix}_landscape"] = (
-            _make_i2v_config(
-                f"veo_3_1_i2v_s_lite_{suffix}_fl",
-                landscape,
-                min_images=2,
-                max_images=2,
-                use_v2_model_config=True,
-                allow_tier_upgrade=False,
-            )
-        )
-        MODEL_CONFIG[f"veo_3_1_interpolation_lite_{suffix}_portrait"] = (
-            _make_i2v_config(
-                f"veo_3_1_i2v_s_lite_{suffix}_fl",
-                portrait,
-                min_images=2,
-                max_images=2,
-                use_v2_model_config=True,
-                allow_tier_upgrade=False,
-            )
-        )
-
-        add_alias(
-            f"veo_3_1_t2v_lite_landscape_{suffix}",
-            f"veo_3_1_t2v_lite_{suffix}_landscape",
-        )
-        add_alias(
-            f"veo_3_1_t2v_lite_portrait_{suffix}",
-            f"veo_3_1_t2v_lite_{suffix}_portrait",
-        )
-        add_alias(
-            f"veo_3_1_i2v_lite_landscape_{suffix}",
-            f"veo_3_1_i2v_lite_{suffix}_landscape",
-        )
-        add_alias(
-            f"veo_3_1_i2v_lite_portrait_{suffix}",
-            f"veo_3_1_i2v_lite_{suffix}_portrait",
-        )
-        add_alias(
-            f"veo_3_1_interpolation_lite_landscape_{suffix}",
-            f"veo_3_1_interpolation_lite_{suffix}_landscape",
-        )
-        add_alias(
-            f"veo_3_1_interpolation_lite_portrait_{suffix}",
-            f"veo_3_1_interpolation_lite_{suffix}_portrait",
-        )
-
-    add_alias("veo_3_1_t2v_lite_8s_landscape", "veo_3_1_t2v_lite_landscape")
-    add_alias("veo_3_1_t2v_lite_8s_portrait", "veo_3_1_t2v_lite_portrait")
-    add_alias("veo_3_1_t2v_lite_landscape_8s", "veo_3_1_t2v_lite_landscape")
-    add_alias("veo_3_1_t2v_lite_portrait_8s", "veo_3_1_t2v_lite_portrait")
-    add_alias("veo_3_1_i2v_lite_8s_landscape", "veo_3_1_i2v_lite_landscape")
-    add_alias("veo_3_1_i2v_lite_8s_portrait", "veo_3_1_i2v_lite_portrait")
-    add_alias("veo_3_1_i2v_lite_landscape_8s", "veo_3_1_i2v_lite_landscape")
-    add_alias("veo_3_1_i2v_lite_portrait_8s", "veo_3_1_i2v_lite_portrait")
-    add_alias(
-        "veo_3_1_interpolation_lite_8s_landscape",
-        "veo_3_1_interpolation_lite_landscape",
-    )
-    add_alias(
-        "veo_3_1_interpolation_lite_8s_portrait",
-        "veo_3_1_interpolation_lite_portrait",
-    )
-    add_alias(
-        "veo_3_1_interpolation_lite_landscape_8s",
-        "veo_3_1_interpolation_lite_landscape",
-    )
-    add_alias(
-        "veo_3_1_interpolation_lite_portrait_8s",
-        "veo_3_1_interpolation_lite_portrait",
-    )
-
-
-_apply_veo_3_1_model_updates()
-
-
-def _apply_current_flow_model_catalog():
-    """Expose the current Flow model families while retaining hidden legacy aliases."""
-    landscape = "VIDEO_ASPECT_RATIO_LANDSCAPE"
-    portrait = "VIDEO_ASPECT_RATIO_PORTRAIT"
-
-    for config_entry in MODEL_CONFIG.values():
-        config_entry["listed"] = False
-
-    def register(model_id: str, config_entry: Dict[str, Any], display_name: str):
-        config_entry = dict(config_entry)
-        config_entry["listed"] = True
-        config_entry["display_name"] = display_name
-        MODEL_CONFIG[model_id] = config_entry
-
-    image_variants = [
-        (model_id, dict(entry)) for model_id, entry in MODEL_CONFIG.items()
-        if entry.get("type") == "image"
-        and model_id.startswith("gemini-3.1-flash-image-")
-        and entry.get("model_name") == "BELUGA"
-    ]
-    for model_id, entry in image_variants:
-        entry["model_name"] = "BELUGA"
-        register(model_id, entry, "Nano Banana 2.1")
-        lite_entry = dict(entry)
-        lite_entry["model_name"] = "HARBOR_SEAL"
-        register(
-            model_id.replace("gemini-3.1-flash-image-", "gemini-3.1-flash-lite-image-", 1),
-            lite_entry,
-            "Nano Banana 2 Lite",
-        )
-
-    pro_variants = [
-        (model_id, dict(entry)) for model_id, entry in MODEL_CONFIG.items()
-        if entry.get("type") == "image"
-        and model_id.startswith("gemini-3.0-pro-image-")
-        and entry.get("model_name") == "GEM_PIX_2"
-    ]
-    for model_id, entry in pro_variants:
-        register(model_id, entry, "Nano Banana Pro")
-
-    def t2v(model_key: str, aspect_ratio: str) -> Dict[str, Any]:
-        return _make_t2v_config(
-            model_key,
-            aspect_ratio,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-
-    def i2v(model_key: str, aspect_ratio: str, max_images: int = 2) -> Dict[str, Any]:
-        return _make_i2v_config(
-            model_key,
-            aspect_ratio,
-            min_images=1,
-            max_images=max_images,
-            use_v2_model_config=True,
-            allow_tier_upgrade=False,
-        )
-
-    def r2v(model_key: str, aspect_ratio: str) -> Dict[str, Any]:
-        return {
-            "type": "video",
-            "video_type": "r2v",
-            "model_key": model_key,
-            "aspect_ratio": aspect_ratio,
-            "supports_images": True,
-            "min_images": 1,
-            "max_images": 3,
-            "use_v2_model_config": True,
-            "allow_tier_upgrade": False,
-        }
-
-    def extend(model_key: str, aspect_ratio: str) -> Dict[str, Any]:
-        return {
-            "type": "video",
-            "video_type": "extend",
-            "model_key": model_key,
-            "aspect_ratio": aspect_ratio,
-            "supports_images": False,
-            "use_v2_model_config": True,
-            "allow_tier_upgrade": False,
-        }
-
-    # Veo 3.1 Lite (active Veo family).
-    for seconds, key in (
-        (4, "veo_3_1_t2v_lite_4s"),
-        (6, "veo_3_1_t2v_lite_6s"),
-        (8, "veo_3_1_t2v_lite"),
-    ):
-        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
-            model_id = f"veo-3.1-lite-{seconds}s-{orientation}"
-            cfg = t2v(key, ratio)
-            register(model_id, cfg, f"Veo 3.1 - Lite · {seconds}s · {orientation}")
-            for res_name, res_enum, up_key in (
-                ("1080p", "VIDEO_RESOLUTION_1080P", "veo_3_1_upsampler_1080p"),
-                ("4k", "VIDEO_RESOLUTION_4K", "veo_3_1_upsampler_4k"),
-            ):
-                MODEL_CONFIG[f"{model_id}-{res_name}"] = {
-                    **cfg,
-                    "listed": False,
-                    "upsample": {"resolution": res_enum, "model_key": up_key},
-                }
-
-    def omni_cfg(
-        family_prefix: str,
-        seconds: int,
-        aspect_ratio: str,
-        *,
-        display_label: str,
-        resolution: Optional[str] = None,
-        upsample: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        res_suffix = "_360p" if resolution == "360p" else ""
-        cfg: Dict[str, Any] = {
-            "type": "video",
-            "video_type": "omni",
-            "model_key": f"{family_prefix}_t2v_{seconds}s{res_suffix}",
-            "reference_model_key": f"{family_prefix}_r2v_{seconds}s{res_suffix}",
-            "reference_duration": seconds,
-            "reference_model_display_name": display_label,
-            "aspect_ratio": aspect_ratio,
-            "supports_images": True,
-            "min_images": 0,
-            "max_images": 3,
-            "use_v2_model_config": True,
-            "allow_tier_upgrade": False,
-        }
-        if resolution:
-            cfg["video_resolution"] = resolution
-        if upsample:
-            cfg["upsample"] = upsample
-        return cfg
-
-    def register_hidden(model_id: str, config_entry: Dict[str, Any]):
-        entry = dict(config_entry)
-        entry["listed"] = False
-        MODEL_CONFIG[model_id] = entry
-
-    def register_hidden_upsamples(model_id: str, base_cfg: Dict[str, Any]):
-        for res_name, res_enum, up_key in (
-            ("1080p", "VIDEO_RESOLUTION_1080P", "veo_3_1_upsampler_1080p"),
-            ("4k", "VIDEO_RESOLUTION_4K", "veo_3_1_upsampler_4k"),
-        ):
-            register_hidden(
-                f"{model_id}-{res_name}",
-                {
-                    **base_cfg,
-                    "upsample": {"resolution": res_enum, "model_key": up_key},
-                },
-            )
-
-    # Omni 1.2 Flash (upstream family key: macaron_cookie; current Flow default).
-    omni_12_public_durations = {4, 6, 8, 10, 15}
-    for seconds in range(3, 16):
-        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
-            cfg_720 = omni_cfg(
-                "macaron_cookie", seconds, ratio, display_label="Omni 1.2 Flash"
-            )
-            cfg_360 = omni_cfg(
-                "macaron_cookie",
-                seconds,
-                ratio,
-                display_label="Omni 1.2 Flash",
-                resolution="360p",
-            )
-            model_id = f"omni-1.2-flash-{seconds}s-{orientation}"
-            model_id_360 = f"{model_id}-360p"
-            if seconds in omni_12_public_durations:
-                register(
-                    model_id, cfg_720, f"Omni 1.2 Flash · {seconds}s · {orientation}"
-                )
-                register(
-                    model_id_360,
-                    cfg_360,
-                    f"Omni 1.2 Flash · {seconds}s · {orientation} · 360p",
-                )
-            else:
-                register_hidden(model_id, cfg_720)
-                register_hidden(model_id_360, cfg_360)
-            register_hidden_upsamples(model_id, cfg_720)
-
-            # I2V: 3-10s supports start + optional end frame; 11-15s supports start frame only.
-            if seconds <= 10:
-                i2v_720 = {
-                    **i2v(f"macaron_cookie_i2v_fl_{seconds}s", ratio, max_images=2),
-                    "start_frame_model_key": f"macaron_cookie_i2v_{seconds}s",
-                }
-                i2v_360 = {
-                    **i2v(
-                        f"macaron_cookie_i2v_fl_{seconds}s_360p", ratio, max_images=2
-                    ),
-                    "start_frame_model_key": f"macaron_cookie_i2v_{seconds}s_360p",
-                    "video_resolution": "360p",
-                }
-            else:
-                i2v_720 = i2v(f"macaron_cookie_i2v_{seconds}s", ratio, max_images=1)
-                i2v_360 = {
-                    **i2v(f"macaron_cookie_i2v_{seconds}s_360p", ratio, max_images=1),
-                    "video_resolution": "360p",
-                }
-            i2v_id = f"omni-1.2-flash-i2v-{seconds}s-{orientation}"
-            i2v_id_360 = f"{i2v_id}-360p"
-            if seconds in omni_12_public_durations:
-                register(
-                    i2v_id, i2v_720, f"Omni 1.2 Flash I2V · {seconds}s · {orientation}"
-                )
-            else:
-                register_hidden(i2v_id, i2v_720)
-            register_hidden(i2v_id_360, i2v_360)
-            register_hidden_upsamples(i2v_id, i2v_720)
-
-            if seconds <= 10:
-                ext_720 = extend(f"macaron_cookie_extend_{seconds}s", ratio)
-                ext_360 = {
-                    **extend(f"macaron_cookie_extend_{seconds}s_360p", ratio),
-                    "video_resolution": "360p",
-                }
-                ext_id = f"omni-1.2-flash-extend-{seconds}s-{orientation}"
-                ext_id_360 = f"{ext_id}-360p"
-                if seconds in (4, 6, 8, 10):
-                    register(
-                        ext_id,
-                        ext_720,
-                        f"Omni 1.2 Flash Extend · {seconds}s · {orientation}",
-                    )
-                else:
-                    register_hidden(ext_id, ext_720)
-                register_hidden(ext_id_360, ext_360)
-                register_hidden_upsamples(ext_id, ext_720)
-
-        # Hidden raw upstream usage key aliases (landscape default + portrait suffix).
-        register_hidden(
-            f"macaron_cookie_t2v_{seconds}s",
-            omni_cfg("macaron_cookie", seconds, landscape, display_label="Omni 1.2 Flash"),
-        )
-        register_hidden(
-            f"macaron_cookie_t2v_{seconds}s_360p",
-            omni_cfg(
-                "macaron_cookie",
-                seconds,
-                landscape,
-                display_label="Omni 1.2 Flash",
-                resolution="360p",
-            ),
-        )
-        register_hidden(
-            f"macaron_cookie_r2v_{seconds}s",
-            omni_cfg("macaron_cookie", seconds, landscape, display_label="Omni 1.2 Flash"),
-        )
-        register_hidden(
-            f"macaron_cookie_r2v_{seconds}s_360p",
-            omni_cfg(
-                "macaron_cookie",
-                seconds,
-                landscape,
-                display_label="Omni 1.2 Flash",
-                resolution="360p",
-            ),
-        )
-        register_hidden(
-            f"macaron_cookie_i2v_{seconds}s",
-            i2v(f"macaron_cookie_i2v_{seconds}s", landscape, max_images=1),
-        )
-        register_hidden(
-            f"macaron_cookie_i2v_{seconds}s_360p",
-            {
-                **i2v(f"macaron_cookie_i2v_{seconds}s_360p", landscape, max_images=1),
-                "video_resolution": "360p",
-            },
-        )
-        if seconds <= 10:
-            register_hidden(
-                f"macaron_cookie_i2v_fl_{seconds}s",
-                {
-                    **i2v(f"macaron_cookie_i2v_fl_{seconds}s", landscape, max_images=2),
-                    "start_frame_model_key": f"macaron_cookie_i2v_{seconds}s",
-                },
-            )
-            register_hidden(
-                f"macaron_cookie_i2v_fl_{seconds}s_360p",
-                {
-                    **i2v(
-                        f"macaron_cookie_i2v_fl_{seconds}s_360p", landscape, max_images=2
-                    ),
-                    "start_frame_model_key": f"macaron_cookie_i2v_{seconds}s_360p",
-                    "video_resolution": "360p",
-                },
-            )
-            register_hidden(
-                f"macaron_cookie_extend_{seconds}s",
-                extend(f"macaron_cookie_extend_{seconds}s", landscape),
-            )
-            register_hidden(
-                f"macaron_cookie_extend_{seconds}s_360p",
-                {
-                    **extend(f"macaron_cookie_extend_{seconds}s_360p", landscape),
-                    "video_resolution": "360p",
-                },
-            )
-
-    for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
-        register_hidden(
-            f"omni-1.2-flash-{orientation}",
-            omni_cfg("macaron_cookie", 8, ratio, display_label="Omni 1.2 Flash"),
-        )
-        register_hidden(
-            f"omni-1.2-flash-{orientation}-360p",
-            omni_cfg(
-                "macaron_cookie",
-                8,
-                ratio,
-                display_label="Omni 1.2 Flash",
-                resolution="360p",
-            ),
-        )
-        register_hidden_upsamples(
-            f"omni-1.2-flash-{orientation}",
-            omni_cfg("macaron_cookie", 8, ratio, display_label="Omni 1.2 Flash"),
-        )
-        register_hidden(
-            f"omni-1.2-flash-i2v-{orientation}",
-            {
-                **i2v("macaron_cookie_i2v_fl_8s", ratio, max_images=2),
-                "start_frame_model_key": "macaron_cookie_i2v_8s",
-            },
-        )
-        register_hidden(
-            f"omni-1.2-flash-i2v-{orientation}-360p",
-            {
-                **i2v("macaron_cookie_i2v_fl_8s_360p", ratio, max_images=2),
-                "start_frame_model_key": "macaron_cookie_i2v_8s_360p",
-                "video_resolution": "360p",
-            },
-        )
-        register_hidden_upsamples(
-            f"omni-1.2-flash-i2v-{orientation}",
-            {
-                **i2v("macaron_cookie_i2v_fl_8s", ratio, max_images=2),
-                "start_frame_model_key": "macaron_cookie_i2v_8s",
-            },
-        )
-        register_hidden(
-            f"omni-1.2-flash-extend-{orientation}",
-            extend("macaron_cookie_extend_8s", ratio),
-        )
-        register_hidden(
-            f"omni-1.2-flash-extend-{orientation}-360p",
-            {
-                **extend("macaron_cookie_extend_8s_360p", ratio),
-                "video_resolution": "360p",
-            },
-        )
-        register_hidden_upsamples(
-            f"omni-1.2-flash-extend-{orientation}",
-            extend("macaron_cookie_extend_8s", ratio),
-        )
-
-    # Veo 3.1 Lite I2V, R2V, and Extend (active Veo family).
-    for seconds, start_key, fl_key in (
-        (4, "veo_3_1_i2v_s_lite_4s", "veo_3_1_i2v_s_lite_4s_fl"),
-        (6, "veo_3_1_i2v_s_lite_6s", "veo_3_1_i2v_s_lite_6s_fl"),
-        (8, "veo_3_1_i2v_lite", "veo_3_1_interpolation_lite"),
-    ):
-        for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
-            i2v_id = f"veo-3.1-lite-i2v-{seconds}s-{orientation}"
-            i2v_cfg = {
-                **i2v(fl_key, ratio),
-                "start_frame_model_key": start_key,
-            }
-            register(i2v_id, i2v_cfg, f"Veo 3.1 - Lite I2V · {seconds}s · {orientation}")
-            register_hidden_upsamples(i2v_id, i2v_cfg)
-
-    for orientation, ratio in (("landscape", landscape), ("portrait", portrait)):
-        r2v_id = f"veo-3.1-lite-r2v-8s-{orientation}"
-        r2v_cfg = r2v("veo_3_1_r2v_lite", ratio)
-        register(r2v_id, r2v_cfg, f"Veo 3.1 - Lite R2V · 8s · {orientation}")
-        register_hidden_upsamples(r2v_id, r2v_cfg)
-        ext_id = f"veo-3.1-lite-extend-8s-{orientation}"
-        ext_cfg = extend("veo_3_1_extension_lite", ratio)
-        register(ext_id, ext_cfg, f"Veo 3.1 - Lite Extend · {orientation}")
-        register_hidden_upsamples(ext_id, ext_cfg)
-
-    lite_default_cfg = t2v("veo_3_1_t2v_lite", landscape)
-    register(
-        "veo-3.1-lite",
-        lite_default_cfg,
-        "Veo 3.1 - Lite · 8s · landscape",
-    )
-    register_hidden_upsamples("veo-3.1-lite", lite_default_cfg)
-
-    omni_12_default_cfg = omni_cfg(
-        "macaron_cookie", 8, landscape, display_label="Omni 1.2 Flash"
-    )
-    register(
-        "omni-1.2-flash",
-        omni_12_default_cfg,
-        "Omni 1.2 Flash · 8s · landscape",
-    )
-    register_hidden_upsamples("omni-1.2-flash", omni_12_default_cfg)
-    register(
-        "omni-1.2-flash-360p",
-        omni_cfg(
-            "macaron_cookie",
-            8,
-            landscape,
-            display_label="Omni 1.2 Flash",
-            resolution="360p",
-        ),
-        "Omni 1.2 Flash · 8s · landscape · 360p",
-    )
-
-
-_apply_current_flow_model_catalog()
-
-
-def _known_video_model_keys() -> set[str]:
-    keys = {
-        cfg["model_key"]
-        for cfg in MODEL_CONFIG.values()
-        if cfg.get("type") == "video" and cfg.get("model_key")
-    }
-    keys.update(
-        cfg["start_frame_model_key"]
-        for cfg in MODEL_CONFIG.values()
-        if cfg.get("type") == "video" and cfg.get("start_frame_model_key")
-    )
-    return keys
-def _resolve_tier_two_model_key(model_key: str) -> str:
-    """Only upgrade to an ultra key when that exact upstream key is known valid."""
-    if "ultra" in model_key:
-        return model_key
-    if "_fl" in model_key:
-        candidate = model_key.replace("_fl", "_ultra_fl")
-    else:
-        candidate = model_key + "_ultra"
-    return candidate if candidate in _known_video_model_keys() else model_key
-
+from ..core.model_catalog import (  # noqa: E402
+    MODEL_CONFIG,
+    _known_video_model_keys,
+    _resolve_tier_two_model_key,
+)
 
 class GenerationHandler:
     """统一生成处理器"""
@@ -1460,20 +588,45 @@ class GenerationHandler:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    classified_failover = classify_flow_error(
+                        e,
+                        post_submit=bool(
+                            getattr(e, "submission_uncertain", False)
+                            or getattr(e, "outcome_unknown", False)
+                        ),
+                        billed_operation=(generation_type == "video"),
+                    )
                     if (
                         not caller_pinned_token
                         and token is not None
                         and token_attempt < max_token_attempts - 1
+                        and classified_failover.next_action != "reconcile"
                         and self._should_failover_token(e, generation_result)
                     ):
                         err_msg = str(e or "")
                         if hasattr(self.load_balancer, "mark_token_cooldown"):
-                            self.load_balancer.mark_token_cooldown(
-                                token.id, seconds=180.0, reason=err_msg[:120]
+                            cd_bucket = (
+                                resolve_cooldown_bucket(
+                                    model,
+                                    for_image=(generation_type == "image"),
+                                    for_video=(generation_type == "video"),
+                                    quota_model=classified_failover.quota_model,
+                                )
+                                if classified_failover.category == FlowErrorCategory.RATE_LIMIT
+                                else None
                             )
-                        if any(
-                            m in err_msg
-                            for m in ("登录态已失效", "登录已失效", "code=401", "认证失败")
+                            self.load_balancer.mark_token_cooldown(
+                                token.id,
+                                seconds=classified_failover.cooldown_seconds or 180.0,
+                                reason=err_msg[:120],
+                                bucket=cd_bucket,
+                            )
+                        if (
+                            classified_failover.category == FlowErrorCategory.AUTH_EXPIRED
+                            or any(
+                                m in err_msg
+                                for m in ("登录态已失效", "登录已失效", "code=401", "认证失败")
+                            )
                         ) and hasattr(self.token_manager, "schedule_auth_recovery"):
                             self.token_manager.schedule_auth_recovery(token.id)
                         if pending_token_state.get("active") and self.load_balancer:
@@ -1629,7 +782,15 @@ class GenerationHandler:
             )
             raise
         except Exception as e:
-            classified_err = classify_flow_error(e)
+            is_uncertain_submit = bool(
+                getattr(e, "submission_uncertain", False)
+                or getattr(e, "outcome_unknown", False)
+            )
+            classified_err = classify_flow_error(
+                e,
+                post_submit=is_uncertain_submit,
+                billed_operation=(generation_type == "video"),
+            )
             error_msg = redact_sensitive_text(
                 f"生成失败: {str(e).strip() or type(e).__name__}"
             )
@@ -1651,10 +812,21 @@ class GenerationHandler:
                         hasattr(self.load_balancer, "mark_token_cooldown")
                         and classified_err.cooldown_seconds > 0
                     ):
+                        cd_bucket = (
+                            resolve_cooldown_bucket(
+                                model,
+                                for_image=(generation_type == "image"),
+                                for_video=(generation_type == "video"),
+                                quota_model=classified_err.quota_model,
+                            )
+                            if classified_err.category == FlowErrorCategory.RATE_LIMIT
+                            else None
+                        )
                         self.load_balancer.mark_token_cooldown(
                             token.id,
                             seconds=classified_err.cooldown_seconds,
                             reason=error_msg[:120],
+                            bucket=cd_bucket,
                         )
                     debug_logger.log_info(
                         f"[GENERATION] 跳过 token 错误计数: token_id={token.id}, category={classified_err.category.value}, reason={error_msg[:200]}"
@@ -1667,12 +839,16 @@ class GenerationHandler:
             perf_trace["total_ms"] = int(duration * 1000)
             perf_trace["error"] = error_msg
             perf_trace["error_category"] = classified_err.category.value
+            perf_trace["charged"] = classified_err.charged
+            perf_trace["next_action"] = classified_err.next_action
             await self._log_request(
                 token.id if token else None,
                 request_operation if generation_type else "generate_unknown",
                 request_payload if "request_payload" in locals() else {"model": model},
                 {
                     "error": error_msg,
+                    "charged": classified_err.charged,
+                    "next_action": classified_err.next_action,
                     "error_category": classified_err.category.value,
                     "remediation_hint": classified_err.remediation_hint,
                     "performance": perf_trace,

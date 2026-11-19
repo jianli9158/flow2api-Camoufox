@@ -837,6 +837,7 @@ class CurrentFlowClientMixin:
             browser_id = None
             request_model_key = fallback_model_key or model_keys[0]
             submission_accepted = False
+            submit_dispatched = False
             try:
                 token, browser_id = await self._get_recaptcha_token(
                     project_id,
@@ -865,6 +866,7 @@ class CurrentFlowClientMixin:
                     video_media_id=video_media_id,
                     resolution=resolution,
                 )
+                submit_dispatched = True
                 payload = await self._current_rpc(
                     rpc_id=rpc_id,
                     argument=argument,
@@ -889,6 +891,33 @@ class CurrentFlowClientMixin:
                     or bool(getattr(error, "submission_uncertain", False))
                 ):
                     raise
+                if locals().get("submit_dispatched"):
+                    err_lower = str(error or "").lower()
+                    is_pre_connect_error = any(
+                        m in err_lower
+                        for m in (
+                            "connection timed out",
+                            "connection refused",
+                            "failed to connect",
+                            "could not resolve",
+                        )
+                    )
+                    if not is_pre_connect_error:
+                        post_classified = classify_flow_error(
+                            error, post_submit=True, billed_operation=True
+                        )
+                        if (
+                            post_classified.category == FlowErrorCategory.TRANSIENT_UPSTREAM
+                            and post_classified.next_action == "reconcile"
+                        ):
+                            try:
+                                setattr(error, "submission_uncertain", True)
+                            except Exception:
+                                pass
+                            debug_logger.log_warning(
+                                f"[VIDEO] RPC ({rpc_id}) 提交后发生响应超时/断连，按防重复扣费规则中止重试 (charged=maybe, next_action=reconcile): {error}"
+                            )
+                            raise
                 error_text = str(error).lower()
                 is_risk = "public_error_unusual_activity" in error_text
                 if is_risk:
@@ -3898,18 +3927,3 @@ class CurrentFlowClientMixin:
             "updatedFields": paths,
             "frontendRpc": "Kcr7Ub",
         }
-    async def _warmup_flow_video_frontend_context(
-        self, *args: Any, **kwargs: Any
-    ) -> None:
-        return None
-
-    async def _labs_trpc_get_with_st(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        raise RuntimeError("The retired Labs tRPC transport is disabled")
-
-    async def _labs_trpc_post_with_st(
-        self, *args: Any, **kwargs: Any
-    ) -> Dict[str, Any]:
-        raise RuntimeError("The retired Labs tRPC transport is disabled")
-
-    async def _aisandbox_request(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        raise RuntimeError("The retired AI Sandbox REST transport is disabled")

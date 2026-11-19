@@ -16,9 +16,8 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
   - **Gemini 兼容**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`（及 `/models/...` 路径），支持 `generationConfig.imageConfig` 动态分辨率与比例解析。
   - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、参考生视频 / 首帧生视频、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
 - **多账号调度、防误封自愈与断开取消**：
-  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）与 `default` / `polling` 策略，并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`）实现跨进程单账号 Profile 排他占用。
-  - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`，不重试不故障转移）、权限/等级不足（`403`，跳过 4K 放大重复重试）、限流/配额（`429`）与短暂 `401`/风控抖动（触发 `schedule_auth_recovery()`），杜绝虚假封禁与无意义重试；记录请求 `requested_model` 与上游 `observed_model` 归因并全程对敏感 Cookie/签名链接脱敏。
-  - 支持客户端断开实时传播：自动中止后台任务并向页内 `StreamChat` 发送 `AbortController` 取消信号，日志状态统一收敛为 `499`。
+  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）、按模型族精细冷却（如仅冷却配额耗尽的 `image:GEM_PIX_2` 而不影响 `BELUGA` / `Veo`）、等级成本感知路由（廉价生图优先 Free/Pro，保留 Ultra 给 4K/高阶任务），并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`，支持短时排队等待）实现跨进程 Profile 排他占用。
+  - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`）、权限/等级不足（`403`）、限流/配额（`429`，解析 `Retry-After` / `quotaResetTimeStamp`）、Google `/about` 二次身份核验（`identity_recheck_required`）与付费视频提交后响应超时防重复扣费（返回 `charged=maybe` / `next_action=reconcile` 停止盲目重试）；全程对敏感 Cookie/签名链接脱敏。
 - **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
 - **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
 
@@ -171,7 +170,7 @@ python main.py
 | | `DELETE /v1/flow/voices/{voice_ref}` | 删除自定义语音 |
 | **角色管理** | `GET /v1/flow/characters` / `GET /v1/flow/characters/{character_id}` | 列出或查询角色设定 |
 | | `POST /v1/flow/characters` / `PATCH /v1/flow/characters/{character_id}` / `DELETE /v1/flow/characters/{character_id}` | 创建（支持 `face_prompt` + `body_prompt` 两段式自动建图绑定）、更新或删除角色 |
-| **模型与视频链** | `GET /v1/flow/models` | 返回当前账号等级、积分与可用图像/视频模型矩阵 |
+| **模型与能力** | `GET /v1/flow/models` / `GET /v1/flow/capabilities` | 返回当前账号等级、积分与模型矩阵 / 零上游调用的能力声明（含 `noSpend` 与 `video.chain` 可用性） |
 | | `POST /v1/flow/videos` | 支持 `@角色名` / `@资产名` 自动解析与可选 SD 标签清理（`clean_prompt`），自动路由参考/首帧生视频 |
 | | `POST /v1/flow/videos/chain` | 顺序生成多段视频，通过 `ffmpeg`/`ffprobe` 提取尾帧串联下一段并无缝拼接（需本机安装 `ffmpeg`） |
 | **Creation Agent** | `POST /v1/flow/agent/chat` | 发起或继续 Agent 对话（`stream: true` 输出 SSE：`session` / `thinking` / `text` / `a2ui` / `media` / `permission` / `done` / `error`） |
@@ -179,8 +178,7 @@ python main.py
 | | `GET /v1/flow/agent/sessions` / `GET` / `PATCH` / `DELETE .../{session_id}` | 查询会话列表、读取历史轮次、重命名或删除会话 |
 | **偏好与设置** | `GET` / `PATCH /v1/flow/user/preferences` | 读取或更新 Flow 用户全局偏好（自动清框、水印开关等） |
 | | `GET` / `PATCH /v1/flow/projects/{project_id}/settings` | 读取或更新项目面板与默认生图/生视频配置 |
-| **MCP Server** | `GET / POST /mcp` | 内置 Streamable HTTP MCP 服务端（`initialize` / `tools/list` / `tools/call`），带令牌桶消费保护防 Agent 循环刷量 |
-
+| **MCP Server** | `GET / POST /mcp` | 内置 Streamable HTTP MCP 服务端（含 `resources/list`、`capabilities://self`、`no_spend` 禁扣费模式与令牌桶限流） |
 ### 控制台与监控端点
 
 - `GET /login`、`GET /manage`、`GET /test`：登录页、管理控制台、模型/Agent/语音工作台
@@ -236,15 +234,14 @@ asyncio.run(main())
 | 配置节 | 关键字段 | 默认值 | 说明 |
 |---|---|---|---|
 | `[global]` | `api_key`、`admin_username`、`admin_password` | `"han1234"` / `"admin"` | API 密钥与后台管理员凭证 |
-| `[server]` | `host`、`port` | `"0.0.0.0"` / `8000` | 服务监听地址（支持环境变量 `FLOW2API_SERVER_PORT` 覆盖） |
-| `[captcha]` | `captcha_method`、`browser_engine` | `"camoufox"` | 浏览器引擎；`browser_in_page_rpc = true` 开启页面内 XHR/StreamChat |
-| `[captcha]` | `browser_count`、`browser_personal_fresh_restart_every_n_solves` | `1` / `10` | 常驻 Camoufox 槽位数量与每 N 次成功求解后轮换重启阈值（`0` 为禁用） |
-| `[captcha]` | `browser_flow_page_warmup_seconds`、`personal_project_pool_size` | `6.0` / `4` | Flow 页面预热等待时间与单账号默认项目池大小 |
+| `[server]` | `host`、`port`、`path_prefix` | `"0.0.0.0"` / `8000` / `""` | 服务监听地址与可选反代子路径（支持 `FLOW2API_SERVER_PORT`、`FLOW2API_PATH_PREFIX`） |
+| `[flow]` | `clean_prompt` | `false` | 是否默认清理 `8k`/`masterpiece` 等遗留 SD 冗余标签 |
+| `[captcha]` | `captcha_method`、`browser_count`、`personal_project_pool_size` | `"camoufox"` / `1` / `4` | Camoufox + WebDriver BiDi 槽位池与单账号默认项目池大小 |
+| `[mcp]` | `no_spend` | `false` | 开启后（或通过 `FLOW2API_MCP_NO_SPEND=1` / `X-Flow-No-Spend: 1`）隐藏并拦截付费视频工具 |
 | `[generation]` | `image_timeout`、`video_timeout` | `300` / `1500` | 图像与视频生成超时上限（秒） |
-| `[call_logic]` | `call_mode` | `"default"` | `"default"`（负载均衡）或 `"polling"`（稳定顺序轮询） |
+| `[call_logic]` | `call_mode` | `"default"` | `"default"`（负载与等级成本感知调度）或 `"polling"`（稳定顺序轮询） |
 | `[cache]` | `enabled`、`timeout`、`base_url` | `false` / `7200` / `""` | 本地媒体文件缓存、过期清理时间（`0` 永不过期）与外链访问域名 |
 | `[proxy]` | `proxy_enabled`、`proxy_url` | `false` / `""` | 协议回退与下载代理（支持 `http://` 与 `socks5://`） |
-
 ---
 
 ## 许可证
