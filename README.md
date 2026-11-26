@@ -10,18 +10,19 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
 ## 核心能力
 
 - **Camoufox + WebDriver BiDi 双 Tab 隔离与分层执行管线**：模块化浏览器运行时（`camoufox_bidi.py`、`camoufox_fingerprint.py`、`bidi_transport.py`、`camoufox_profile.py`、`camoufox_login.py`）为每个账号锁定持久化 Windows 10/11 指纹（`camoufox-fingerprint.json`）、WebGL/字体子集与独立 Firefox Profile（`browser_data_rt/token_<id>/`）：
-  - **同进程双 Tab 隔离**：同一 Camoufox 进程内分离 **API Tab**（常驻 `flow.google.com`，专责 `WIZ_global_data`、同源 `batchexecute` RPC 与 `StreamChat`）与 **打码 Tab**（专责人类轨迹预热与 `grecaptcha.enterprise.execute`），共享同一份 Cookie / TLS / 代理而互不污染页面缓存；遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 时独立清理 `_GRECAPTCHA` 并销毁重建打码 Tab 自动重试，不中断 API 会话且不再持久化瞬态 `_GRECAPTCHA` Cookie。
-  - **控制面分层路由**：只读查询与视频状态轮询 RPC（`Zzl0ze` 20s 缓存与单飞合并、`jwpduf`、`as29s`、`nzlxg`、`wDg3C`、Agent 会话、用户/项目设置等）优先走连接池化的 `curl_cffi` HTTP 控制面（遇风控自动回退浏览器），彻底减少对打码槽位的抢占。
+  - **同进程双 Tab 隔离与并发排队**：同一 Camoufox 进程内分离 **API Tab**（常驻 `flow.google.com`，专责 `WIZ_global_data`、同源 `batchexecute` RPC 与 `StreamChat`）与 **打码 Tab**（专责人类轨迹预热与 `grecaptcha.enterprise.execute`），共享同一份 Cookie / TLS / 代理而互不污染页面缓存；同账号并发请求在槽位条件变量上排队共享而非 502 冲突，遇 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 自动隔离清理 `_GRECAPTCHA` 并重建打码 Tab；子进程启用独立进程组回收防止僵尸残留，空闲裁剪结合 SQLite WAL 瘦身与临时目录回收。
+  - **控制面分层路由与流式缓存**：只读查询与视频状态轮询 RPC（`Zzl0ze` 20s 缓存与单飞合并、`jwpduf`、`as29s`、`nzlxg`、`wDg3C`、Agent 会话、用户/项目设置等）优先走按账号/代理池化复用的 `curl_cffi` HTTP 控制面（单次 RPC 绑定固定代理、CAS 原子回写旋转 Cookie、遇风控自动回退浏览器），大媒体拉取与本地缓存统一流式分片写 `.part` 原子落盘。
 - **三协议标准 API 兼容**：
-  - **OpenAI 标准接口**：`GET /v1/models`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式），仅公开 **10 个标准基础模型**，通过参数控制比例/清晰度/时长（图像默认 `16:9` + `2K`）。
-  - **Gemini / AI Studio 标准接口**：`GET /v1beta/models`、`GET /v1beta/models/{model}`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:predict`（及 `/models/...` 路径），直接通过 `generationConfig.imageConfig` / `videoConfig` / `parameters` 控制比例、清晰度与时长。
-  - **Flow 原生特征接口 (`/v1/flow/*`) 与内置 MCP (`/mcp`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD 与两段式自动建角、参考生视频 / 首帧生视频 / 多段串联、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置、Streamable HTTP MCP。
-- **多 API Key 与按 Key 模型权限隔离**：保留主密钥默认公开全部模型，同时可在管理控制台（系统配置 → 安全配置）或 `/api/admin/apikeys` 创建多个受管子 API Key，按 Key 精确或通配符指定可见与可调用的模型集合，在 OpenAI / Gemini / Flow / MCP 全协议生效。
-- **多账号调度、防误封自愈与断开取消**：
-  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）、按模型族精细冷却（如仅冷却配额耗尽的 `image:GEM_PIX_2` 而不影响 `BELUGA` / `Veo`）、等级成本感知路由（廉价生图优先 Free/Pro，保留 Ultra 给 4K/高阶任务），并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`，支持短时排队等待）实现跨进程 Profile 排他占用。
-  - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`）、权限/等级不足（`403`）、限流/配额（`429`，解析 `Retry-After` / `quotaResetTimeStamp`）、Google `/about` 二次身份核验（`identity_recheck_required`）与付费视频提交后响应超时防重复扣费（返回 `charged=maybe` / `next_action=reconcile` 停止盲目重试）；全程对敏感 Cookie/签名链接脱敏。
-- **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
-- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、AI Studio 风格画面比例/清晰度/时长参数面板、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
+  - **OpenAI 标准接口**：`GET /v1/models`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式），仅公开 **10 个标准基础模型**，通过参数控制比例/清晰度/时长（图像默认 `16:9` + `2K`，`n > 1` 并发生成）。
+  - **Gemini / AI Studio 标准接口**：`GET /v1beta/models`、`GET /v1beta/models/{model}`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:predict`（及 `/models/...` 路径，兼容 `imagen-3*` 别名与 `sampleCount > 1` 并发生成），直接通过 `generationConfig.imageConfig` / `videoConfig` / `parameters` 控制比例、清晰度与时长。
+  - **Flow 原生特征接口 (`/v1/flow/*`) 与内置 MCP (`/mcp`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD 与两段式自动建角、参考生视频 / 首尾帧生视频 / 多段串联、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置、Streamable HTTP MCP；全链路统一接入账号原子用量/成功/错误记账。
+- **多 API Key 与按 Key 模型权限隔离**：保留主密钥默认公开全部模型，同时可在管理控制台（系统配置 → 安全配置）或 `/api/admin/apikeys` 创建多个受管子 API Key，按 Key 精确或通配符指定可见与可调用的模型集合，在 OpenAI / Gemini / Flow（含 4s/6s Veo 变体）/ MCP 全协议生效。
+- **多账号调度、安全加固与自愈能力**：
+  - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）、预占式并发防惊群、按模型族精细冷却（如仅冷却配额耗尽的 `image:GEM_PIX_2` 而不影响 `BELUGA` / `Veo`）、等级成本感知路由（廉价生图优先 Free/Pro，保留 Ultra 给 4K/高阶任务），并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`）实现跨进程 Profile 排他占用。
+  - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`）、权限/等级不足（`403`）、限流/配额（`429`，解析 `Retry-After` / `quotaResetTimeStamp` 并自动解禁）、Google `/about` 二次身份核验（`identity_recheck_required`）与付费视频提交后响应超时防重复扣费（返回 `charged=maybe` / `next_action=reconcile`）；支持 SSE 客户端断开即时取消上游、启动自动恢复孤儿任务与定时清理历史任务。
+  - **边界安全防护**：出站下载逐跳禁用自动重定向并校验 SSRF 与流式体积上限（图片 50MB / 视频拼接 300MB）；二进制/非法编码入参安全返回 `422`/`400` 避免 500 崩溃；SQL 更新列白名单校验；完整适配 `X-Forwarded-Host` / `X-Forwarded-Proto` 与 `[server].path_prefix` 反代部署。
+- **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流（反代 Origin 适配、WS 在线自动抑制重复截图轮询）与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
+- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，通过 `GET /api/admin/bootstrap` 单请求完成首屏与配置聚合初始化，移除内联字符串拼接事件防范 XSS；支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、AI Studio 风格参数面板、Camoufox 槽位池实时监控、Score 检测、自动刷新请求日志以及 Creation Agent / 30 种预设音色试听与角色交互测试。
 ---
 
 ## 系统架构
@@ -45,7 +46,7 @@ flowchart LR
 ### 环境要求
 
 - **Python**：3.10+（推荐 3.11–3.13）
-- **浏览器运行时**：无需手动安装 Chrome 或 Playwright；首次启动服务或打开浏览器登录时，`src/services/camoufox_bidi.py` 会按宿主机架构（macOS `arm64`/`x86_64`、Linux `x86_64`/`arm64`、Windows `x86_64`）自动下载并解压 Camoufox 至 `.runtime/camoufox/`（或复用本地 `CAMOUFOX_PATH`）。
+- **浏览器运行时**：无需手动安装 Chrome 或 Playwright；首次启动服务或打开浏览器登录时，`src/services/camoufox_fingerprint.py` 会按宿主机架构（macOS `arm64`/`x86_64`、Linux `x86_64`/`arm64`、Windows `x86_64`）加锁自动下载并校验解压 Camoufox 至 `./runtime/camoufox/`（或复用本地 `CAMOUFOX_PATH`）。
 
 ### 本地源码部署
 
@@ -74,14 +75,14 @@ python main.py
    cp -n config/setting_example.toml config/setting.toml
    docker compose up -d --build
    ```
-   容器内置 GTK3 / X11 / 音频共享库支持无头 Camoufox，持久化挂载 `./data`、`./tmp`、`./browser_data_rt` 与 `./config/setting.toml`，宿主机映射端口 **`38000:8000`**（访问 `http://localhost:38000`）。
+   容器内置 GTK3 / X11 / 音频共享库支持无头 Camoufox，启用 `init: true` 与 `shm_size: "2gb"`，持久化挂载 `./data`、`./tmp`、`./browser_data_rt`、`./runtime` 与 `./config/setting.toml`，宿主机映射端口 **`38000:8000`**（访问 `http://localhost:38000`）。
 
 2. **搭配 WARP 代理容器部署（`docker-compose.proxy.yml`）**
    ```bash
-   cp -n config/setting_example.toml config/setting_warp.toml
+   cp -n config/setting_example.toml config/setting.toml
    docker compose -f docker-compose.proxy.yml up -d --build
    ```
-   同时拉起 `caomingjun/warp` 容器并在 `31080:1080` 暴露 SOCKS5 入口。
+   同时拉起 `caomingjun/warp` 容器（状态卷独立挂载至 `./data/warp`），并将 SOCKS5 入口安全绑定至本机 **`127.0.0.1:31080:1080`**。
 
 3. **Xvfb 有头环境部署（`docker-compose.headed.yml`）**
    ```bash
@@ -107,9 +108,9 @@ python main.py
 
 | 标准模型 ID | 兼容别名 | 上游引擎 | 支持参数与默认值 |
 |---|---|---|---|
-| `gemini-3.1-flash-image` | `gemini-3.1-flash-image-preview`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` | `aspectRatio`: `16:9`（默认）、`9:16`、`1:1`、`4:3`、`3:4`<br>`imageSize`: `2K`（默认）、`1K`、`4K` |
+| `gemini-3.1-flash-image` | `gemini-3.1-flash-image-preview`、`nano-banana-2.1`、`nano-banana-2`、`imagen-3.0-fast-generate-001` | `BELUGA` | `aspectRatio`: `16:9`（默认）、`9:16`、`1:1`、`4:3`、`3:4`<br>`imageSize`: `2K`（默认）、`1K`、`4K` |
 | `gemini-3.1-flash-lite-image` | `gemini-3.1-flash-lite-image-preview`、`nano-banana-2-lite` | `HARBOR_SEAL` | 同上（默认 `16:9` + `2K`） |
-| `gemini-3.0-pro-image` | `gemini-3-pro-image`、`gemini-3-pro-image-preview`、`nano-banana-pro` | `GEM_PIX_2` | 同上（默认 `16:9` + `2K`） |
+| `gemini-3.0-pro-image` | `gemini-3-pro-image`、`gemini-3-pro-image-preview`、`nano-banana-pro`、`imagen-3.0-generate-002`、`imagen-3.0-generate-001`、`imagen-3` | `GEM_PIX_2` | 同上（默认 `16:9` + `2K`） |
 
 > - 不传任何参数时默认生成 **16:9 横屏 2K** 图片；图生图未显式传 `aspectRatio` 时自动跟随参考图比例。
 > - `aspectRatio` 还支持任意 `W:H`（如 `3:2`、`21:9`）或 OpenAI `size`（如 `1024x1024`、`1792x1024`），自动匹配最接近的 Flow 原生比例；显式传 `imageSize: "1K"` 或 `quality: "standard"` 可回落到 1K 基础图（Free 账号可用），传 `imageSize: "4K"` 或 `quality: "hd"` 可升至 4K（Ultra 账号）。
@@ -241,7 +242,8 @@ python main.py
 ### 控制台与监控端点
 
 - `GET /login`、`GET /manage`、`GET /test`：登录页、管理控制台、模型/Agent/语音工作台
-- `GET /metrics`：Prometheus 监控指标输出
+- `GET /api/admin/bootstrap`：管理控制台首屏与系统配置单请求聚合初始化接口
+- `GET /metrics`：Prometheus 监控指标输出（单锁批量采集在途快照）
 - `GET /api/captcha/browser-stats` & `POST /api/captcha/score-test`：Camoufox 槽位实时状态与站点 reCAPTCHA 分数实测
 - `POST /api/tokens/browser-login/start` & `WS /api/tokens/browser-login/ws/{session_id}`：启动 LiveView 远程登录会话与帧流转发
 
