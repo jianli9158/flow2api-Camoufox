@@ -10,13 +10,13 @@
 
 ## 1. 鉴权方式
 
-所有 `/v1/flow/*` 接口均校验 `[global].api_key`（默认 `han1234`），支持任意以下一种传参方式：
+所有 `/v1/flow/*` 接口均校验 `[global].api_key`（默认主密钥 `han1234`，公开全部模型）或在后台「系统配置 → 安全配置 → 多 API Key 管理」（`/api/admin/apikeys`）创建的受管子 API Key，支持任意以下一种传参方式：
 
 1. HTTP Header：`Authorization: Bearer <api_key>`
 2. HTTP Header：`x-goog-api-key: <api_key>`
 3. URL Query 参数：`?key=<api_key>`
 
----
+> 若子 API Key 限制了公开模型列表，`/v1/flow/models` 与 MCP `flow_list_models` 会自动按该 Key 过滤；调用未公开模型将返回 HTTP `403`（MCP 返回 JSON-RPC `-32031`，`charged: "no"`）。
 
 ## 2. 账号与项目绑定机制（必读）
 
@@ -343,8 +343,7 @@ curl -s -X PATCH "http://127.0.0.1:8001/v1/flow/projects/<project_uuid>/settings
 
 #### 22) 查询账号能力与模型目录：`GET /v1/flow/models`
 - **Query 参数**：`email?: string`, `token_id?: int`
-- 返回账号订阅等级（`accountTier`）、剩余积分（`credits`）、`imageModels`、`videoModels`（含 `supported` 等级判定）、`nativeVideoModels` 与 `supportedResolutions`。
-
+- 返回账号订阅等级（`accountTier`）、剩余积分（`credits`）、精简后的标准 `imageModels`（3 个，默认 `16:9` + `2K`）与 `videoModels`（7 个，均含 `defaultAspectRatio`、`supportedAspectRatios`、`supportedImageSizes` / `supportedDurations` / `supportedResolutions` 与 `supported` 等级判定）、`nativeVideoModels` 与 `supportedResolutions`。
 #### 23) 两段式自动建角（Face -> Body Saga）：`POST /v1/flow/characters`
 - 除原有 `display_name` / `voice_id` / `personality_notes` / `image_refs` 外，新增可选参数：
   - `face_prompt?: string`：自动生成角色面部参考图并绑定；
@@ -370,7 +369,7 @@ curl -s -X PATCH "http://127.0.0.1:8001/v1/flow/projects/<project_uuid>/settings
 - `/v1/flow/*` 错误响应附带 `X-Flow-Error-Category`、`X-Flow-Charged`（`no` / `maybe` / `yes`）、`X-Flow-Next-Action`（`retry` / `retry_after` / `reauth` / `fix_input` / `reconcile` / `none`）及 `Retry-After` 响应头。
 
 #### 27) 内置 Streamable HTTP MCP 服务端：`GET / POST /mcp`
-- 使用标准 `Authorization: Bearer <api_key>` 或 `x-goog-api-key` 鉴权。
-- 支持 JSON-RPC 2.0 `initialize`、`ping`、`resources/list`、`resources/read`（`capabilities://self`）、`tools/list`、`tools/call`（内置 9 个工具）。
+- 使用标准 `Authorization: Bearer <api_key>` 或 `x-goog-api-key` 鉴权（遵循多 API Key 模型权限隔离，越权返回 HTTP `403` / JSON-RPC `-32031`）。
+- 支持 JSON-RPC 2.0 `initialize`、`ping`、`resources/list`、`resources/read`（`capabilities://self`）、`tools/list`、`tools/call`（内置 9 个工具；`flow_generate_image` 默认 `model="gemini-3.1-flash-image"`、`aspect_ratio="16:9"`、`image_size="2K"`）。
 - 支持 `no_spend` 禁扣费模式（`[mcp].no_spend = true`、`FLOW2API_MCP_NO_SPEND=1` 或请求头 `X-Flow-No-Spend: 1`）：隐藏并拦截消耗 Veo 积分的 `flow_generate_video`（返回 HTTP `403` / JSON-RPC `-32030`）。
 - 高消费工具内置令牌桶限流（容量 8，每 20s 恢复 1 枚），超限返回 JSON-RPC `-32029`（HTTP `429`）。

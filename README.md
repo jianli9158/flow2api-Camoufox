@@ -2,8 +2,9 @@
 
 **基于 Camoufox + WebDriver BiDi 原生浏览器管线的 Google Flow OpenAI / Gemini / Flow 原生兼容网关**
 
-Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDriver BiDi 协议直接驱动 `flow.google.com` 页面内原生交互与同源 RPC，将 Google Flow 的图像生成、视频生成（文生 / 图生 / 多图 / 续写 / 高清放大）、TTS 语音合成、持久化角色库、以及多轮 Creation Agent 统一封装为标准 OpenAI、Gemini 与 `/v1/flow/*` REST/SSE 接口。
+> 本项目基于开源项目 **[TheSmallHanCat/flow2api](https://github.com/TheSmallHanCat/flow2api)** 深度优化升级，重构了浏览器运行时（Camoufox + WebDriver BiDi 双 Tab 隔离）、防风控/热槽位调度、标准 OpenAI & Gemini/AI Studio 参数化 API、多 API Key 权限隔离、Flow 原生特性接口（`/v1/flow/*`）及内置 MCP 服务端。
 
+Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDriver BiDi 协议直接驱动 `flow.google.com` 页面内原生交互与同源 RPC，将 Google Flow 的图像生成、视频生成（文生 / 图生 / 多图 / 续写 / 高清放大）、TTS 语音合成、持久化角色库、以及多轮 Creation Agent 统一封装为标准 OpenAI、Gemini / AI Studio、`/v1/flow/*` REST/SSE 与 `/mcp` 接口。
 ---
 
 ## 核心能力
@@ -12,22 +13,22 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
   - **同进程双 Tab 隔离**：同一 Camoufox 进程内分离 **API Tab**（常驻 `flow.google.com`，专责 `WIZ_global_data`、同源 `batchexecute` RPC 与 `StreamChat`）与 **打码 Tab**（专责人类轨迹预热与 `grecaptcha.enterprise.execute`），共享同一份 Cookie / TLS / 代理而互不污染页面缓存；遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 时独立清理 `_GRECAPTCHA` 并销毁重建打码 Tab 自动重试，不中断 API 会话且不再持久化瞬态 `_GRECAPTCHA` Cookie。
   - **控制面分层路由**：只读查询与视频状态轮询 RPC（`Zzl0ze` 20s 缓存与单飞合并、`jwpduf`、`as29s`、`nzlxg`、`wDg3C`、Agent 会话、用户/项目设置等）优先走连接池化的 `curl_cffi` HTTP 控制面（遇风控自动回退浏览器），彻底减少对打码槽位的抢占。
 - **三协议标准 API 兼容**：
-  - **OpenAI 标准接口**：`GET /v1/models`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式）。
-  - **Gemini / AI Studio 标准接口**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:predict`（及 `/models/...` 路径），直接通过 `generationConfig.imageConfig` / `videoConfig` / `parameters` 控制比例、清晰度与时长。
-  - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、参考生视频 / 首帧生视频、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
+  - **OpenAI 标准接口**：`GET /v1/models`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式），仅公开 **10 个标准基础模型**，通过参数控制比例/清晰度/时长（图像默认 `16:9` + `2K`）。
+  - **Gemini / AI Studio 标准接口**：`GET /v1beta/models`、`GET /v1beta/models/{model}`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:predict`（及 `/models/...` 路径），直接通过 `generationConfig.imageConfig` / `videoConfig` / `parameters` 控制比例、清晰度与时长。
+  - **Flow 原生特征接口 (`/v1/flow/*`) 与内置 MCP (`/mcp`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD 与两段式自动建角、参考生视频 / 首帧生视频 / 多段串联、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置、Streamable HTTP MCP。
+- **多 API Key 与按 Key 模型权限隔离**：保留主密钥默认公开全部模型，同时可在管理控制台（系统配置 → 安全配置）或 `/api/admin/apikeys` 创建多个受管子 API Key，按 Key 精确或通配符指定可见与可调用的模型集合，在 OpenAI / Gemini / Flow / MCP 全协议生效。
 - **多账号调度、防误封自愈与断开取消**：
   - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）、按模型族精细冷却（如仅冷却配额耗尽的 `image:GEM_PIX_2` 而不影响 `BELUGA` / `Veo`）、等级成本感知路由（廉价生图优先 Free/Pro，保留 Ultra 给 4K/高阶任务），并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`，支持短时排队等待）实现跨进程 Profile 排他占用。
   - 基于结构化错误分类（`src/core/flow_errors.py`），严格区分内容安全（`400`）、权限/等级不足（`403`）、限流/配额（`429`，解析 `Retry-After` / `quotaResetTimeStamp`）、Google `/about` 二次身份核验（`identity_recheck_required`）与付费视频提交后响应超时防重复扣费（返回 `charged=maybe` / `next_action=reconcile` 停止盲目重试）；全程对敏感 Cookie/签名链接脱敏。
 - **LiveView 网页远程登录向导**：管理后台内置 WebSocket 实时画面流与键鼠转发，无需安装桌面环境或 Xvfb，在浏览器控制台即可完成 Google 账号登录并自动落盘完整凭证与指纹档案。
-- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
-
+- **零外部 CDN 的重构控制台**：登录页（`/login`）、管理控制台（`/manage`）与工作台（`/test`）共用本地设计系统 `static/console.css`，支持浅色/深色主题切换、中英双语（`zh-CN` / `en`）、AI Studio 风格画面比例/清晰度/时长参数面板、Camoufox 槽位池实时监控、Score 检测、日志过滤以及 Creation Agent / 30 种预设音色试听与角色交互测试。
 ---
 
 ## 系统架构
 
 ```mermaid
 flowchart LR
-    Client["客户端<br/>OpenAI / Gemini / Flow REST"] --> API["FastAPI 网关<br/>/v1/chat/completions · /v1beta/models/* · /v1/flow/*"]
+    Client["客户端<br/>OpenAI / Gemini / Flow / MCP"] --> API["FastAPI 网关<br/>/v1/images/* · /v1/chat/completions · /v1beta/models/* · /v1/flow/* · /mcp"]
     API --> Core["TokenManager & LoadBalancer<br/>热槽位亲和 · 防误封自愈 · 断开取消 499"]
     Core -->|控制面/轮询 HTTP-First| HTTP["curl_cffi 连接池<br/>Zzl0ze 缓存 · jwpduf · as29s"]
     Core -->|高风险提交/打码| Pool["BrowserCaptchaService<br/>单 Profile 排他槽位池"]
@@ -133,7 +134,7 @@ python main.py
 
 ### 标准 OpenAI 与 Gemini / AI Studio 生成接口
 
-- **OpenAI 标准生图 `POST /v1/images/generations`**（及图生图编辑 `POST /v1/images/edits`，支持 `multipart/form-data` 与 JSON；不传参数默认 `16:9` + `2K`）
+- **OpenAI 标准生图 `POST /v1/images/generations`**（不传参数默认 `model="gemini-3.1-flash-image"`、`16:9` + `2K`；支持 `n` 1–4、`size`、`quality`、`aspect_ratio`、`image_size`、`response_format`: `"url"` | `"b64_json"`）
   ```bash
   curl -X POST "http://localhost:8000/v1/images/generations" \
     -H "Authorization: Bearer han1234" \
@@ -147,8 +148,20 @@ python main.py
     }'
   ```
 
-- **Gemini / AI Studio 标准生图 `POST /v1beta/models/{model}:generateContent`**（同时支持 `:streamGenerateContent` 与 Imagen `:predict`）
+- **OpenAI 标准图生图编辑 `POST /v1/images/edits`**（支持 `multipart/form-data` 上传文件或 JSON `image`/`images` 传入 URL / Data URL / Base64）
   ```bash
+  curl -X POST "http://localhost:8000/v1/images/edits" \
+    -H "Authorization: Bearer han1234" \
+    -F "model=gemini-3.1-flash-image" \
+    -F "prompt=把背景改成黄昏樱花街道，保持主体不变" \
+    -F "aspect_ratio=1:1" \
+    -F "image_size=2K" \
+    -F "image=@./ref.png"
+  ```
+
+- **Gemini / AI Studio 标准接口 `POST /v1beta/models/{model}:generateContent`**（同时支持 `:streamGenerateContent` 及 `/models/...` 路径，返回干净的标准 `modelVersion`）
+  ```bash
+  # 图片生成（通过 generationConfig.imageConfig 控制比例与清晰度；不传默认 16:9 + 2K）
   curl -X POST "http://localhost:8000/v1beta/models/gemini-3.1-flash-image:generateContent" \
     -H "x-goog-api-key: han1234" \
     -H "Content-Type: application/json" \
@@ -159,9 +172,31 @@ python main.py
         "imageConfig": {"aspectRatio": "9:16", "imageSize": "2K"}
       }
     }'
+
+  # 视频生成（通过 generationConfig.videoConfig 控制比例、时长与分辨率）
+  curl -X POST "http://localhost:8000/v1beta/models/veo-3.1-lite:generateContent" \
+    -H "x-goog-api-key: han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "contents": [{"role": "user", "parts": [{"text": "无人机航拍海岸公路日落，缓慢推进"}]}],
+      "generationConfig": {
+        "videoConfig": {"aspectRatio": "16:9", "durationSeconds": 6, "resolution": "1080p"}
+      }
+    }'
   ```
 
-- **OpenAI Chat 统一接口 `POST /v1/chat/completions`**（支持 `stream: true` 实时推流进度）
+- **Gemini / Imagen 标准预测接口 `POST /v1beta/models/{model}:predict`**（同时挂载在 `/models/{model}:predict`，返回 `predictions[].{bytesBase64Encoded, mimeType}`）
+  ```bash
+  curl -X POST "http://localhost:8000/v1beta/models/gemini-3.1-flash-image:predict" \
+    -H "x-goog-api-key: han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "instances": [{"prompt": "棚拍极简玻璃茶壶，柔和自然光"}],
+      "parameters": {"aspectRatio": "4:3", "imageSize": "2K", "sampleCount": 1}
+    }'
+  ```
+
+- **OpenAI Chat 统一接口 `POST /v1/chat/completions`**（支持 `stream: true` 实时推流进度；图生图/图生视频可在 `messages[].content` 传入 `image_url`，视频续写传入 `extend://<source_mediaGenerationId>`）
   ```bash
   curl -X POST "http://localhost:8000/v1/chat/completions" \
     -H "Authorization: Bearer han1234" \
@@ -173,18 +208,12 @@ python main.py
       "stream": true
     }'
   ```
-- **图生图 / 图生视频**：在 `messages[].content` 传入 `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` 或图片 URL。
-- **视频续写**：传入 `{"type": "image_url", "image_url": {"url": "extend://<source_mediaGenerationId>"}}`。
-- **`POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent`**（同时挂载在 `/models/...`）：
-  ```bash
-  curl -X POST "http://localhost:8000/v1beta/models/gemini-3.1-flash-image:generateContent" \
-    -H "x-goog-api-key: han1234" \
-    -H "Content-Type: application/json" \
-    -d '{
-      "contents": [{"role": "user", "parts": [{"text": "棚拍极简玻璃茶壶，柔和自然光"}]}],
-      "generationConfig": {"responseModalities": ["IMAGE"], "imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}}
-    }'
-  ```
+
+### 多 API Key 与按 Key 模型隔离
+
+- 在控制台 **系统配置 → 安全配置 → 多 API Key 管理**（或管理员接口 `GET/POST /api/admin/apikeys`、`PUT/DELETE /api/admin/apikeys/{id}`）可创建多个子 API Key，分别勾选公开的标准模型或配置 `*`/`?` 通配符规则（如 `gemini-3.1-flash-image`、`veo-3.1-lite*`、`macaron_cookie_r2v_*`）。
+- 子 Key 仅在 `/v1/models`、`/v1beta/models`、`/v1/flow/models` 与 MCP `flow_list_models` 中看到各自授权的模型；越权调用未公开模型将在扣费与触发上游前直接拦截，返回 HTTP `403`（Gemini 返回 `PERMISSION_DENIED`，MCP 返回 JSON-RPC `-32031`）。
+- 授权某标准模型（例如 `gemini-3.1-flash-image`）后，自动覆盖该模型全部 `aspectRatio`/`imageSize` 参数组合及对应 AI Studio 别名（如 `gemini-3.1-flash-image-preview`）。
 
 ### Flow 原生特征接口 (`/v1/flow/*`)
 
@@ -273,7 +302,7 @@ asyncio.run(main())
 | `[cache]` | `enabled`、`timeout`、`base_url` | `false` / `7200` / `""` | 本地媒体文件缓存、过期清理时间（`0` 永不过期）与外链访问域名 |
 | `[proxy]` | `proxy_enabled`、`proxy_url` | `false` / `""` | 协议回退与下载代理（支持 `http://` 与 `socks5://`） |
 ---
+## 致谢与许可证
 
-## 许可证
-
-本项目基于 [MIT 许可证](LICENSE) 开源。
+- 本项目基于 [TheSmallHanCat/flow2api](https://github.com/TheSmallHanCat/flow2api) 进行优化与功能升级，感谢原作者的开源贡献。
+- 本项目遵循 [MIT 许可证](LICENSE) 开源。
