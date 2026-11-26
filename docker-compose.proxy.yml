@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   flow2api:
+    init: true
     build:
       context: .
       dockerfile: Dockerfile
@@ -13,10 +14,12 @@ services:
       - ./data:/app/data
       - ./tmp:/app/tmp
       - ./browser_data_rt:/app/browser_data_rt
-      - ./config/setting_warp.toml:/app/config/setting.toml
+      - ./runtime:/app/runtime
+      - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
       - FLOW2API_SERVER_PORT=8000
+    shm_size: "2gb"
     restart: unless-stopped
     depends_on:
       - warp
@@ -28,7 +31,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "31080:1080"
+      - "127.0.0.1:31080:1080"
     environment:
       - WARP_SLEEP=2
     cap_add:
@@ -39,4 +42,4 @@ services:
       - net.ipv6.conf.all.disable_ipv6=0
       - net.ipv4.conf.all.src_valid_mark=1
     volumes:
-      - ./data:/var/lib/cloudflare-warp
+      - ./data/warp:/var/lib/cloudflare-warp

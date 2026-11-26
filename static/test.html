@@ -782,7 +782,7 @@ function renderImagePreviews() {
   STATE.images.forEach((dataUrl, idx) => {
     const item = document.createElement("div");
     item.className = "image-preview-item";
-    item.innerHTML = `<img src="${dataUrl}" alt="preview"><button type="button" class="remove-btn" onclick="removeImage(${idx})">×</button>`;
+    item.innerHTML = `<img src="${I18n.escapeHtml(dataUrl)}" alt="preview"><button type="button" class="remove-btn" onclick="removeImage(${Number(idx)})">×</button>`;
     list.appendChild(item);
   });
 }
@@ -1027,7 +1027,7 @@ async function loadAgentSessions() {
       return;
     }
     listEl.innerHTML = sessions.map(s => `
-      <div class="session-row ${s.sessionId === STATE.agentSessionId ? 'active' : ''}" onclick="openAgentSession('${I18n.escapeHtml(s.sessionId)}')">
+      <div class="session-row ${s.sessionId === STATE.agentSessionId ? 'active' : ''}" data-session-id="${I18n.escapeHtml(s.sessionId)}" onclick="openAgentSession(this.dataset.sessionId)">
         <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${I18n.escapeHtml(s.title || s.sessionId)}</span>
       </div>`).join("");
   } catch (e) {
@@ -1337,7 +1337,7 @@ async function loadVoicesAndCharacters(opts = {}) {
           </div>
           <div class="toolbar-group">
             ${v.audioUrl ? `<audio controls src="${I18n.escapeHtml(v.audioUrl)}" style="height:28px;"></audio>` : ""}
-            <button type="button" class="act-btn danger" onclick="deleteVoiceItem('${I18n.escapeHtml(v.workflowId || v.mediaId || v.id)}')">${I18n.escapeHtml(I18n.t("删除"))}</button>
+            <button type="button" class="act-btn danger" data-voice-id="${I18n.escapeHtml(v.workflowId || v.mediaId || v.id)}" onclick="deleteVoiceItem(this.dataset.voiceId)">${I18n.escapeHtml(I18n.t("删除"))}</button>
           </div>
         </div>`).join("");
       STATE.voicesLoadedFor = `${creds.baseUrl}\0${creds.apiKey}`;
@@ -1354,7 +1354,7 @@ async function loadVoicesAndCharacters(opts = {}) {
               <strong>${I18n.escapeHtml(c.displayName || c.id)}</strong>
               <div class="cell-sub">${I18n.escapeHtml(c.personalityNotes || "")} ${c.voiceId ? `· ${I18n.escapeHtml(c.voiceId)}` : ""}</div>
             </div>
-            <button type="button" class="act-btn danger" onclick="deleteCharacterItem('${I18n.escapeHtml(c.id)}')">${I18n.escapeHtml(I18n.t("删除"))}</button>
+            <button type="button" class="act-btn danger" data-character-id="${I18n.escapeHtml(c.id)}" onclick="deleteCharacterItem(this.dataset.characterId)">${I18n.escapeHtml(I18n.t("删除"))}</button>
           </div>`).join("")
         : `<div class="notice-well">${I18n.escapeHtml(I18n.t("暂无自定义角色"))}</div>`;
     } else if (!silent) {

@@ -26,6 +26,11 @@ IMAGE_BASE_MODELS = {
     "gemini-3-pro-image": "gemini-3.0-pro-image",
     "gemini-3-pro-image-preview": "gemini-3.0-pro-image",
     "nano-banana-pro": "gemini-3.0-pro-image",
+    # Imagen 3 aliases (Vertex / AI Studio :predict compatibility)
+    "imagen-3.0-generate-002": "gemini-3.0-pro-image",
+    "imagen-3.0-generate-001": "gemini-3.0-pro-image",
+    "imagen-3": "gemini-3.0-pro-image",
+    "imagen-3.0-fast-generate-001": "gemini-3.1-flash-image",
     # Nano Banana 2.1 (BELUGA / Gemini 3.1 Flash Image)
     "gemini-3.1-flash-image": "gemini-3.1-flash-image",
     "gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",

@@ -312,6 +312,12 @@ class ConcurrencyManager:
         async with self._lock:
             return self._video_inflight.get(token_id, 0)
 
+    async def get_inflight_snapshot(self) -> tuple[dict[int, int], dict[int, int]]:
+        """Get a consistent snapshot of all in-flight image and video counts under one lock."""
+        self._ensure_loop()
+        async with self._lock:
+            return dict(self._image_inflight), dict(self._video_inflight)
+
     async def reset_token(
         self, token_id: int, image_concurrency: int = -1, video_concurrency: int = -1
     ):

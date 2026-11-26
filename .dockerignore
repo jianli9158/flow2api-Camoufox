@@ -47,9 +47,20 @@ ENV/
 # Project specific
 data/*.db
 data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/.session_secret
+data/warp/
+browser_data_rt/
+runtime/
 tmp/*
+src/tmp/
 logs/*
+logs.txt
 *.log
+config/setting.toml
+config/setting_*.toml
+!config/setting_example.toml
 
 # Docker
 Dockerfile

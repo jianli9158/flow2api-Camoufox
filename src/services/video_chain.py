@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from pathlib import Path
 import shutil
 import tempfile
@@ -45,8 +46,8 @@ async def _run_proc(cmd: Sequence[str], *, timeout: float = 120.0) -> Tuple[int,
 
 
 async def probe_video_duration(ffprobe_bin: str, video_path: Path) -> float:
-    """Return video duration in seconds using ffprobe (0.0 if unreadable)."""
-    rc, stdout, _ = await _run_proc(
+    """Return video duration in seconds using ffprobe; raise RuntimeError if unreadable/non-positive."""
+    rc, stdout, stderr = await _run_proc(
         [
             ffprobe_bin,
             "-v",
@@ -60,12 +61,22 @@ async def probe_video_duration(ffprobe_bin: str, video_path: Path) -> float:
         timeout=30.0,
     )
     if rc != 0:
-        return 0.0
+        err = stderr.decode("utf-8", errors="ignore")[-400:].strip()
+        raise RuntimeError(
+            f"ffprobe duration probe failed (rc={rc}): {err or 'unknown error'}"
+        )
+    raw_duration = (stdout.decode("utf-8", errors="ignore") or "").strip()
     try:
-        val = float((stdout.decode("utf-8", errors="ignore") or "").strip())
-        return max(0.0, val)
-    except ValueError:
-        return 0.0
+        val = float(raw_duration)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"ffprobe returned unreadable duration for {video_path}: {raw_duration!r}"
+        ) from exc
+    if not math.isfinite(val) or val <= 0.0:
+        raise RuntimeError(
+            f"ffprobe returned non-positive duration ({val}) for {video_path}"
+        )
+    return val
 
 
 async def extract_tail_frame(
@@ -78,8 +89,12 @@ async def extract_tail_frame(
 ) -> bytes:
     """Extract a high-quality frame slightly before the end (`duration - offset_ms`) to avoid black fade."""
     duration = await probe_video_duration(ffprobe_bin, video_path)
+    if not math.isfinite(duration) or duration <= 0.0:
+        raise RuntimeError(
+            f"Cannot extract tail frame from non-positive duration ({duration}) for {video_path}"
+        )
     safe_offset = max(0, int(offset_ms)) / 1000.0
-    seek_sec = max(0.0, duration - safe_offset) if duration > 0.0 else 0.0
+    seek_sec = max(0.0, duration - safe_offset)
 
     rc, _, stderr = await _run_proc(
         [

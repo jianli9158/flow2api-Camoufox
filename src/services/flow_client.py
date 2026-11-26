@@ -8,6 +8,7 @@ import json
 import random
 import re
 import time
+from unittest.mock import NonCallableMock
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 try:
@@ -22,9 +23,11 @@ from ..core.config import config
 from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
 from ..core.prompt_tools import detect_image_mime_type, jitter_seconds
+from .browser_cookie_utils import serialize_cookie_header_for_url
 from .flow_cookies import FlowCookieJar
 from .flow_current import CurrentFlowClientMixin, _safe_updated_flow_cookies
 from .flow_frontend import FlowFrontendMixin
+_PROXY_UNSET = object()
 
 class _FlowClientBase(FlowFrontendMixin):
     """VideoFX API 客户端基础层"""
@@ -176,6 +179,141 @@ class _FlowClientBase(FlowFrontendMixin):
             self._http_session_last_used.pop(key, None)
         await self._close_http_session(session)
 
+    def _ensure_token_http_session_pool(
+        self,
+    ) -> Tuple[
+        Dict[Tuple[int, int, str, str, bool], Any],
+        Dict[Tuple[int, int, str, str, bool], asyncio.Lock],
+        Dict[int, asyncio.Lock],
+    ]:
+        sessions = getattr(self, "_token_http_sessions", None)
+        if sessions is None:
+            sessions = {}
+            self._token_http_sessions = sessions
+        key_locks = getattr(self, "_token_http_session_locks", None)
+        if key_locks is None:
+            key_locks = {}
+            self._token_http_session_locks = key_locks
+        pool_locks = getattr(self, "_token_http_pool_locks", None)
+        if pool_locks is None:
+            pool_locks = {}
+            self._token_http_pool_locks = pool_locks
+        return sessions, key_locks, pool_locks
+
+    async def _get_token_http_session(
+        self,
+        *,
+        token_id: int,
+        impersonate: str,
+        proxy_url: Optional[str],
+        verify: bool = True,
+    ) -> Tuple[Tuple[int, int, str, str, bool], Any, asyncio.Lock]:
+        sessions, key_locks, pool_locks = self._ensure_token_http_session_pool()
+        loop_id = id(asyncio.get_running_loop())
+        normalized_impersonate = str(impersonate or "chrome")
+        key: Tuple[int, int, str, str, bool] = (
+            loop_id,
+            int(token_id),
+            normalized_impersonate,
+            str(proxy_url or ""),
+            bool(verify),
+        )
+        last_used_map = getattr(self, "_token_http_session_last_used", None)
+        if last_used_map is None:
+            last_used_map = {}
+            self._token_http_session_last_used = last_used_map
+
+        now = time.monotonic()
+        existing = sessions.get(key)
+        key_lock = key_locks.get(key)
+        if (
+            existing is not None
+            and key_lock is not None
+            and (now - last_used_map.get(key, now)) < 300.0
+        ):
+            last_used_map[key] = now
+            return key, existing, key_lock
+
+        pool_lock = pool_locks.get(loop_id)
+        if pool_lock is None:
+            pool_lock = asyncio.Lock()
+            pool_locks[loop_id] = pool_lock
+
+        stale_sessions: list[Any] = []
+        async with pool_lock:
+            now = time.monotonic()
+            for k, sess in list(sessions.items()):
+                k_lock = key_locks.get(k)
+                if (
+                    k[0] == loop_id
+                    and (now - last_used_map.get(k, now)) >= 300.0
+                    and (k_lock is None or not k_lock.locked())
+                ):
+                    sessions.pop(k, None)
+                    last_used_map.pop(k, None)
+                    key_locks.pop(k, None)
+                    stale_sessions.append(sess)
+
+            existing = sessions.get(key)
+            key_lock = key_locks.get(key)
+            if existing is not None and key_lock is not None:
+                last_used_map[key] = now
+                chosen = existing
+            else:
+                if len(sessions) >= 64:
+                    unlocked_keys = [
+                        k
+                        for k in sessions.keys()
+                        if not (key_locks.get(k) and key_locks[k].locked())
+                    ]
+                    if unlocked_keys:
+                        oldest_k = min(
+                            unlocked_keys,
+                            key=lambda item_k: last_used_map.get(item_k, 0.0),
+                        )
+                        stale_sessions.append(sessions.pop(oldest_k))
+                        last_used_map.pop(oldest_k, None)
+                        key_locks.pop(oldest_k, None)
+                session_kwargs: Dict[str, Any] = {
+                    "trust_env": False,
+                    "impersonate": normalized_impersonate,
+                    "curl_infos": [CurlInfo.COOKIELIST],
+                    "discard_cookies": True,
+                }
+                try:
+                    created = AsyncSession(**session_kwargs)
+                except TypeError:
+                    session_kwargs.pop("discard_cookies", None)
+                    created = AsyncSession(**session_kwargs)
+                aenter = getattr(created, "__aenter__", None)
+                if callable(aenter):
+                    entered = aenter()
+                    if inspect.isawaitable(entered):
+                        entered = await entered
+                    if entered is not None:
+                        created = entered
+                sessions[key] = created
+                last_used_map[key] = now
+                key_lock = key_locks.setdefault(key, asyncio.Lock())
+                chosen = created
+
+        for stale in stale_sessions:
+            await self._close_http_session(stale)
+        return key, chosen, key_lock
+
+    async def _evict_token_http_session(
+        self,
+        key: Tuple[int, int, str, str, bool],
+        session: Any,
+    ) -> None:
+        sessions, key_locks, _ = self._ensure_token_http_session_pool()
+        if sessions.get(key) is session:
+            sessions.pop(key, None)
+            key_locks.pop(key, None)
+        if hasattr(self, "_token_http_session_last_used"):
+            self._token_http_session_last_used.pop(key, None)
+        await self._close_http_session(session)
+
     async def close(self) -> None:
         """Close all pooled curl_cffi AsyncSession instances."""
         sessions, locks = self._ensure_http_session_pool()
@@ -184,9 +322,19 @@ class _FlowClientBase(FlowFrontendMixin):
         locks.clear()
         if hasattr(self, "_http_session_last_used"):
             self._http_session_last_used.clear()
+
+        token_sessions, token_key_locks, token_pool_locks = (
+            self._ensure_token_http_session_pool()
+        )
+        pooled.extend(token_sessions.values())
+        token_sessions.clear()
+        token_key_locks.clear()
+        token_pool_locks.clear()
+        if hasattr(self, "_token_http_session_last_used"):
+            self._token_http_session_last_used.clear()
+
         for session in pooled:
             await self._close_http_session(session)
-
     def _generate_user_agent(self, account_id: str = None) -> str:
         if not hasattr(self, "_user_agent_cache"):
             self._user_agent_cache = {}
@@ -458,27 +606,32 @@ class _FlowClientBase(FlowFrontendMixin):
         redact_sensitive_logs: bool = False,
         impersonate: str = "chrome",
         cookie_jar: Optional[CookieJar] = None,
+        proxy_url: Any = _PROXY_UNSET,
+        token_id: Optional[int] = None,
     ) -> str:
         """执行原始文本请求（如 SSE / batchexecute），返回响应文本。"""
         fingerprint = self._request_fingerprint_ctx.get()
 
-        proxy_url = None
+        resolved_proxy_url: Optional[str] = None
         if not force_no_proxy:
-            if self.proxy_manager:
-                if hasattr(self.proxy_manager, "get_request_proxy_url"):
-                    proxy_url = await self.proxy_manager.get_request_proxy_url()
-                else:
-                    proxy_url = await self.proxy_manager.get_proxy_url()
+            if proxy_url is not _PROXY_UNSET:
+                resolved_proxy_url = str(proxy_url or "").strip() or None
+            else:
+                if self.proxy_manager:
+                    if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                        resolved_proxy_url = await self.proxy_manager.get_request_proxy_url()
+                    else:
+                        resolved_proxy_url = await self.proxy_manager.get_proxy_url()
 
-            if (
-                respect_fingerprint_proxy
-                and isinstance(fingerprint, dict)
-                and "proxy_url" in fingerprint
-            ):
-                proxy_url = fingerprint.get("proxy_url")
-                if proxy_url == "":
-                    proxy_url = None
-
+                if (
+                    respect_fingerprint_proxy
+                    and isinstance(fingerprint, dict)
+                    and "proxy_url" in fingerprint
+                ):
+                    resolved_proxy_url = fingerprint.get("proxy_url")
+                    if resolved_proxy_url == "":
+                        resolved_proxy_url = None
+        proxy_url = resolved_proxy_url
         request_timeout = timeout or self.timeout
         headers = dict(headers) if headers else {}
 
@@ -570,8 +723,6 @@ class _FlowClientBase(FlowFrontendMixin):
         ):
             headers["sec-ch-ua-mobile"] = inferred_fingerprint["sec_ch_ua_mobile"]
 
-        if cookie_jar is not None:
-            headers.pop("Cookie", None)
         if isinstance(cookie_jar, FlowCookieJar):
             cookie_jar.add_runtime_cookies(
                 (fingerprint or {}).get("session_cookies"), url
@@ -593,44 +744,128 @@ class _FlowClientBase(FlowFrontendMixin):
 
         start_time = time.time()
 
+        async def _send_with_ephemeral_cookie_session() -> Any:
+            ephemeral_headers = dict(headers)
+            ephemeral_headers.pop("Cookie", None)
+            session_kwargs: Dict[str, Any] = {
+                "trust_env": False,
+                "cookies": cookie_jar,
+                "curl_infos": [CurlInfo.COOKIELIST],
+            }
+            if isinstance(cookie_jar, FlowCookieJar):
+                extra = cookie_jar.extra_cookie_header(url)
+                session_kwargs.update(
+                    curl_options={CurlOpt.COOKIE: extra},
+                    allow_redirects=not bool(extra),
+                )
+            async with AsyncSession(**session_kwargs) as session:
+                if method.upper() == "GET":
+                    resp = await session.get(
+                        url,
+                        headers=ephemeral_headers,
+                        proxy=proxy_url,
+                        timeout=request_timeout,
+                        impersonate=impersonate,
+                    )
+                else:
+                    request_kwargs = {
+                        "headers": ephemeral_headers,
+                        "proxy": proxy_url,
+                        "timeout": request_timeout,
+                        "impersonate": impersonate,
+                    }
+                    if raw_body is not None:
+                        request_kwargs["data"] = raw_body
+                    else:
+                        request_kwargs["json"] = json_data
+                    resp = await session.post(url, **request_kwargs)
+                updater = getattr(self, "_update_flow_cookie_jar", None)
+                if updater is not None:
+                    updater(cookie_jar, resp)
+                return resp
+
         try:
             if cookie_jar is not None:
-                session_kwargs: Dict[str, Any] = {
-                    "trust_env": False,
-                    "cookies": cookie_jar,
-                    "curl_infos": [CurlInfo.COOKIELIST],
-                }
-                if isinstance(cookie_jar, FlowCookieJar):
-                    extra = cookie_jar.extra_cookie_header(url)
-                    session_kwargs.update(
-                        curl_options={CurlOpt.COOKIE: extra},
-                        allow_redirects=not bool(extra),
+                if token_id is not None:
+                    pool_key, session, key_lock = await self._get_token_http_session(
+                        token_id=int(token_id),
+                        impersonate=impersonate,
+                        proxy_url=proxy_url,
+                        verify=True,
                     )
-                async with AsyncSession(**session_kwargs) as session:
-                    if method.upper() == "GET":
-                        response = await session.get(
-                            url,
-                            headers=headers,
-                            proxy=proxy_url,
-                            timeout=request_timeout,
-                            impersonate=impersonate,
-                        )
+                    if key_lock.locked():
+                        response = await _send_with_ephemeral_cookie_session()
                     else:
-                        request_kwargs = {
-                            "headers": headers,
-                            "proxy": proxy_url,
-                            "timeout": request_timeout,
-                            "impersonate": impersonate,
-                        }
-                        if raw_body is not None:
-                            request_kwargs["data"] = raw_body
-                        else:
-                            request_kwargs["json"] = json_data
-                        response = await session.post(url, **request_kwargs)
+                        async with key_lock:
+                            try:
+                                cookies_obj = getattr(session, "cookies", None)
+                                clear_fn = getattr(cookies_obj, "clear", None)
+                                if (
+                                    callable(clear_fn)
+                                    and not isinstance(cookies_obj, NonCallableMock)
+                                ):
+                                    clear_fn()
+                                session_curl_opts = getattr(session, "curl_options", None)
+                                if isinstance(session_curl_opts, dict):
+                                    session_curl_opts.pop(CurlOpt.COOKIE, None)
 
-                    updater = getattr(self, "_update_flow_cookie_jar", None)
-                    if updater is not None:
-                        updater(cookie_jar, response)
+                                extra = (
+                                    cookie_jar.extra_cookie_header(url)
+                                    if isinstance(cookie_jar, FlowCookieJar)
+                                    else ""
+                                )
+                                pooled_headers = dict(headers)
+                                if isinstance(cookie_jar, FlowCookieJar):
+                                    scoped_cookie_header = serialize_cookie_header_for_url(
+                                        cookie_jar.export_storage(), url
+                                    )
+                                    if scoped_cookie_header:
+                                        pooled_headers["Cookie"] = scoped_cookie_header
+                                    else:
+                                        pooled_headers.pop("Cookie", None)
+                                else:
+                                    pooled_headers.pop("Cookie", None)
+
+                                request_kwargs = {
+                                    "headers": pooled_headers,
+                                    "proxy": proxy_url,
+                                    "timeout": request_timeout,
+                                    "impersonate": impersonate,
+                                    "cookies": cookie_jar,
+                                    "discard_cookies": True,
+                                    "allow_redirects": not bool(extra),
+                                }
+                                if method.upper() == "GET":
+                                    try:
+                                        response = await session.get(url, **request_kwargs)
+                                    except TypeError:
+                                        request_kwargs.pop("discard_cookies", None)
+                                        request_kwargs.pop("cookies", None)
+                                        request_kwargs.pop("allow_redirects", None)
+                                        response = await session.get(url, **request_kwargs)
+                                else:
+                                    if raw_body is not None:
+                                        request_kwargs["data"] = raw_body
+                                    else:
+                                        request_kwargs["json"] = json_data
+                                    try:
+                                        response = await session.post(url, **request_kwargs)
+                                    except TypeError:
+                                        request_kwargs.pop("discard_cookies", None)
+                                        request_kwargs.pop("cookies", None)
+                                        request_kwargs.pop("allow_redirects", None)
+                                        response = await session.post(url, **request_kwargs)
+                                updater = getattr(self, "_update_flow_cookie_jar", None)
+                                if updater is not None:
+                                    updater(cookie_jar, response)
+                            except BaseException:
+                                await self._evict_token_http_session(pool_key, session)
+                                raise
+                            finally:
+                                if isinstance(getattr(session, "curl_options", None), dict):
+                                    session.curl_options.pop(CurlOpt.COOKIE, None)
+                else:
+                    response = await _send_with_ephemeral_cookie_session()
             else:
                 pool_key, session = await self._get_http_session(
                     impersonate=impersonate,

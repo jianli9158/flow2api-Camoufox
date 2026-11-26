@@ -6,7 +6,15 @@ import sys
 import warnings
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, FileResponse, Response, RedirectResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import (
+    HTMLResponse,
+    FileResponse,
+    JSONResponse,
+    Response,
+    RedirectResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -121,6 +129,11 @@ async def lifespan(app: FastAPI):
     # 启动时统一把数据库配置同步到内存，避免 personal/brower 相关运行时配置遗漏。
     await db.reload_config_to_memory()
     generation_handler.file_cache.set_timeout(config.cache_timeout)
+    if hasattr(db, "recover_stale_processing_tasks"):
+        try:
+            await db.recover_stale_processing_tasks()
+        except Exception as e:
+            print(f"Initial stale task recovery warning: {e}")
     cache_cleanup_enabled = await generation_handler.file_cache.refresh_cleanup_task()
     captcha_config = await db.get_captcha_config()
 
@@ -162,6 +175,11 @@ async def lifespan(app: FastAPI):
                     await db.cleanup_old_request_logs()
             except Exception as e:
                 print(f"Request log cleanup error: {e}")
+            try:
+                if hasattr(db, "cleanup_old_tasks"):
+                    await db.cleanup_old_tasks()
+            except Exception as e:
+                print(f"Task cleanup error: {e}")
             try:
                 if hasattr(db, "run_maintenance_pragmas"):
                     await db.run_maintenance_pragmas()
@@ -262,6 +280,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.add_middleware(I18nMiddleware)
+
+def _sanitize_validation_errors(value):
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        try:
+            decoded = raw.decode("utf-8")
+            return decoded if len(decoded) <= 512 else f"{decoded[:512]}...(truncated)"
+        except UnicodeDecodeError:
+            return f"<binary {len(raw)} bytes>"
+    if isinstance(value, dict):
+        return {k: _sanitize_validation_errors(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_validation_errors(item) for item in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def safe_request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    safe_errors = _sanitize_validation_errors(exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(safe_errors)},
+    )
+
 
 # Include routers
 app.include_router(routes.router)

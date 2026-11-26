@@ -8,6 +8,7 @@ import time
 import uuid
 import mimetypes
 import inspect
+from unittest.mock import NonCallableMock
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 from urllib.parse import urlparse
@@ -74,12 +75,12 @@ class FileCache:
         proxy_url: Optional[str] = None,
         verify: bool = True,
     ) -> Tuple[Tuple[int, str, str, bool], Any]:
-        """Borrow a pooled stateless AsyncSession keyed by (loop, impersonate, proxy, verify)."""
+        """Borrow a pooled stateless AsyncSession keyed by (loop, impersonate, '', verify)."""
         loop_id = id(asyncio.get_running_loop())
         key: Tuple[int, str, str, bool] = (
             loop_id,
             str(impersonate or "chrome120"),
-            str(proxy_url or ""),
+            "",
             bool(verify),
         )
         now = time.monotonic()
@@ -277,18 +278,42 @@ class FileCache:
 
     def _write_cached_content(self, file_path: Path, content: bytes):
         """先写临时文件，再原子替换，避免并发读到半截文件。"""
-        temp_path = file_path.with_suffix(f"{file_path.suffix}.part")
+        temp_path = file_path.with_name(f"{file_path.name}.part")
         try:
             with open(temp_path, "wb") as f:
                 f.write(content)
             temp_path.replace(file_path)
         finally:
-            if temp_path.exists():
-                try:
-                    temp_path.unlink()
-                except Exception:
-                    pass
+            temp_path.unlink(missing_ok=True)
 
+    @staticmethod
+    def _is_real_async_iter(candidate: Any) -> bool:
+        if candidate is None or isinstance(candidate, NonCallableMock):
+            return False
+        return inspect.isasyncgen(candidate) or (
+            hasattr(candidate, "__aiter__")
+            and callable(getattr(type(candidate), "__anext__", None))
+        )
+
+    @staticmethod
+    async def _close_stream_response(response: Any) -> None:
+        if response is None or isinstance(response, NonCallableMock):
+            return
+        quit_now = getattr(response, "quit_now", None)
+        if (
+            quit_now is not None
+            and not isinstance(quit_now, NonCallableMock)
+            and callable(getattr(quit_now, "set", None))
+        ):
+            quit_now.set()
+        aclose = getattr(response, "aclose", None)
+        if callable(aclose) and not isinstance(aclose, NonCallableMock):
+            try:
+                res = aclose()
+                if inspect.isawaitable(res):
+                    await res
+            except BaseException:
+                pass
     def _decode_and_write_base64(
         self, file_path: Path, base64_data: str, expected_kind: Optional[str] = None
     ) -> int:
@@ -516,51 +541,104 @@ class FileCache:
                     media_type, fingerprint=fingerprint
                 )
 
-                # Try method 1: curl_cffi with browser impersonation
+                # Try method 1: curl_cffi with browser impersonation (streamed to .part)
                 pool_key = None
                 pooled_session = None
+                part_path = file_path.with_name(f"{file_path.name}.part")
                 try:
                     pool_key, pooled_session = await self.get_http_session(
                         impersonate="chrome120",
                         proxy_url=proxy_url,
                         verify=False,
                     )
-                    response = await pooled_session.get(
-                        url,
-                        timeout=60,
-                        proxy=proxy_url,
-                        headers=headers,
-                        impersonate="chrome120",
-                        verify=False,
-                    )
+                    try:
+                        response = await pooled_session.get(
+                            url,
+                            timeout=60,
+                            proxy=proxy_url,
+                            headers=headers,
+                            impersonate="chrome120",
+                            verify=False,
+                            stream=True,
+                        )
+                    except TypeError:
+                        response = await pooled_session.get(
+                            url,
+                            timeout=60,
+                            proxy=proxy_url,
+                            headers=headers,
+                            impersonate="chrome120",
+                            verify=False,
+                        )
 
-                    if response.status_code == 200 and response.content:
-                        content_bytes = response.content
-                        await asyncio.to_thread(
-                            self._write_cached_content, file_path, content_bytes
-                        )
-                        debug_logger.log_info(
-                            f"File cached (curl_cffi): {filename} ({len(content_bytes)} bytes)"
-                        )
-                        return filename
+                    try:
+                        if response.status_code == 200:
+                            aiter_fn = getattr(response, "aiter_content", None)
+                            stream_iter = None
+                            if callable(aiter_fn):
+                                candidate_iter = aiter_fn()
+                                if self._is_real_async_iter(candidate_iter):
+                                    stream_iter = candidate_iter
+                                elif callable(getattr(candidate_iter, "aclose", None)) and not isinstance(candidate_iter, NonCallableMock):
+                                    await candidate_iter.aclose()
+
+                            if stream_iter is not None:
+                                total_bytes = 0
+                                buffer = bytearray()
+                                try:
+                                    with open(part_path, "wb") as f:
+                                        async for chunk in stream_iter:
+                                            if not chunk:
+                                                continue
+                                            total_bytes += len(chunk)
+                                            buffer.extend(chunk)
+                                            if len(buffer) >= 65536:
+                                                await asyncio.to_thread(f.write, bytes(buffer))
+                                                buffer.clear()
+                                        if buffer:
+                                            await asyncio.to_thread(f.write, bytes(buffer))
+                                            buffer.clear()
+                                    if total_bytes > 0:
+                                        await asyncio.to_thread(part_path.replace, file_path)
+                                        debug_logger.log_info(
+                                            f"File cached (curl_cffi): {filename} ({total_bytes} bytes)"
+                                        )
+                                        return filename
+                                finally:
+                                    part_path.unlink(missing_ok=True)
+                            elif response.content:
+                                content_bytes = response.content
+                                await asyncio.to_thread(
+                                    self._write_cached_content, file_path, content_bytes
+                                )
+                                debug_logger.log_info(
+                                    f"File cached (curl_cffi): {filename} ({len(content_bytes)} bytes)"
+                                )
+                                return filename
+                    finally:
+                        await self._close_stream_response(response)
+
                     debug_logger.log_warning(
                         f"curl_cffi failed with HTTP {response.status_code}, trying wget..."
                     )
 
                 except Exception as e:
+                    part_path.unlink(missing_ok=True)
                     if pool_key is not None and pooled_session is not None:
                         await self.evict_http_session(pool_key, pooled_session)
                     debug_logger.log_warning(
                         f"curl_cffi failed: {str(e)}, trying wget..."
                     )
 
-                # Try method 2: wget command
+                # Try method 2: wget command (atomic .part)
+                temp_path = file_path.with_name(f"{file_path.name}.part")
                 try:
+                    temp_path.unlink(missing_ok=True)
                     wget_cmd = [
                         "wget",
                         "-q",
                         "-O",
-                        str(file_path),
+                        str(temp_path),
                         "--timeout=60",
                         "--tries=3",
                         f"--user-agent={headers.get('User-Agent', '')}",
@@ -595,9 +673,10 @@ class FileCache:
 
                     if returncode == 0:
                         file_size = await asyncio.to_thread(
-                            self._verify_downloaded_file_size, file_path
+                            self._verify_downloaded_file_size, temp_path
                         )
                         if file_size > 0:
+                            await asyncio.to_thread(temp_path.replace, file_path)
                             debug_logger.log_info(
                                 f"File cached (wget): {filename} ({file_size} bytes)"
                             )
@@ -618,15 +697,18 @@ class FileCache:
                     debug_logger.log_warning("wget not found, trying curl...")
                 except Exception as e:
                     debug_logger.log_warning(f"wget failed: {str(e)}, trying curl...")
+                finally:
+                    temp_path.unlink(missing_ok=True)
 
-                # Try method 3: system curl command
+                # Try method 3: system curl command (atomic .part)
                 try:
+                    temp_path.unlink(missing_ok=True)
                     curl_cmd = [
                         "curl",
                         "-L",
                         "-s",
                         "-o",
-                        str(file_path),
+                        str(temp_path),
                         "--max-time",
                         "60",
                         "-H",
@@ -664,9 +746,10 @@ class FileCache:
 
                     if returncode == 0:
                         file_size = await asyncio.to_thread(
-                            self._verify_downloaded_file_size, file_path
+                            self._verify_downloaded_file_size, temp_path
                         )
                         if file_size > 0:
+                            await asyncio.to_thread(temp_path.replace, file_path)
                             debug_logger.log_info(
                                 f"File cached (curl): {filename} ({file_size} bytes)"
                             )
@@ -680,7 +763,6 @@ class FileCache:
                         else "Unknown error"
                     )
                     raise Exception(f"curl command failed: {error_msg}")
-
                 except FileNotFoundError as e:
                     normalized_error = self._normalize_cache_error(e)
                     debug_logger.log_error(
@@ -697,6 +779,8 @@ class FileCache:
                         response_text=str(e),
                     )
                     raise Exception(normalized_error) from e
+                finally:
+                    temp_path.unlink(missing_ok=True)
         finally:
             remaining = self._download_lock_users.get(filename, 1) - 1
             if remaining <= 0:

@@ -521,8 +521,10 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
 
                 async def fake_camoufox_refresh(_pid, *, token_id):
                     tok = await db.get_token(token_id)
-                    return {"google_cookies": rotated_browser, "email": tok.email}
-
+                    return {
+                        "google_cookies": raw_cookies.replace("osid-1", f"osid-browser-{token_id}"),
+                        "email": tok.email,
+                    }
                 fake_camoufox = MagicMock()
                 fake_camoufox.get_warm_bound_token_ids = lambda idle_only=False: {warm_tid}
                 fake_camoufox.has_any_idle_slot = lambda: True
@@ -541,14 +543,16 @@ class PerformanceAndResilienceTests(unittest.IsolatedAsyncioTestCase):
                     mock_cfg.browser_captcha_engine = "camoufox"
                     await manager.run_protocol_refresh_once()
 
-                # Warm-idle token + at most 1 cold token refreshed in tick 1; cold2 deferred to next tick
+                # Warm-idle token + at most 1 cold token (stalest last_st_refresh_at first = cold2) refreshed in tick 1; cold1 deferred
                 refreshed_tids = [c.kwargs["token_id"] for c in fake_camoufox.refresh_google_cookies.call_args_list]
-                self.assertEqual(refreshed_tids, [warm_tid, cold1_tid])
+                self.assertEqual(refreshed_tids, [warm_tid, cold2_tid])
 
                 warm_after = await db.get_token(warm_tid)
+                cold1_after = await db.get_token(cold1_tid)
                 cold2_after = await db.get_token(cold2_tid)
-                self.assertEqual(warm_after.google_cookies, rotated_browser)
-                self.assertEqual(cold2_after.google_cookies, raw_cookies)
+                self.assertEqual(warm_after.google_cookies, raw_cookies.replace("osid-1", f"osid-browser-{warm_tid}"))
+                self.assertEqual(cold2_after.google_cookies, raw_cookies.replace("osid-1", f"osid-browser-{cold2_tid}"))
+                self.assertEqual(cold1_after.google_cookies, raw_cookies)
                 self.assertGreater(
                     (warm_after.at_expires.replace(tzinfo=timezone.utc) if warm_after.at_expires.tzinfo is None else warm_after.at_expires) - now,
                     timedelta(minutes=100),

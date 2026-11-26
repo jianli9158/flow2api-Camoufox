@@ -8,6 +8,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sqlite3
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -406,35 +408,39 @@ def persist_account_login_artifacts(source_dir: Path, target_dir: Path) -> None:
     """Copy fingerprint, storage-state, startup cache, HTTP disk cache, and full Firefox profile from isolated login dir to account dir."""
     if not source_dir.exists() or source_dir.resolve() == target_dir.resolve():
         return
-    target_dir.mkdir(parents=True, exist_ok=True)
-    for file_name in ("camoufox-fingerprint.json", "storage-state.json"):
-        src_file = source_dir / file_name
-        if src_file.is_file():
-            shutil.copy2(src_file, target_dir / file_name)
-    for dir_name in (PROFILE_STARTUP_DIR_NAME, "camoufox-cache", "firefox-profile"):
-        src_dir = source_dir / dir_name
-        if src_dir.is_dir():
-            dst_dir = target_dir / dir_name
-            if dir_name == "firefox-profile" and dst_dir.exists():
-                shutil.rmtree(dst_dir, ignore_errors=True)
-            shutil.copytree(
-                src_dir,
-                dst_dir,
-                dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(
-                    ".parentlock",
-                    "lock",
-                    "parent.lock",
-                    "gmp-widevinecdm",
-                    "minidumps",
-                    "crashes",
-                    "datareporting",
-                    "saved-telemetry-pings",
-                ),
-            )
-            if dir_name == "firefox-profile":
-                _clear_stale_firefox_profile_locks(dst_dir)
-
+    with acquire_profile_lease(
+        target_dir,
+        holder=f"persist_login_artifacts:{source_dir.name}",
+        wait_seconds=5.0,
+    ):
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for file_name in ("camoufox-fingerprint.json", "storage-state.json"):
+            src_file = source_dir / file_name
+            if src_file.is_file():
+                shutil.copy2(src_file, target_dir / file_name)
+        for dir_name in (PROFILE_STARTUP_DIR_NAME, "camoufox-cache", "firefox-profile"):
+            src_dir = source_dir / dir_name
+            if src_dir.is_dir():
+                dst_dir = target_dir / dir_name
+                if dir_name == "firefox-profile" and dst_dir.exists():
+                    shutil.rmtree(dst_dir, ignore_errors=True)
+                shutil.copytree(
+                    src_dir,
+                    dst_dir,
+                    dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        ".parentlock",
+                        "lock",
+                        "parent.lock",
+                        "gmp-widevinecdm",
+                        "minidumps",
+                        "crashes",
+                        "datareporting",
+                        "saved-telemetry-pings",
+                    ),
+                )
+                if dir_name == "firefox-profile":
+                    _clear_stale_firefox_profile_locks(dst_dir)
 
 def prune_camoufox_profile_bloat(
     base_dir: Union[str, Path],
@@ -444,17 +450,15 @@ def prune_camoufox_profile_bloat(
     """Remove unneeded Widevine DRM binaries, crash dumps, and oversized cache2 entries from idle profiles."""
     root = Path(base_dir)
     stats = {"profiles_scanned": 0, "profiles_skipped_busy": 0, "bytes_reclaimed": 0}
-    if not root.is_dir():
-        return stats
-
     candidate_account_dirs: List[Path] = []
-    for child in root.iterdir():
-        if not child.is_dir():
-            continue
-        if child.name == "profiles":
-            candidate_account_dirs.extend(p for p in child.iterdir() if p.is_dir())
-        else:
-            candidate_account_dirs.append(child)
+    if root.is_dir():
+        for child in root.iterdir():
+            if not child.is_dir():
+                continue
+            if child.name == "profiles":
+                candidate_account_dirs.extend(p for p in child.iterdir() if p.is_dir())
+            else:
+                candidate_account_dirs.append(child)
 
     def _dir_size(path: Path) -> int:
         total = 0
@@ -469,6 +473,12 @@ def prune_camoufox_profile_bloat(
             pass
         return total
 
+    def _has_lock_files(path: Path) -> bool:
+        return any(
+            (path / lk).exists() or (path / lk).is_symlink()
+            for lk in (".parentlock", "lock", "parent.lock")
+        )
+
     for acc_dir in candidate_account_dirs:
         ff_dir = acc_dir / "firefox-profile"
         if not ff_dir.is_dir():
@@ -477,55 +487,159 @@ def prune_camoufox_profile_bloat(
         if (
             get_profile_login_holder(acc_dir)
             or get_active_profile_lease_holder(acc_dir)
-            or any(
-                (ff_dir / lk).exists() or (ff_dir / lk).is_symlink()
-                for lk in (".parentlock", "lock", "parent.lock")
-            )
+            or _has_lock_files(ff_dir)
         ):
             stats["profiles_skipped_busy"] += 1
             continue
 
-        for removable_rel in (
-            "gmp-widevinecdm",
-            "minidumps",
-            "crashes",
-            "datareporting",
-            "saved-telemetry-pings",
-            "cache2/doomed",
-            "cache2/trash",
-        ):
-            target = ff_dir / removable_rel
-            if target.exists():
-                reclaimed = _dir_size(target)
-                shutil.rmtree(target, ignore_errors=True)
-                stats["bytes_reclaimed"] += reclaimed
+        try:
+            lease = acquire_profile_lease(
+                acc_dir, holder="profile_bloat_pruner", wait_seconds=0.0
+            )
+        except ProfileLeaseBusyError:
+            stats["profiles_skipped_busy"] += 1
+            continue
 
-        entries_dir = ff_dir / "cache2" / "entries"
-        if entries_dir.is_dir():
-            file_records: List[Tuple[float, int, Path]] = []
-            total_entries_bytes = 0
-            try:
-                for entry in entries_dir.iterdir():
-                    if not entry.is_file():
-                        continue
-                    try:
-                        st = entry.stat()
-                        total_entries_bytes += st.st_size
-                        file_records.append((st.st_mtime, st.st_size, entry))
-                    except OSError:
-                        pass
-            except OSError:
-                file_records = []
-            if total_entries_bytes > max_cache_bytes:
-                file_records.sort(key=lambda r: r[0])
-                remaining_bytes = total_entries_bytes
-                for _, fsize, fpath in file_records:
-                    if remaining_bytes <= max_cache_bytes:
-                        break
-                    try:
-                        fpath.unlink(missing_ok=True)
-                        remaining_bytes -= fsize
+        with lease:
+            for removable_rel in (
+                "gmp-widevinecdm",
+                "minidumps",
+                "crashes",
+                "datareporting",
+                "saved-telemetry-pings",
+                "sessionstore-backups",
+                "cache2/doomed",
+                "cache2/trash",
+            ):
+                target = ff_dir / removable_rel
+                if target.exists():
+                    reclaimed = _dir_size(target)
+                    shutil.rmtree(target, ignore_errors=True)
+                    stats["bytes_reclaimed"] += reclaimed
+
+            for fav_entry in ff_dir.glob("favicons.sqlite*"):
+                try:
+                    if fav_entry.is_dir():
+                        reclaimed = _dir_size(fav_entry)
+                        shutil.rmtree(fav_entry, ignore_errors=True)
+                        stats["bytes_reclaimed"] += reclaimed
+                    elif fav_entry.is_file() or fav_entry.is_symlink():
+                        fsize = fav_entry.stat().st_size if fav_entry.is_file() else 0
+                        fav_entry.unlink(missing_ok=True)
                         stats["bytes_reclaimed"] += fsize
-                    except OSError:
-                        pass
+                except OSError:
+                    pass
+
+            for db_path in ff_dir.glob("*.sqlite"):
+                if not db_path.is_file():
+                    continue
+                wal_path = Path(f"{db_path}-wal")
+                if not wal_path.is_file():
+                    continue
+                try:
+                    wal_before = wal_path.stat().st_size
+                    if wal_before <= 0:
+                        continue
+                    db_before = db_path.stat().st_size
+                except OSError:
+                    continue
+                conn = None
+                try:
+                    conn = sqlite3.connect(str(db_path), timeout=2.0)
+                    conn.execute("PRAGMA busy_timeout = 1000")
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except (sqlite3.Error, OSError):
+                    continue
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                try:
+                    db_after = db_path.stat().st_size if db_path.is_file() else 0
+                    wal_after = wal_path.stat().st_size if wal_path.is_file() else 0
+                    stats["bytes_reclaimed"] += max(
+                        0, (db_before + wal_before) - (db_after + wal_after)
+                    )
+                except OSError:
+                    pass
+
+            entries_dir = ff_dir / "cache2" / "entries"
+            if entries_dir.is_dir():
+                file_records: List[Tuple[float, int, Path]] = []
+                total_entries_bytes = 0
+                try:
+                    for entry in entries_dir.iterdir():
+                        if not entry.is_file():
+                            continue
+                        try:
+                            st = entry.stat()
+                            total_entries_bytes += st.st_size
+                            file_records.append((st.st_mtime, st.st_size, entry))
+                        except OSError:
+                            pass
+                except OSError:
+                    file_records = []
+                if total_entries_bytes > max_cache_bytes:
+                    file_records.sort(key=lambda r: r[0])
+                    remaining_bytes = total_entries_bytes
+                    for _, fsize, fpath in file_records:
+                        if remaining_bytes <= max_cache_bytes:
+                            break
+                        try:
+                            fpath.unlink(missing_ok=True)
+                            remaining_bytes -= fsize
+                            stats["bytes_reclaimed"] += fsize
+                        except OSError:
+                            pass
+
+    now = time.time()
+    legacy_tmp_root = Path(__file__).resolve().parent.parent / "tmp"
+    if legacy_tmp_root.is_dir():
+        try:
+            for entry in legacy_tmp_root.glob("*browser_profile_*"):
+                if not entry.is_dir():
+                    continue
+                if (
+                    get_profile_login_holder(entry)
+                    or get_active_profile_lease_holder(entry)
+                    or _has_lock_files(entry)
+                    or _has_lock_files(entry / "firefox-profile")
+                ):
+                    continue
+                try:
+                    is_empty = not any(entry.iterdir())
+                    is_stale = (now - entry.stat().st_mtime) >= 3600.0
+                    if is_empty or is_stale:
+                        reclaimed = _dir_size(entry)
+                        shutil.rmtree(entry, ignore_errors=True)
+                        stats["bytes_reclaimed"] += reclaimed
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    sys_tmp_root = Path(tempfile.gettempdir())
+    if sys_tmp_root.is_dir():
+        try:
+            for entry in sys_tmp_root.glob("flow2api-camoufox-*"):
+                if not entry.is_dir():
+                    continue
+                if (
+                    get_profile_login_holder(entry)
+                    or get_active_profile_lease_holder(entry)
+                    or _has_lock_files(entry)
+                ):
+                    continue
+                try:
+                    if (now - entry.stat().st_mtime) >= 7200.0:
+                        reclaimed = _dir_size(entry)
+                        shutil.rmtree(entry, ignore_errors=True)
+                        stats["bytes_reclaimed"] += reclaimed
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
     return stats

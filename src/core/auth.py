@@ -176,29 +176,6 @@ class AuthManager:
         return verify_admin_password(plain_password, stored_password)
 
     @staticmethod
-    def verify_admin(username: str, password: str) -> bool:
-        """Verify admin credentials"""
-        # Compare with current config (which may be from database or config file)
-        if username is None or config.admin_username is None:
-            return False
-        username_ok = hmac.compare_digest(
-            username.encode("utf-8"), config.admin_username.encode("utf-8")
-        )
-        password_ok = verify_admin_password(password, config.admin_password)
-        return username_ok and password_ok
-
-    @staticmethod
-    async def verify_admin_async(username: str, password: str) -> bool:
-        """Verify admin credentials asynchronously without blocking the event loop."""
-        if username is None or config.admin_username is None:
-            return False
-        username_ok = hmac.compare_digest(
-            username.encode("utf-8"), config.admin_username.encode("utf-8")
-        )
-        password_ok = await verify_admin_password_async(password, config.admin_password)
-        return username_ok and password_ok
-
-    @staticmethod
     def hash_password(password: str) -> str:
         """Hash password"""
         return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")

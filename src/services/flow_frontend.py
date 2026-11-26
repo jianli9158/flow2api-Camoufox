@@ -1,6 +1,8 @@
 """Current flow.google.com frontend RPC transport and response adapters."""
 
 import contextvars
+import asyncio
+import inspect
 import hashlib
 import json
 import random
@@ -23,9 +25,10 @@ except ImportError:
     CurlMorsel = None
 
 from ..core.logger import debug_logger
-from .browser_cookie_utils import serialize_cookie_header_for_url
+from .browser_cookie_utils import build_cookie_signature, serialize_cookie_header_for_url
 from .flow_cookies import FlowCookieJar
 
+_PROXY_UNSET = object()
 
 class FlowFrontendMixin:
     """Frontend RPC helpers shared by project and media generation flows."""
@@ -113,13 +116,157 @@ class FlowFrontendMixin:
             return snapshot[1]
         return storage
 
-    def _remember_flow_cookies(self, original: str, cookie_jar: FlowCookieJar) -> None:
+    def _resolve_cookie_token_id(self, token_id: Optional[int] = None) -> Optional[int]:
+        if token_id is not None:
+            try:
+                return int(token_id)
+            except (TypeError, ValueError):
+                return None
+        ctx_getter = getattr(self, "_get_captcha_request_context", None)
+        if callable(ctx_getter):
+            raw_tid = (ctx_getter() or {}).get("token_id")
+            if raw_tid is not None:
+                try:
+                    return int(raw_tid)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    async def _persist_rotated_flow_cookies(
+        self,
+        token_id: Optional[int],
+        cookie_jar: Any,
+        *,
+        original_cookies: Optional[str] = None,
+        original_signature: Optional[str] = None,
+    ) -> None:
+        import hashlib
+
+        effective_tid = self._resolve_cookie_token_id(token_id)
+        if effective_tid is None:
+            return
+        db = getattr(self, "db", None)
+        if db is None:
+            return
+        cas_fn = getattr(db, "update_token_if_cookie_matches", None)
+        update_fn = getattr(db, "update_token", None)
+        if not callable(cas_fn) and not callable(update_fn):
+            return
+        if isinstance(cookie_jar, FlowCookieJar):
+            if not list(cookie_jar):
+                return
+            exported = cookie_jar.export_storage()
+        else:
+            exported = str(cookie_jar or "").strip()
+        if not exported or exported == "[]":
+            return
+        new_sig = build_cookie_signature(exported)
+        if not new_sig:
+            return
+        if original_signature and new_sig == original_signature:
+            return
+        persisted_sigs = getattr(self, "_persisted_cookie_signatures", None)
+        if persisted_sigs is None:
+            persisted_sigs = {}
+            self._persisted_cookie_signatures = persisted_sigs
+        if persisted_sigs.get(effective_tid) == new_sig:
+            return
+
+        if original_cookies is None:
+            ctx = getattr(self, "_flow_cookie_storage_ctx", None)
+            snap = ctx.get() if ctx is not None else None
+            if snap:
+                original_cookies = snap[0]
+
+        persisted_raw = getattr(self, "_persisted_cookie_raw", None)
+        if persisted_raw is None:
+            persisted_raw = {}
+            self._persisted_cookie_raw = persisted_raw
+        prev_persisted = persisted_raw.get(effective_tid)
+
+        new_st = (
+            "frontend-"
+            + hashlib.sha256(exported.encode("utf-8")).hexdigest()[:32]
+        )
+        try:
+            if callable(cas_fn) and (prev_persisted or original_cookies):
+                saved = False
+                for candidate_expected in (prev_persisted, original_cookies):
+                    if not candidate_expected:
+                        continue
+                    res = cas_fn(
+                        effective_tid,
+                        candidate_expected,
+                        google_cookies=exported,
+                        st=new_st,
+                    )
+                    if inspect.isawaitable(res):
+                        res = await res
+                    if res:
+                        saved = True
+                        break
+                if saved:
+                    persisted_sigs[effective_tid] = new_sig
+                    persisted_raw[effective_tid] = exported
+            elif callable(update_fn):
+                res = update_fn(
+                    effective_tid,
+                    google_cookies=exported,
+                    st=new_st,
+                )
+                if inspect.isawaitable(res):
+                    await res
+                persisted_sigs[effective_tid] = new_sig
+                persisted_raw[effective_tid] = exported
+        except Exception as exc:
+            debug_logger.log_warning(
+                f"[FlowFrontend] Failed to persist rotated cookies for token {effective_tid}: {exc}"
+            )
+
+    def _remember_flow_cookies(
+        self,
+        original: str,
+        cookie_jar: FlowCookieJar,
+        *,
+        token_id: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
         if not hasattr(self, "_flow_cookie_storage_ctx"):
             self._flow_cookie_storage_ctx = contextvars.ContextVar(
                 "flow_cookie_storage", default=None
             )
-        self._flow_cookie_storage_ctx.set((original, cookie_jar.export_storage()))
-
+        exported = cookie_jar.export_storage()
+        self._flow_cookie_storage_ctx.set((original, exported))
+        if not persist:
+            return
+        effective_tid = self._resolve_cookie_token_id(token_id)
+        if effective_tid is None:
+            return
+        db = getattr(self, "db", None)
+        if db is None or not callable(getattr(db, "update_token", None)):
+            return
+        original_sig = build_cookie_signature(original)
+        new_sig = build_cookie_signature(exported)
+        if not new_sig or new_sig == original_sig:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        tasks = getattr(self, "_cookie_persist_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._cookie_persist_tasks = tasks
+        task = loop.create_task(
+            self._persist_rotated_flow_cookies(
+                effective_tid,
+                exported,
+                original_cookies=original,
+                original_signature=original_sig,
+            )
+        )
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
     STREAM_CHAT_RPC_PATH = (
         "/_/AiSandboxAngularFrontend/data/"
         "google.internal.labs.aisandbox.proto.flow.agent.v1."
@@ -866,22 +1013,33 @@ class FlowFrontendMixin:
         for cookie in refreshed.jar:
             cookie_jar.set_cookie(cookie)
 
+    async def _resolve_frontend_proxy_url(self) -> Optional[str]:
+        proxy_url = None
+        if getattr(self, "proxy_manager", None):
+            if hasattr(self.proxy_manager, "get_request_proxy_url"):
+                proxy_url = await self.proxy_manager.get_request_proxy_url()
+            else:
+                proxy_url = await self.proxy_manager.get_proxy_url()
+        fingerprint_getter = getattr(self, "get_request_fingerprint", None)
+        fingerprint = (fingerprint_getter() or {}) if callable(fingerprint_getter) else {}
+        if isinstance(fingerprint, dict) and "proxy_url" in fingerprint:
+            proxy_url = str(fingerprint.get("proxy_url") or "").strip() or None
+        return str(proxy_url or "").strip() or None
+
     async def _load_flow_frontend_bootstrap(
         self,
         page_url: str,
         cookie_header: str,
         timeout: int,
         cookie_jar: Optional[CookieJar] = None,
+        proxy_url: Any = _PROXY_UNSET,
     ) -> str:
-        proxy_url = None
-        if self.proxy_manager:
-            if hasattr(self.proxy_manager, "get_request_proxy_url"):
-                proxy_url = await self.proxy_manager.get_request_proxy_url()
-            else:
-                proxy_url = await self.proxy_manager.get_proxy_url()
-        fingerprint = self.get_request_fingerprint() or {}
-        if "proxy_url" in fingerprint:
-            proxy_url = str(fingerprint.get("proxy_url") or "").strip() or None
+        if proxy_url is _PROXY_UNSET:
+            proxy_url = await self._resolve_frontend_proxy_url()
+        else:
+            proxy_url = str(proxy_url or "").strip() or None
+        fingerprint_getter = getattr(self, "get_request_fingerprint", None)
+        fingerprint = (fingerprint_getter() or {}) if callable(fingerprint_getter) else {}
         if isinstance(cookie_jar, FlowCookieJar):
             cookie_jar.add_runtime_cookies(fingerprint.get("session_cookies"), page_url)
         headers = {
@@ -960,6 +1118,8 @@ class FlowFrontendMixin:
             cookie_storage if str(cookie_storage or "").strip() else cookie_header
         )
         cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
+        initial_cookie_sig = build_cookie_signature(cookie_jar.export_storage())
+        pinned_proxy_url = await self._resolve_frontend_proxy_url()
         cache_key = self._build_frontend_bootstrap_cache_key(
             token_id, bootstrap_cookie_header, page_url
         )
@@ -988,13 +1148,28 @@ class FlowFrontendMixin:
                     cookie_jar = FlowCookieJar(
                         self.get_updated_flow_cookies(original_cookies)
                     )
-                bootstrap_text = await self._load_flow_frontend_bootstrap(
-                    page_url,
-                    bootstrap_cookie_header,
-                    timeout,
-                    cookie_jar=cookie_jar,
+                bootstrap_kwargs: Dict[str, Any] = {"cookie_jar": cookie_jar}
+                try:
+                    bootstrap_text = await self._load_flow_frontend_bootstrap(
+                        page_url,
+                        bootstrap_cookie_header,
+                        timeout,
+                        proxy_url=pinned_proxy_url,
+                        **bootstrap_kwargs,
+                    )
+                except TypeError:
+                    bootstrap_text = await self._load_flow_frontend_bootstrap(
+                        page_url,
+                        bootstrap_cookie_header,
+                        timeout,
+                        **bootstrap_kwargs,
+                    )
+                self._remember_flow_cookies(
+                    original_cookies, cookie_jar, token_id=token_id, persist=False
                 )
-                self._remember_flow_cookies(original_cookies, cookie_jar)
+                await self._persist_rotated_flow_cookies(
+                    token_id, cookie_jar, original_signature=initial_cookie_sig
+                )
                 bootloader_match = re.search(
                     r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
                     bootstrap_text,
@@ -1055,6 +1230,8 @@ class FlowFrontendMixin:
                     return_error_response=True,
                     redact_sensitive_logs=True,
                     cookie_jar=cookie_jar,
+                    proxy_url=pinned_proxy_url,
+                    token_id=token_id,
                 )
                 xsrf_match = re.search(
                     r'\["xsrf"\s*,\s*"((?:\\.|[^"\\])*)"', response_text
@@ -1072,6 +1249,8 @@ class FlowFrontendMixin:
                         return_error_response=True,
                         redact_sensitive_logs=True,
                         cookie_jar=cookie_jar,
+                        proxy_url=pinned_proxy_url,
+                        token_id=token_id,
                     )
 
                 frames = self._parse_batchexecute_frames(response_text)
@@ -1097,7 +1276,12 @@ class FlowFrontendMixin:
                         "at": at_token or "",
                     },
                 )
-            self._remember_flow_cookies(original_cookies, cookie_jar)
+            self._remember_flow_cookies(
+                original_cookies, cookie_jar, token_id=token_id, persist=False
+            )
+            await self._persist_rotated_flow_cookies(
+                token_id, cookie_jar, original_signature=initial_cookie_sig
+            )
             return payload
         raise RuntimeError(f"Flow frontend RPC returned no payload: rpc={rpc_id}")
 
@@ -1192,6 +1376,7 @@ class FlowFrontendMixin:
         cookie_header: str,
         timeout: int,
         cookie_storage: Optional[str] = None,
+        token_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """新版 Flow 图片生成入口：FlowCreationAgentService/StreamChat。"""
         page_url = f"https://flow.google.com/project/{project_id}"
@@ -1206,13 +1391,29 @@ class FlowFrontendMixin:
             cookie_storage if str(cookie_storage or "").strip() else cookie_header
         )
         cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
-        bootstrap_text = await self._load_flow_frontend_bootstrap(
-            page_url,
-            bootstrap_cookie_header,
-            timeout,
-            cookie_jar=cookie_jar,
+        initial_cookie_sig = build_cookie_signature(cookie_jar.export_storage())
+        pinned_proxy_url = await self._resolve_frontend_proxy_url()
+        try:
+            bootstrap_text = await self._load_flow_frontend_bootstrap(
+                page_url,
+                bootstrap_cookie_header,
+                timeout,
+                cookie_jar=cookie_jar,
+                proxy_url=pinned_proxy_url,
+            )
+        except TypeError:
+            bootstrap_text = await self._load_flow_frontend_bootstrap(
+                page_url,
+                bootstrap_cookie_header,
+                timeout,
+                cookie_jar=cookie_jar,
+            )
+        self._remember_flow_cookies(
+            original_cookies, cookie_jar, token_id=token_id, persist=False
         )
-        self._remember_flow_cookies(original_cookies, cookie_jar)
+        await self._persist_rotated_flow_cookies(
+            token_id, cookie_jar, original_signature=initial_cookie_sig
+        )
         bootloader_match = re.search(
             r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+",
             bootstrap_text,
@@ -1272,6 +1473,8 @@ class FlowFrontendMixin:
             return_error_response=True,
             redact_sensitive_logs=True,
             cookie_jar=cookie_jar,
+            proxy_url=pinned_proxy_url,
+            token_id=token_id,
         )
         frames = self._parse_batchexecute_frames(response_text)
         error_match = re.search(r"PUBLIC_ERROR_[A-Z_]+", response_text)
@@ -1294,7 +1497,12 @@ class FlowFrontendMixin:
                 )
             )
         )
-        self._remember_flow_cookies(original_cookies, cookie_jar)
+        self._remember_flow_cookies(
+            original_cookies, cookie_jar, token_id=token_id, persist=False
+        )
+        await self._persist_rotated_flow_cookies(
+            token_id, cookie_jar, original_signature=initial_cookie_sig
+        )
         return {
             "frames": frames,
             "mediaIds": media_ids,

@@ -1041,6 +1041,8 @@
         let proxyTestResultState=null;
         let lastBrowserStats=null;
         let allBrowserProfiles=[];
+        let settingsBootstrapLoadedAt=0;
+        let settingsBootstrapDirty=false;
 
         const $=(id)=>document.getElementById(id),
         BLANK_FRAME_URI='data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
@@ -1050,8 +1052,10 @@
         apiRequest=async(url,opts={})=>{const headers={...I18n.headers(),...opts.headers};if(!headers['Content-Type'])headers['Content-Type']='application/json';const r=await fetch(url,{credentials:'include',...opts,headers});return r.status===401?(location.href='/login',null):r},
         updateLastSync=()=>{const el=$('lastSyncText');if(el)el.textContent=I18n.t("同步于 {0}",{"0":new Date().toLocaleTimeString(I18n.locale,{hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false})})},
 
-        loadStats=async()=>{try{const r=await apiRequest('/api/stats');if(!r)return;const d=await r.json();I18n.setRawText($('statTotal'), d.total_tokens??0);I18n.setRawText($('statActive'), d.active_tokens??0);I18n.setRawText($('statImages'), (d.today_images||0)+'/'+(d.total_images||0));I18n.setRawText($('statVideos'), (d.today_videos||0)+'/'+(d.total_videos||0));I18n.setRawText($('statErrors'), (d.today_errors||0)+'/'+(d.total_errors||0));updateLastSync()}catch(e){console.error(I18n.t("加载统计失败:"),e)}},
-        loadTokens=async()=>{try{const r=await apiRequest('/api/tokens');if(!r)return;const data=await r.json();allTokens=Array.isArray(data)?data:[];renderTokens()}catch(e){console.error(I18n.t("加载Token失败:"),e)}},
+        applyStatsPayload=(d)=>{if(!d||typeof d!=='object')return;I18n.setRawText($('statTotal'), d.total_tokens??0);I18n.setRawText($('statActive'), d.active_tokens??0);I18n.setRawText($('statImages'), (d.today_images||0)+'/'+(d.total_images||0));I18n.setRawText($('statVideos'), (d.today_videos||0)+'/'+(d.total_videos||0));I18n.setRawText($('statErrors'), (d.today_errors||0)+'/'+(d.total_errors||0));updateLastSync()},
+        loadStats=async()=>{try{const r=await apiRequest('/api/stats');if(!r)return;applyStatsPayload(await r.json())}catch(e){console.error(I18n.t("加载统计失败:"),e)}},
+        applyTokensPayload=(data)=>{allTokens=Array.isArray(data)?data:[];renderTokens()},
+        loadTokens=async()=>{try{const r=await apiRequest('/api/tokens');if(!r)return;applyTokensPayload(await r.json())}catch(e){console.error(I18n.t("加载Token失败:"),e)}},
         renderBrowserProfileDatalist=()=>{
             const dl=$('browserProfileDatalist');
             if(!dl)return;
@@ -1081,15 +1085,15 @@
                 hint.textContent=I18n.t("将创建并绑定固定目录: {0}",{"0":normalized});
             }
         },
-        loadBrowserProfiles=async()=>{try{const r=await apiRequest('/api/tokens/browser-profiles');if(!r)return;const d=await r.json();allBrowserProfiles=Array.isArray(d.profiles)?d.profiles:[];renderBrowserProfileDatalist()}catch(_){}},
+        applyBrowserProfilesPayload=(d)=>{allBrowserProfiles=Array.isArray(d&&d.profiles)?d.profiles:[];renderBrowserProfileDatalist()},
+        loadBrowserProfiles=async()=>{try{const r=await apiRequest('/api/tokens/browser-profiles');if(!r)return;applyBrowserProfilesPayload(await r.json())}catch(_){}},
 
+        applyBrowserStatsPayload=(d)=>{if(!d||typeof d!=='object')return;lastBrowserStats=d;renderBrowserStats(d)},
         loadBrowserStats=async()=>{
             try{
                 const r=await apiRequest('/api/captcha/browser-stats');
                 if(!r)return;
-                const d=await r.json();
-                lastBrowserStats=d;
-                renderBrowserStats(d);
+                applyBrowserStatsPayload(await r.json());
             }catch(_){}
         },
 
@@ -1181,8 +1185,8 @@
 
         formatExpiry=exp=>{if(!exp)return'<span class="muted-text">-</span>';const d=new Date(exp),now=new Date(),diff=d-now;const dateStr=d.toLocaleDateString(I18n.locale, {year:'numeric',month:'2-digit',day:'2-digit'}).replace(/\//g,'-');const timeStr=d.toLocaleTimeString(I18n.locale, {hour:'2-digit',minute:'2-digit',hour12:false});const hours=Math.floor(diff/36e5);if(diff<0)return`<span class="pill neg" title="已过期" data-i18n-title="已过期"><span data-i18n="已过期">已过期</span></span>`;if(hours<1)return`<span class="pill neg tabular-nums" title="${dateStr} ${timeStr}">${Math.floor(diff/6e4)}<span data-i18n="分钟">分钟</span></span>`;if(hours<24)return`<span class="pill warn tabular-nums" title="${dateStr} ${timeStr}">${hours}<span data-i18n="小时">小时</span></span>`;const days=Math.floor(diff/864e5);if(days<7)return`<span class="pill warn tabular-nums" title="${dateStr} ${timeStr}">${days}<span data-i18n="天">天</span></span>`;return`<span class="muted-text tabular-nums" title="${dateStr} ${timeStr}">${days}<span data-i18n="天">天</span></span>`},
         formatAccountType=(tier)=>{if(tier==='PAYGATE_TIER_NOT_PAID'||!tier){return`<span class="pill">Free</span>`}if(tier==='PAYGATE_TIER_ONE'){return`<span class="pill accent">Pro</span>`}if(tier==='PAYGATE_TIER_TWO'){return`<span class="pill pos">Ult</span>`}return`<span class="pill warn" title="${escapeLogHtml(tier)}">${escapeLogHtml(tier)}</span>`},
-        formatProjectIdDisplay=(projectId,projectName)=>{if(!projectId&&!projectName)return'<span class="muted-text">-</span>';const pid=String(projectId||'');const short=pid.length>8?`${pid.substring(0,8)}...`:pid;const nameHtml=projectName?`<div class="cell-sub" style="margin-top:0;margin-bottom:3px;">${escapeLogHtml(projectName)}</div>`:'';const chipHtml=pid?`<button type="button" onclick="copyProjectId('${escapeLogHtml(pid)}')" class="project-chip" title="${I18n.escapeHtml(I18n.t('点击复制项目ID'))}&#10;${escapeLogHtml(pid)}"><code>${escapeLogHtml(short)}</code></button>`:'';return`<div>${nameHtml}${chipHtml}</div>`},
-        renderTokenActions=t=>{const toggleLabel=t.is_active?I18n.t("禁用"):I18n.t("启用");return`<div class="row-actions"><button type="button" onclick="openBrowserLoginModal({tokenId:${t.id}})" class="act-btn accent" title="使用 Camoufox 浏览器重新登录并更新缓存" data-i18n-title="使用 Camoufox 浏览器重新登录并更新缓存"><span data-i18n="重登">重登</span></button><button type="button" onclick="refreshTokenAT(${t.id})" class="act-btn"><span data-i18n="刷新凭证">刷新凭证</span></button><button type="button" onclick="openEditModal(${t.id})" class="act-btn"><span data-i18n="详情">详情</span></button><button type="button" onclick="toggleToken(${t.id},${t.is_active})" class="act-btn">${toggleLabel}</button><button type="button" onclick="deleteToken(${t.id})" class="act-btn danger"><span data-i18n="删除">删除</span></button></div>`},
+        formatProjectIdDisplay=(projectId,projectName)=>{if(!projectId&&!projectName)return'<span class="muted-text">-</span>';const pid=String(projectId||'');const short=pid.length>8?`${pid.substring(0,8)}...`:pid;const nameHtml=projectName?`<div class="cell-sub" style="margin-top:0;margin-bottom:3px;">${escapeLogHtml(projectName)}</div>`:'';const chipHtml=pid?`<button type="button" data-project-id="${escapeLogHtml(pid)}" onclick="copyProjectId(this.dataset.projectId)" class="project-chip" title="${I18n.escapeHtml(I18n.t('点击复制项目ID'))}&#10;${escapeLogHtml(pid)}"><code>${escapeLogHtml(short)}</code></button>`:'';return`<div>${nameHtml}${chipHtml}</div>`},
+        renderTokenActions=t=>{const toggleLabel=t.is_active?I18n.t("禁用"):I18n.t("启用");const tid=Number(t.id);const activeFlag=Boolean(t.is_active);return`<div class="row-actions"><button type="button" onclick="openBrowserLoginModal({tokenId:${tid}})" class="act-btn accent" title="使用 Camoufox 浏览器重新登录并更新缓存" data-i18n-title="使用 Camoufox 浏览器重新登录并更新缓存"><span data-i18n="重登">重登</span></button><button type="button" onclick="refreshTokenAT(${tid})" class="act-btn"><span data-i18n="刷新凭证">刷新凭证</span></button><button type="button" onclick="openEditModal(${tid})" class="act-btn"><span data-i18n="详情">详情</span></button><button type="button" onclick="toggleToken(${tid},${activeFlag})" class="act-btn">${toggleLabel}</button><button type="button" onclick="deleteToken(${tid})" class="act-btn danger"><span data-i18n="删除">删除</span></button></div>`},
         renderTokens=()=>{
             const tb=$('tokenTableBody');
             const filtered=allTokens.filter(t=>{
@@ -1213,7 +1217,7 @@
                 const remarkLine=t.remark?`<div class="cell-sub" title="${escapeLogHtml(t.remark)}">${escapeLogHtml(t.remark)}</div>`:'';
                 const profileLine=t.browser_profile_dir?`<div class="cell-sub" title="browser_data_rt/${escapeLogHtml(t.browser_profile_dir)}"><code>${escapeLogHtml(t.browser_profile_dir)}</code>${t.browser_profile_exists?'':` · ${escapeLogHtml(I18n.t("未初始化"))}`}</div>`:'';
                 const errBadge=errCount>0?` <span class="pill neg tabular-nums">${errCount}</span>`:` <span class="muted-text tabular-nums">0</span>`;
-                return`<tr><td><div class="cell-primary" title="${escapeLogHtml(t.email||'')}">${escapeLogHtml(t.email||'-')}</div>${remarkLine}${profileLine}</td><td>${statusBadge}${refreshNote}</td><td>${accountTypeDisplay}</td><td class="num"><button type="button" onclick="refreshTokenCredits(${t.id})" class="credit-btn" title="点击刷新余额" data-i18n-title="点击刷新余额"><span>${creditsDisplay}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12a9 9 0 11-6.219-8.56"/><path d="M15 4.5l3.5 3.5L22 4.5"/></svg></button></td><td>${expiryDisplay}</td><td>${projectDisplay}</td><td class="num"><span class="tabular-nums">${imageDisplay} / ${videoDisplay}</span>${errBadge}</td><td class="num">${renderTokenActions(t)}</td></tr>`;
+                return`<tr><td><div class="cell-primary" title="${escapeLogHtml(t.email||'')}">${escapeLogHtml(t.email||'-')}</div>${remarkLine}${profileLine}</td><td>${statusBadge}${refreshNote}</td><td>${accountTypeDisplay}</td><td class="num"><button type="button" onclick="refreshTokenCredits(${Number(t.id)})" class="credit-btn" title="点击刷新余额" data-i18n-title="点击刷新余额"><span>${creditsDisplay}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 12a9 9 0 11-6.219-8.56"/><path d="M15 4.5l3.5 3.5L22 4.5"/></svg></button></td><td>${expiryDisplay}</td><td>${projectDisplay}</td><td class="num"><span class="tabular-nums">${imageDisplay} / ${videoDisplay}</span>${errBadge}</td><td class="num">${renderTokenActions(t)}</td></tr>`;
             }).join('');
         },
 
@@ -1238,10 +1242,11 @@
         normalizeImportPayload=(importData)=>{if(importData&&!Array.isArray(importData)&&typeof importData==='object'&&Array.isArray(importData.cookies))importData=[{google_cookies:JSON.stringify({cookies:importData.cookies})}];if(!Array.isArray(importData))throw new Error(I18n.t("JSON 格式错误：根节点必须是数组或 {cookies: [...]}"));if(importData.length===0)throw new Error(I18n.t("JSON 文件为空"));const isEmail=value=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);const isCookieItem=item=>item&&typeof item==='object'&&!Array.isArray(item)&&typeof item.name==='string'&&item.name.trim()&&('value'in item);if(importData.every(isCookieItem))return[{google_cookies:JSON.stringify({cookies:importData}),protocol_mode:'protocol'}];return importData.map((item,index)=>{const position=I18n.t("第 {0} 项", {"0": (index+1)});if(!item||typeof item!=='object'||Array.isArray(item))throw new Error(I18n.t("{0} 格式错误", {"0": (position)}));if('access_token'in item||'session_token'in item||'login_password'in item)throw new Error(I18n.t("{0} 仍包含旧版凭证字段，请使用新版导出文件", {"0": (position)}));let googleCookies=item.google_cookies;if(!googleCookies&&Array.isArray(item.cookies))googleCookies=JSON.stringify({cookies:item.cookies});if(googleCookies&&typeof googleCookies!=='string')googleCookies=JSON.stringify(Array.isArray(googleCookies)?{cookies:googleCookies}:googleCookies);if(typeof googleCookies!=='string'||!googleCookies.trim())throw new Error(I18n.t("{0} 缺少 google_cookies", {"0": (position)}));let loginAccount=typeof item.login_account==='string'?item.login_account.trim().toLowerCase():'';if(loginAccount&&!isEmail(loginAccount))throw new Error(I18n.t("{0} 的 login_account 不是有效邮箱", {"0": (position)}));const{login_account,cookies,access_token,session_token,login_password,...rest}=item;return{...rest,google_cookies:googleCookies.trim(),protocol_mode:'protocol',...(loginAccount?{login_account:loginAccount}:{})}})},
         submitImportTokens=async()=>{const fileInput=$('importFile');if(!fileInput.files||fileInput.files.length===0)return showToast(I18n.t("请选择文件"),'error');const file=fileInput.files[0];if(!file.name.toLowerCase().endsWith('.json'))return showToast(I18n.t("请选择 JSON 文件"),'error');if(file.size>5*1024*1024)return showToast(I18n.t("导入文件不能超过 5MB"),'error');try{const fileContent=await file.text(),importData=JSON.parse(fileContent);const normalized=normalizeImportPayload(importData);if(normalized.length>100)return showToast(I18n.t("单次最多导入 100 个账号"),'error');const btn=$('importBtn'),btnText=$('importBtnText'),btnSpinner=$('importBtnSpinner');btn.disabled=true;I18n.setMessage(btnText, I18n.t("导入中..."));btnSpinner.classList.remove('hidden');try{const r=await apiRequest('/api/tokens/import',{method:'POST',body:JSON.stringify({tokens:normalized})});if(!r)return;const d=await r.json(),errorList=Array.isArray(d.errors)?d.errors:[];if(d.success){closeImportModal();await refreshTokens();let message=I18n.t("导入完成：新增 {0}，更新 {1}", {"0": (d.added||0), "1": (d.updated||0)});if(errorList.length)message+=I18n.t("，失败 {0}\n{1}", {"0": (errorList.length), "1": (errorList.slice(0,3).join('\n'))});showToast(message,errorList.length?'error':'success')}else{const detail=Array.isArray(d.detail)?d.detail.map(item=>item.msg||String(item)).join('；'):(d.detail||d.message||errorList.join('\n')||I18n.t("未知错误"));showToast(I18n.t("导入失败: {error}", {error: (detail)}),'error')}}catch(e){showToast(I18n.t("导入失败: {error}", {error: (e.message)}),'error')}finally{btn.disabled=false;I18n.setMessage(btnText, I18n.t("导入"));btnSpinner.classList.add('hidden')}}catch(e){showToast(I18n.t("导入失败: {error}", {error: (e.message)}),'error')}},
 
-        loadAdminConfig=async()=>{try{const r=await apiRequest('/api/admin/config');if(!r)return;const d=await r.json();$('cfgErrorBan').value=d.error_ban_threshold||3;$('cfgAdminUsername').value=d.admin_username||'admin';$('cfgCurrentAPIKey').value=d.api_key||'';$('cfgDebugEnabled').checked=d.debug_enabled||false}catch(e){console.error(I18n.t("加载配置失败:"),e)}},
-        saveAdminConfig=async()=>{try{const r=await apiRequest('/api/admin/config',{method:'POST',body:JSON.stringify({error_ban_threshold:parseInt($('cfgErrorBan').value)||3})});if(!r)return;const d=await r.json();d.success?showToast(I18n.t("配置保存成功"),'success'):showToast(I18n.t("保存失败"),'error')}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        applyAdminConfigPayload=(d)=>{if(!d||typeof d!=='object')return;$('cfgErrorBan').value=d.error_ban_threshold||3;$('cfgAdminUsername').value=d.admin_username||'admin';$('cfgCurrentAPIKey').value=d.api_key||'';$('cfgDebugEnabled').checked=d.debug_enabled||false},
+        loadAdminConfig=async()=>{try{const r=await apiRequest('/api/admin/config');if(!r)return;applyAdminConfigPayload(await r.json())}catch(e){console.error(I18n.t("加载配置失败:"),e)}},
+        saveAdminConfig=async()=>{try{const r=await apiRequest('/api/admin/config',{method:'POST',body:JSON.stringify({error_ban_threshold:parseInt($('cfgErrorBan').value)||3})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("配置保存成功"),'success')}else{showToast(I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         updateAdminPassword=async()=>{const username=$('cfgAdminUsername').value.trim(),oldPwd=$('cfgOldPassword').value.trim(),newPwd=$('cfgNewPassword').value.trim();if(!oldPwd||!newPwd)return showToast(I18n.t("请输入旧密码和新密码"),'error');if(newPwd.length<4)return showToast(I18n.t("新密码至少4个字符"),'error');try{const r=await apiRequest('/api/admin/password',{method:'POST',body:JSON.stringify({username:username||undefined,old_password:oldPwd,new_password:newPwd})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("密码修改成功，请重新登录"),'success');setTimeout(()=>{location.href='/login'},2000)}else{showToast(I18n.t("修改失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("修改失败: {error}", {error: (e.message)}),'error')}},
-        updateAPIKey=async()=>{const newKey=$('cfgNewAPIKey').value.trim();if(!newKey)return showToast(I18n.t("请输入新的 API Key"),'error');if(newKey.length<6)return showToast(I18n.t("API Key 至少6个字符"),'error');if(!confirm(I18n.t("确定要更新 API Key 吗？更新后需要通知所有客户端使用新密钥。")))return;try{const r=await apiRequest('/api/admin/apikey',{method:'POST',body:JSON.stringify({new_api_key:newKey})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("API Key 更新成功"),'success');$('cfgCurrentAPIKey').value=newKey;$('cfgNewAPIKey').value=''}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error')}},
+        updateAPIKey=async()=>{const newKey=$('cfgNewAPIKey').value.trim();if(!newKey)return showToast(I18n.t("请输入新的 API Key"),'error');if(newKey.length<6)return showToast(I18n.t("API Key 至少6个字符"),'error');if(!confirm(I18n.t("确定要更新 API Key 吗？更新后需要通知所有客户端使用新密钥。")))return;try{const r=await apiRequest('/api/admin/apikey',{method:'POST',body:JSON.stringify({new_api_key:newKey})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("API Key 更新成功"),'success');$('cfgCurrentAPIKey').value=newKey;$('cfgNewAPIKey').value=''}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error')}},
         maskApiKeyValue=(val)=>{const s=String(val||'');if(s.length<=12)return s;return `${s.slice(0,8)}…${s.slice(-4)}`},
         copyManagedApiKey=async(id)=>{const rec=allManagedApiKeys.find(k=>k.id===id);const val=rec?String(rec.key_value||''):'';if(!val)return;try{if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(val);showToast(I18n.t("API Key 已复制"),'success');return}}catch(e){}try{const ta=document.createElement('textarea');ta.value=val;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);showToast(I18n.t("API Key 已复制"),'success')}catch(e){showToast(I18n.t("复制失败: {error}",{error:e.message}),'error')}},
         renderManagedApiKeys=()=>{
@@ -1262,7 +1267,8 @@
                 return`<tr><td><div class="cell-primary">${escapeLogHtml(k.name||'-')}</div>${remarkHtml}</td><td><div style="display:flex;align-items:center;gap:6px;"><code title="${escapeLogHtml(k.key_value)}">${escapeLogHtml(maskApiKeyValue(k.key_value))}</code><button type="button" onclick="copyManagedApiKey(${Number(k.id)})" class="act-btn">${escapeLogHtml(I18n.t("复制"))}</button></div></td><td>${scopeHtml}</td><td>${statusHtml}</td><td class="num"><div class="row-actions"><button type="button" onclick="openApiKeyModal(${Number(k.id)})" class="act-btn">${escapeLogHtml(I18n.t("编辑"))}</button><button type="button" onclick="toggleManagedApiKey(${Number(k.id)},${!k.is_active})" class="act-btn">${escapeLogHtml(toggleText)}</button><button type="button" onclick="deleteManagedApiKey(${Number(k.id)})" class="act-btn danger">${escapeLogHtml(I18n.t("删除"))}</button></div></td></tr>`;
             }).join('');
         },
-        loadManagedAPIKeys=async()=>{try{const r=await apiRequest('/api/admin/apikeys');if(!r)return;const d=await r.json();if(d.success){allManagedApiKeys=Array.isArray(d.keys)?d.keys:[];allSelectableModels=Array.isArray(d.available_models)?d.available_models:[];renderManagedApiKeys()}}catch(e){console.error(e)}},
+        applyManagedAPIKeysPayload=(d)=>{if(d&&d.success){allManagedApiKeys=Array.isArray(d.keys)?d.keys:[];allSelectableModels=Array.isArray(d.available_models)?d.available_models:[];renderManagedApiKeys()}},
+        loadManagedAPIKeys=async()=>{try{const r=await apiRequest('/api/admin/apikeys');if(!r)return;applyManagedAPIKeysPayload(await r.json())}catch(e){console.error(e)}},
         generateManagedApiKeyValue=()=>{const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);let out='sk-flow-';for(let i=0;i<bytes.length;i++)out+=chars[bytes[i]%chars.length];$('apiKeyValue').value=out},
         toggleApiKeyModelPicker=()=>{const specific=$('apiKeyScopeSpecific')?.checked;const wrap=$('apiKeyModelPickerWrap');if(!wrap)return;wrap.classList.toggle('hidden',!specific);wrap.style.display=specific?'flex':'none';if(specific)renderApiKeyModelPicker()},
         toggleSingleApiKeyModel=(modelId,checked)=>{if(checked)apiKeySelectedModelSet.add(modelId);else apiKeySelectedModelSet.delete(modelId);updateApiKeySelectedCount()},
@@ -1330,6 +1336,7 @@
                 if(!r)return;
                 const d=await r.json().catch(()=>({}));
                 if(r.ok&&d.success){
+                    settingsBootstrapDirty=true;
                     closeApiKeyModal();
                     await loadManagedAPIKeys();
                     showToast(editId?I18n.t("API Key 更新成功"):I18n.t("API Key 创建成功"),'success');
@@ -1340,33 +1347,40 @@
                 showToast(I18n.t("保存失败: {error}",{error:e.message}),'error');
             }finally{if(btn)btn.disabled=false}
         },
-        toggleManagedApiKey=async(id,nextActive)=>{try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'PUT',body:JSON.stringify({is_active:nextActive})});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){await loadManagedAPIKeys();showToast(nextActive?I18n.t("API Key 已启用"):I18n.t("API Key 已禁用"),'success')}else{showToast(I18n.t("操作失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("操作失败: {error}",{error:e.message}),'error')}},
-        deleteManagedApiKey=async(id)=>{if(!confirm(I18n.t("确定要删除这个 API Key 吗？")))return;try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'DELETE'});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){await loadManagedAPIKeys();showToast(I18n.t("删除成功"),'success')}else{showToast(I18n.t("删除失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("删除失败: {error}",{error:e.message}),'error')}},
-        toggleDebugMode=async()=>{const enabled=$('cfgDebugEnabled').checked;try{const r=await apiRequest('/api/admin/debug',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r)return;const d=await r.json();if(d.success){showToast(enabled?I18n.t("调试模式已开启"):I18n.t("调试模式已关闭"),'success')}else{showToast(I18n.t("操作失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error');$('cfgDebugEnabled').checked=!enabled}}catch(e){showToast(I18n.t("操作失败: {error}", {error: (e.message)}),'error');$('cfgDebugEnabled').checked=!enabled}},
-        loadProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config');if(!r)return;const d=await r.json();$('cfgProxyEnabled').checked=d.proxy_enabled||false;$('cfgProxyUrl').value=d.proxy_url||'';$('cfgMediaProxyEnabled').checked=d.media_proxy_enabled||false;$('cfgMediaProxyUrl').value=d.media_proxy_url||'';toggleMediaProxyInput()}catch(e){console.error(I18n.t("加载代理配置失败:"),e)}},
-        saveProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config',{method:'POST',body:JSON.stringify({proxy_enabled:$('cfgProxyEnabled').checked,proxy_url:$('cfgProxyUrl').value.trim(),media_proxy_enabled:$('cfgMediaProxyEnabled').checked,media_proxy_url:$('cfgMediaProxyUrl').value.trim()})});if(!r)return;const d=await r.json();d.success?showToast(I18n.t("代理配置保存成功"),'success'):showToast(I18n.t("保存失败"),'error')}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        toggleManagedApiKey=async(id,nextActive)=>{try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'PUT',body:JSON.stringify({is_active:nextActive})});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){settingsBootstrapDirty=true;await loadManagedAPIKeys();showToast(nextActive?I18n.t("API Key 已启用"):I18n.t("API Key 已禁用"),'success')}else{showToast(I18n.t("操作失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("操作失败: {error}",{error:e.message}),'error')}},
+        deleteManagedApiKey=async(id)=>{if(!confirm(I18n.t("确定要删除这个 API Key 吗？")))return;try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'DELETE'});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){settingsBootstrapDirty=true;await loadManagedAPIKeys();showToast(I18n.t("删除成功"),'success')}else{showToast(I18n.t("删除失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("删除失败: {error}",{error:e.message}),'error')}},
+        toggleDebugMode=async()=>{const enabled=$('cfgDebugEnabled').checked;try{const r=await apiRequest('/api/admin/debug',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(enabled?I18n.t("调试模式已开启"):I18n.t("调试模式已关闭"),'success')}else{showToast(I18n.t("操作失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error');$('cfgDebugEnabled').checked=!enabled}}catch(e){showToast(I18n.t("操作失败: {error}", {error: (e.message)}),'error');$('cfgDebugEnabled').checked=!enabled}},
+        applyProxyConfigPayload=(d)=>{if(!d||typeof d!=='object')return;const src=(d.config&&typeof d.config==='object')?d.config:d;$('cfgProxyEnabled').checked=(src.proxy_enabled!==undefined?src.proxy_enabled:src.enabled)||false;$('cfgProxyUrl').value=src.proxy_url||'';$('cfgMediaProxyEnabled').checked=src.media_proxy_enabled||false;$('cfgMediaProxyUrl').value=src.media_proxy_url||'';toggleMediaProxyInput()},
+        loadProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config');if(!r)return;applyProxyConfigPayload(await r.json())}catch(e){console.error(I18n.t("加载代理配置失败:"),e)}},
+        saveProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config',{method:'POST',body:JSON.stringify({proxy_enabled:$('cfgProxyEnabled').checked,proxy_url:$('cfgProxyUrl').value.trim(),media_proxy_enabled:$('cfgMediaProxyEnabled').checked,media_proxy_url:$('cfgMediaProxyUrl').value.trim()})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("代理配置保存成功"),'success')}else{showToast(I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         updateProxyTestResult=(message,isSuccess,results=null)=>{proxyTestResultState={message,isSuccess,results};renderProxyTestResult()},
         testProxyConfig=async()=>{const tests=[];const requestProxyUrl=$('cfgProxyUrl').value.trim();const mediaProxyUrl=$('cfgMediaProxyUrl').value.trim();const testUrl='https://flow.google.com/';if(requestProxyUrl)tests.push({name:"请求代理",proxy_url:requestProxyUrl});if(mediaProxyUrl&&mediaProxyUrl!==requestProxyUrl)tests.push({name:"媒体代理",proxy_url:mediaProxyUrl});if(tests.length===0){updateProxyTestResult(I18n.t("请先填写至少一个代理地址"),false);showToast(I18n.t("请先填写代理地址"),'error');return}const btn=$('btnTestProxy');if(btn){btn.disabled=true;I18n.setMessage(btn, I18n.t("测试中..."))}try{const results=[];for(const item of tests){const r=await apiRequest('/api/proxy/test',{method:'POST',body:JSON.stringify({proxy_url:item.proxy_url,test_url:testUrl})});if(!r){results.push({name:item.name,success:false,messageKey:"请求失败"});continue}const d=await r.json();results.push({name:item.name,success:!!d.success,message:d.message||'',messageKey:d.message?null:"未知结果",status_code:d.status_code,elapsed_ms:d.elapsed_ms,final_url:d.final_url})}const allPass=results.every(x=>x.success);updateProxyTestResult('',allPass,results);showToast(allPass?I18n.t("代理测试通过"):I18n.t("代理测试未全部通过"),allPass?'success':'error')}catch(e){updateProxyTestResult(I18n.t("代理测试失败: {error}", {error: (e.message)}),false);showToast(I18n.t("代理测试失败: {error}", {error: (e.message)}),'error')}finally{if(btn){btn.disabled=false;I18n.setMessage(btn, I18n.t("测试代理"))}}},
         toggleMediaProxyInput=()=>{const enabled=$('cfgMediaProxyEnabled').checked;$('mediaProxyUrlInput').classList.toggle('hidden',!enabled)},
         toggleCacheOptions=()=>{const enabled=$('cfgCacheEnabled').checked;$('cacheOptions').style.display=enabled?'flex':'none'},
-        loadCacheConfig=async()=>{try{const r=await apiRequest('/api/cache/config');if(!r)return;const d=await r.json();if(d.success&&d.config){const enabled=d.config.enabled!==false;const timeout=d.config.timeout??7200;const baseUrl=d.config.base_url||'';const effectiveUrl=d.config.effective_base_url||'';$('cfgCacheEnabled').checked=enabled;$('cfgCacheTimeout').value=timeout;$('cfgCacheBaseUrl').value=baseUrl;if(effectiveUrl){I18n.setRawText($('cacheEffectiveUrlValue'), effectiveUrl);$('cacheEffectiveUrl').classList.remove('hidden')}else{$('cacheEffectiveUrl').classList.add('hidden')}toggleCacheOptions()}}catch(e){showToast(I18n.t("加载缓存配置失败: {error}", {error: (e.message)}),'error')}},
-        loadGenerationTimeout=async()=>{try{const r=await apiRequest('/api/generation/timeout');if(!r)return;const d=await r.json();if(d.success&&d.config){$('cfgImageTimeout').value=d.config.image_timeout||300;$('cfgVideoTimeout').value=d.config.video_timeout||1500;$('cfgMaxRetries').value=d.config.max_retries||3}}catch(e){showToast(I18n.t("加载生成配置失败: {error}", {error: (e.message)}),'error')}},
-        loadCallLogicConfig=async()=>{try{const r=await apiRequest('/api/call-logic/config');if(!r)return;const d=await r.json();if(d.success&&d.config){const mode=d.config.call_mode||((d.config.polling_mode_enabled||false)?'polling':'default');$('cfgCallLogicMode').value=mode}}catch(e){showToast(I18n.t("加载轮询模式配置失败: {error}", {error: (e.message)}),'error')}},
-        saveCacheConfig=async()=>{const enabled=$('cfgCacheEnabled').checked,timeoutInput=$('cfgCacheTimeout').value.trim(),timeout=timeoutInput===''?7200:parseInt(timeoutInput,10),baseUrl=$('cfgCacheBaseUrl').value.trim();if(Number.isNaN(timeout)||timeout<0||timeout>86400)return showToast(I18n.t("缓存超时时间必须在 0-86400 秒之间，0 表示不删除"),'error');if(baseUrl&&!baseUrl.startsWith('http://')&&!baseUrl.startsWith('https://'))return showToast(I18n.t("域名必须以 http:// 或 https:// 开头"),'error');try{const r0=await apiRequest('/api/cache/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r0)return;const d0=await r0.json();if(!d0.success)return showToast(I18n.t("保存缓存启用状态失败"),'error');const r1=await apiRequest('/api/cache/config',{method:'POST',body:JSON.stringify({timeout:timeout})});if(!r1)return;const d1=await r1.json();if(!d1.success)return showToast(I18n.t("保存超时时间失败"),'error');const r2=await apiRequest('/api/cache/base-url',{method:'POST',body:JSON.stringify({base_url:baseUrl})});if(!r2)return;const d2=await r2.json();if(d2.success){showToast(I18n.t("缓存配置保存成功"),'success');await new Promise(r=>setTimeout(r,200));await loadCacheConfig()}else{showToast(I18n.t("保存域名失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
-        saveGenerationTimeout=async()=>{const imageTimeout=parseInt($('cfgImageTimeout').value)||300,videoTimeout=parseInt($('cfgVideoTimeout').value)||1500,maxRetries=parseInt($('cfgMaxRetries').value)||3;if(imageTimeout<60||imageTimeout>3600)return showToast(I18n.t("图片超时时间必须在 60-3600 秒之间"),'error');if(videoTimeout<60||videoTimeout>7200)return showToast(I18n.t("视频超时时间必须在 60-7200 秒之间"),'error');if(maxRetries<1)return showToast(I18n.t("最大重试次数不能小于 1"),'error');try{const r=await apiRequest('/api/generation/timeout',{method:'POST',body:JSON.stringify({image_timeout:imageTimeout,video_timeout:videoTimeout,max_retries:maxRetries})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("生成配置保存成功"),'success');await new Promise(r=>setTimeout(r,200));await loadGenerationTimeout()}else{showToast(I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
-        saveCallLogicConfig=async()=>{const callMode=$('cfgCallLogicMode').value||'default';try{const r=await apiRequest('/api/call-logic/config',{method:'POST',body:JSON.stringify({call_mode:callMode})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("Token轮询配置保存成功"),'success');await loadCallLogicConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存轮询模式配置失败: {error}", {error: (e.message)}),'error')}},
+        applyCacheConfigPayload=(d)=>{if(d&&d.success&&d.config){const enabled=d.config.enabled!==false;const timeout=d.config.timeout??7200;const baseUrl=d.config.base_url||'';const effectiveUrl=d.config.effective_base_url||'';$('cfgCacheEnabled').checked=enabled;$('cfgCacheTimeout').value=timeout;$('cfgCacheBaseUrl').value=baseUrl;if(effectiveUrl){I18n.setRawText($('cacheEffectiveUrlValue'), effectiveUrl);$('cacheEffectiveUrl').classList.remove('hidden')}else{$('cacheEffectiveUrl').classList.add('hidden')}toggleCacheOptions()}},
+        loadCacheConfig=async()=>{try{const r=await apiRequest('/api/cache/config');if(!r)return;applyCacheConfigPayload(await r.json())}catch(e){showToast(I18n.t("加载缓存配置失败: {error}", {error: (e.message)}),'error')}},
+        applyGenerationTimeoutPayload=(d)=>{if(d&&d.success&&d.config){$('cfgImageTimeout').value=d.config.image_timeout||300;$('cfgVideoTimeout').value=d.config.video_timeout||1500;$('cfgMaxRetries').value=d.config.max_retries||3}},
+        loadGenerationTimeout=async()=>{try{const r=await apiRequest('/api/generation/timeout');if(!r)return;applyGenerationTimeoutPayload(await r.json())}catch(e){showToast(I18n.t("加载生成配置失败: {error}", {error: (e.message)}),'error')}},
+        applyCallLogicConfigPayload=(d)=>{if(d&&d.success&&d.config){const mode=d.config.call_mode||((d.config.polling_mode_enabled||false)?'polling':'default');$('cfgCallLogicMode').value=mode}},
+        loadCallLogicConfig=async()=>{try{const r=await apiRequest('/api/call-logic/config');if(!r)return;applyCallLogicConfigPayload(await r.json())}catch(e){showToast(I18n.t("加载轮询模式配置失败: {error}", {error: (e.message)}),'error')}},
+        saveCacheConfig=async()=>{const enabled=$('cfgCacheEnabled').checked,timeoutInput=$('cfgCacheTimeout').value.trim(),timeout=timeoutInput===''?7200:parseInt(timeoutInput,10),baseUrl=$('cfgCacheBaseUrl').value.trim();if(Number.isNaN(timeout)||timeout<0||timeout>86400)return showToast(I18n.t("缓存超时时间必须在 0-86400 秒之间，0 表示不删除"),'error');if(baseUrl&&!baseUrl.startsWith('http://')&&!baseUrl.startsWith('https://'))return showToast(I18n.t("域名必须以 http:// 或 https:// 开头"),'error');try{const r0=await apiRequest('/api/cache/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r0)return;const d0=await r0.json();if(!d0.success)return showToast(I18n.t("保存缓存启用状态失败"),'error');const r1=await apiRequest('/api/cache/config',{method:'POST',body:JSON.stringify({timeout:timeout})});if(!r1)return;const d1=await r1.json();if(!d1.success)return showToast(I18n.t("保存超时时间失败"),'error');const r2=await apiRequest('/api/cache/base-url',{method:'POST',body:JSON.stringify({base_url:baseUrl})});if(!r2)return;const d2=await r2.json();if(d2.success){settingsBootstrapDirty=true;showToast(I18n.t("缓存配置保存成功"),'success');await new Promise(r=>setTimeout(r,200));await loadCacheConfig()}else{showToast(I18n.t("保存域名失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        saveGenerationTimeout=async()=>{const imageTimeout=parseInt($('cfgImageTimeout').value)||300,videoTimeout=parseInt($('cfgVideoTimeout').value)||1500,maxRetries=parseInt($('cfgMaxRetries').value)||3;if(imageTimeout<60||imageTimeout>3600)return showToast(I18n.t("图片超时时间必须在 60-3600 秒之间"),'error');if(videoTimeout<60||videoTimeout>7200)return showToast(I18n.t("视频超时时间必须在 60-7200 秒之间"),'error');if(maxRetries<1)return showToast(I18n.t("最大重试次数不能小于 1"),'error');try{const r=await apiRequest('/api/generation/timeout',{method:'POST',body:JSON.stringify({image_timeout:imageTimeout,video_timeout:videoTimeout,max_retries:maxRetries})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("生成配置保存成功"),'success');await new Promise(r=>setTimeout(r,200));await loadGenerationTimeout()}else{showToast(I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        saveCallLogicConfig=async()=>{const callMode=$('cfgCallLogicMode').value||'default';try{const r=await apiRequest('/api/call-logic/config',{method:'POST',body:JSON.stringify({call_mode:callMode})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("Token轮询配置保存成功"),'success');await loadCallLogicConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存轮询模式配置失败: {error}", {error: (e.message)}),'error')}},
         toggleCaptchaOptions=()=>{},
         toggleBrowserProxyInput=()=>{const enabled=$('cfgBrowserProxyEnabled').checked;$('browserProxyUrlInput').classList.toggle('hidden',!enabled)},
-        loadCaptchaConfig=async()=>{try{const r=await apiRequest('/api/captcha/config');if(!r)return;const d=await r.json();const freshRestart=d.browser_personal_fresh_restart_every_n_solves===undefined?10:d.browser_personal_fresh_restart_every_n_solves;if($('cfgCaptchaMethod'))$('cfgCaptchaMethod').value='camoufox';$('cfgBrowserProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgBrowserProxyUrl').value=d.browser_proxy_url||'';$('cfgBrowserCount').value=d.browser_count||1;if($('cfgPersonalFreshRestartEveryNSolves'))$('cfgPersonalFreshRestartEveryNSolves').value=freshRestart;toggleBrowserProxyInput();await resumeCaptchaRuntimeStatusPollingIfNeeded('browser')}catch(e){showToast(I18n.t("加载验证码配置失败: {error}", {error: (e.message)}),'error')}},
-        saveCaptchaConfig=async()=>{const browserProxyEnabled=$('cfgBrowserProxyEnabled').checked,browserProxyUrl=$('cfgBrowserProxyUrl').value.trim(),browserCount=parseInt($('cfgBrowserCount').value)||1,freshRestart=Math.max(0,parseInt($('cfgPersonalFreshRestartEveryNSolves')?.value)||0);try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:'camoufox',browser_proxy_enabled:browserProxyEnabled,browser_proxy_url:browserProxyUrl,browser_count:browserCount,browser_personal_fresh_restart_every_n_solves:freshRestart})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("验证码配置保存成功"),'success');if(d.runtime_status_method){startCaptchaRuntimeStatusPolling(d.runtime_status_method,d.runtime_prepare_message||I18n.t("已开始准备浏览器运行环境，安装进度将自动显示。"))}else{stopCaptchaRuntimeStatusPolling()}await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
-        loadPluginConfig=async()=>{try{const r=await apiRequest('/api/plugin/config');if(!r)return;const d=await r.json();if(d.success&&d.config){$('cfgPluginConnectionUrl').value=d.config.connection_url||'';$('cfgPluginConnectionToken').value=d.config.connection_token||'';$('cfgAutoEnableOnUpdate').checked=d.config.auto_enable_on_update||false}}catch(e){showToast(I18n.t("加载插件配置失败: {error}", {error: (e.message)}),'error')}},
-        savePluginConfig=async()=>{const token=$('cfgPluginConnectionToken').value.trim();const autoEnable=$('cfgAutoEnableOnUpdate').checked;try{const r=await apiRequest('/api/plugin/config',{method:'POST',body:JSON.stringify({connection_token:token,auto_enable_on_update:autoEnable})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("插件配置保存成功"),'success');await loadPluginConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        applyCaptchaConfigPayload=(d)=>{if(!d||typeof d!=='object')return;const freshRestart=d.browser_personal_fresh_restart_every_n_solves===undefined?10:d.browser_personal_fresh_restart_every_n_solves;if($('cfgCaptchaMethod'))$('cfgCaptchaMethod').value='camoufox';$('cfgBrowserProxyEnabled').checked=d.browser_proxy_enabled||false;$('cfgBrowserProxyUrl').value=d.browser_proxy_url||'';$('cfgBrowserCount').value=d.browser_count||1;if($('cfgPersonalFreshRestartEveryNSolves'))$('cfgPersonalFreshRestartEveryNSolves').value=freshRestart;toggleBrowserProxyInput()},
+        loadCaptchaConfig=async()=>{try{const r=await apiRequest('/api/captcha/config');if(!r)return;applyCaptchaConfigPayload(await r.json());await resumeCaptchaRuntimeStatusPollingIfNeeded('browser')}catch(e){showToast(I18n.t("加载验证码配置失败: {error}", {error: (e.message)}),'error')}},
+        saveCaptchaConfig=async()=>{const browserProxyEnabled=$('cfgBrowserProxyEnabled').checked,browserProxyUrl=$('cfgBrowserProxyUrl').value.trim(),browserCount=parseInt($('cfgBrowserCount').value)||1,freshRestart=Math.max(0,parseInt($('cfgPersonalFreshRestartEveryNSolves')?.value)||0);try{const r=await apiRequest('/api/captcha/config',{method:'POST',body:JSON.stringify({captcha_method:'camoufox',browser_proxy_enabled:browserProxyEnabled,browser_proxy_url:browserProxyUrl,browser_count:browserCount,browser_personal_fresh_restart_every_n_solves:freshRestart})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("验证码配置保存成功"),'success');if(d.runtime_status_method){startCaptchaRuntimeStatusPolling(d.runtime_status_method,d.runtime_prepare_message||I18n.t("已开始准备浏览器运行环境，安装进度将自动显示。"))}else{stopCaptchaRuntimeStatusPolling()}await new Promise(r=>setTimeout(r,200));await loadCaptchaConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        applyPluginConfigPayload=(d)=>{if(d&&d.success&&d.config){$('cfgPluginConnectionUrl').value=d.config.connection_url||'';$('cfgPluginConnectionToken').value=d.config.connection_token||'';$('cfgAutoEnableOnUpdate').checked=d.config.auto_enable_on_update||false}},
+        loadPluginConfig=async()=>{try{const r=await apiRequest('/api/plugin/config');if(!r)return;applyPluginConfigPayload(await r.json())}catch(e){showToast(I18n.t("加载插件配置失败: {error}", {error: (e.message)}),'error')}},
+        savePluginConfig=async()=>{const token=$('cfgPluginConnectionToken').value.trim();const autoEnable=$('cfgAutoEnableOnUpdate').checked;try{const r=await apiRequest('/api/plugin/config',{method:'POST',body:JSON.stringify({connection_token:token,auto_enable_on_update:autoEnable})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("插件配置保存成功"),'success');await loadPluginConfig()}else{showToast(d.message||I18n.t("保存失败"),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         copyConnectionUrl=()=>{const url=$('cfgPluginConnectionUrl').value;if(!url){showToast(I18n.t("连接接口为空"),'error');return}navigator.clipboard.writeText(url).then(()=>showToast(I18n.t("连接接口已复制"),'success')).catch(()=>showToast(I18n.t("复制失败"),'error'))},
         copyConnectionToken=()=>{const token=$('cfgPluginConnectionToken').value;if(!token){showToast(I18n.t("连接Token为空"),'error');return}navigator.clipboard.writeText(token).then(()=>showToast(I18n.t("连接Token已复制"),'success')).catch(()=>showToast(I18n.t("复制失败"),'error'))},
         generateRandomToken=()=>{const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';let token='';for(let i=0;i<32;i++){token+=chars.charAt(Math.floor(Math.random()*chars.length))}$('cfgPluginConnectionToken').value=token;showToast(I18n.t("随机Token已生成"),'success')},
-        toggleATAutoRefresh=async()=>{try{const enabled=$('atAutoRefreshToggle').checked;const r=await apiRequest('/api/token-refresh/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r){$('atAutoRefreshToggle').checked=!enabled;return}const d=await r.json();if(d.success){showToast(enabled?I18n.t("AT自动刷新已启用"):I18n.t("AT自动刷新已禁用"),'success')}else{showToast(I18n.t("操作失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error');$('atAutoRefreshToggle').checked=!enabled}}catch(e){showToast(I18n.t("操作失败: {error}", {error: (e.message)}),'error');$('atAutoRefreshToggle').checked=!enabled}},
-        loadATAutoRefreshConfig=async()=>{try{const r=await apiRequest('/api/token-refresh/config');if(!r)return;const d=await r.json();if(d.success&&d.config){$('atAutoRefreshToggle').checked=d.config.at_auto_refresh_enabled||false;$('globalRefreshIntervalMinutes').value=d.config.refresh_interval_minutes||30}}catch(e){}},
-        applyGlobalRefreshInterval=async()=>{const minutes=parseInt($('globalRefreshIntervalMinutes').value);if(!minutes||minutes<1||minutes>10080)return showToast(I18n.t("刷新间隔需在 1-10080 分钟之间"),'error');try{const r=await apiRequest('/api/token-refresh/config',{method:'POST',body:JSON.stringify({refresh_interval_minutes:minutes,apply_to_tokens:true})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("已设置为 {0} 分钟，并应用到 {1} 个账号", {"0": (minutes), "1": (d.applied_to_tokens||0)}),'success');await refreshTokens()}else{showToast(I18n.t("保存失败: {error}", {error: (d.detail||d.message||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
+        toggleATAutoRefresh=async()=>{try{const enabled=$('atAutoRefreshToggle').checked;const r=await apiRequest('/api/token-refresh/enabled',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r){$('atAutoRefreshToggle').checked=!enabled;return}const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(enabled?I18n.t("AT自动刷新已启用"):I18n.t("AT自动刷新已禁用"),'success')}else{showToast(I18n.t("操作失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error');$('atAutoRefreshToggle').checked=!enabled}}catch(e){showToast(I18n.t("操作失败: {error}", {error: (e.message)}),'error');$('atAutoRefreshToggle').checked=!enabled}},
+        applyATAutoRefreshConfigPayload=(d)=>{if(d&&d.success&&d.config){$('atAutoRefreshToggle').checked=d.config.at_auto_refresh_enabled||false;$('globalRefreshIntervalMinutes').value=d.config.refresh_interval_minutes||30}},
+        loadATAutoRefreshConfig=async()=>{try{const r=await apiRequest('/api/token-refresh/config');if(!r)return;applyATAutoRefreshConfigPayload(await r.json())}catch(e){}},
+        applyGlobalRefreshInterval=async()=>{const minutes=parseInt($('globalRefreshIntervalMinutes').value);if(!minutes||minutes<1||minutes>10080)return showToast(I18n.t("刷新间隔需在 1-10080 分钟之间"),'error');try{const r=await apiRequest('/api/token-refresh/config',{method:'POST',body:JSON.stringify({refresh_interval_minutes:minutes,apply_to_tokens:true})});if(!r)return;const d=await r.json();if(d.success){settingsBootstrapDirty=true;showToast(I18n.t("已设置为 {0} 分钟，并应用到 {1} 个账号", {"0": (minutes), "1": (d.applied_to_tokens||0)}),'success');await refreshTokens()}else{showToast(I18n.t("保存失败: {error}", {error: (d.detail||d.message||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
 
         formatLogStatus=l=>{const statusText=(l.status_text||'').trim();if(statusText){const map={started:I18n.t("已启动"),token_selected:I18n.t("已选中账号"),token_ready:I18n.t("准备生成环境"),project_ready:I18n.t("项目已就绪"),uploading_images:I18n.t("上传参考图中"),solving_image_captcha:I18n.t("图片打码验证中"),submitting_image:I18n.t("图片提交中"),image_generated:I18n.t("图片生成完成"),preparing_video:I18n.t("准备视频任务"),submitting_video:I18n.t("视频提交中"),video_submitted:I18n.t("视频任务已提交"),video_polling:I18n.t("视频生成中"),caching_image:I18n.t("缓存图片中"),caching_video:I18n.t("缓存视频中"),completed:I18n.t("已完成"),failed:I18n.t("失败"),processing:I18n.t("处理中"),upsampling_2k:I18n.t("正在放大到2K"),upsampling_4k:I18n.t("正在放大到4K"),upsampling_1080p:I18n.t("正在放大到1080P")};return map[statusText]||I18n.translateMessage(statusText)}if(l.status_code===102)return I18n.t("处理中");if(l.status_code===200)return I18n.t("已完成");if((l.status_code||0)>=400)return I18n.t("失败");return'-'},
         formatLogStatusClass=l=>{
@@ -1385,7 +1399,7 @@
         getLogOperationLabel=l=>{const operation=String(l&&l.operation||'').trim();if(operation==='generate_image')return I18n.t("图片");if(operation==='generate_video')return I18n.t("视频");return''},
         formatLogOutcome=l=>{const statusCode=Number(l&&l.status_code);if(statusCode===200){const operation=String(l&&l.operation||'');if(operation.includes('video'))return I18n.t("视频结果已返回");if(operation.includes('image'))return I18n.t("图片结果已返回");return I18n.t("已返回结果")}if(statusCode===102)return I18n.t("处理中");const errorSummary=extractLogErrorSummary(l);if(errorSummary)return I18n.translateError(errorSummary);return statusCode>=400?I18n.t("请求失败"):'-'},
         formatLogOutcomeClass=l=>{if((l.status_code||0)>=400)return'text-red-600';if(l.status_code===200)return'text-green-700';if(l.status_code===102)return'text-amber-700';return'text-muted-foreground'},
-        startLogsAutoRefresh=()=>{stopLogsAutoRefresh()},
+        startLogsAutoRefresh=()=>{stopLogsAutoRefresh();window.logsAutoRefreshTimer=setInterval(()=>{if(!document.hidden&&!window.logsAutoRefreshInFlight){window.logsAutoRefreshInFlight=true;Promise.resolve(loadLogs({silent:true})).finally(()=>{window.logsAutoRefreshInFlight=false})}},5000)},
         stopLogsAutoRefresh=()=>{if(window.logsAutoRefreshTimer){clearInterval(window.logsAutoRefreshTimer);window.logsAutoRefreshTimer=null}},
         loadLogs=async(opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest('/api/logs?limit=100');if(!r)return;const logs=await r.json();window.allLogs=logs;window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=Object.create(null);logs.forEach(l=>window.logListMeta[l.id]={updated_at:l.updated_at,created_at:l.created_at,status_code:l.status_code,progress:l.progress,status_text:l.status_text,error_summary:l.error_summary||''});Object.keys(window.logDetailCache).forEach(key=>{const meta=window.logListMeta[key];const cached=window.logDetailCache[key];if(!meta||!cached||cached.updated_at!==meta.updated_at)delete window.logDetailCache[key]});renderLogs(logs);if(window.activeLogDetailId&&window.logListMeta[window.activeLogDetailId])showLogDetail(window.activeLogDetailId,{silent:true})}catch(e){if(!silent)console.error(I18n.t("加载日志失败:"),e)}},
         refreshLogs=async()=>{await loadLogs()},
@@ -1393,7 +1407,8 @@
         showLogDetail=async(logId,opts={})=>{const silent=!!opts.silent;const modal=$('logDetailModal');const content=$('logDetailContent');window.logDetailCache=window.logDetailCache||Object.create(null);window.logListMeta=window.logListMeta||Object.create(null);window.logDetailRequestSeq=(window.logDetailRequestSeq||0)+1;const requestSeq=window.logDetailRequestSeq;window.activeLogDetailId=logId;modal.classList.remove('hidden');content.innerHTML=`<div class="notice-well"><span data-i18n="日志详情加载中...">${escapeLogHtml(I18n.t("日志详情加载中..."))}</span></div>`;try{const meta=window.logListMeta[logId];let log=window.logDetailCache[logId];if(!log||!meta||log.updated_at!==meta.updated_at){const r=await apiRequest(`/api/logs/${logId}`);if(!r)return;log=await r.json();window.logDetailCache[logId]=log}if(requestSeq!==window.logDetailRequestSeq||window.activeLogDetailId!==logId)return;renderLogDetail(log)}catch(e){if(requestSeq!==window.logDetailRequestSeq)return;content.innerHTML=`<div class="notice-well text-red-600">${escapeLogHtml(I18n.t("加载日志详情失败: {error}", {error: (e.message)}))}</div>`;if(!silent)showToast(I18n.t("加载日志详情失败: {error}", {error: (e.message)}),'error')}},
         closeLogDetailModal=()=>{window.activeLogDetailId=null;resetLogMediaCache();$('logDetailModal').classList.add('hidden')},
         stopCaptchaRuntimeStatusPolling=()=>{if(window.captchaRuntimeStatusTimer){clearInterval(window.captchaRuntimeStatusTimer);window.captchaRuntimeStatusTimer=null}},
-        pollCaptchaRuntimeStatus=async(method,opts={})=>{const silent=!!opts.silent;try{const r=await apiRequest(`/api/captcha/runtime-status?method=${encodeURIComponent(method)}`);if(!r)return null;const d=await r.json();const state=String(d.state||'idle').trim();const message=String(d.message||'').trim();const key=`${state}:${d.sequence||0}:${message}`;const meta=window.captchaRuntimeStatusMeta||{key:'',lastToastAt:0,method:method};const now=Date.now();const shouldRepeat=message&&now-(meta.lastToastAt||0)>=5000;const shouldToast=!silent&&message&&(key!==meta.key||shouldRepeat);if(shouldToast){const toastType=state==='error'?'error':(state==='ready'?'success':'info');showToast(message,toastType,state==='ready'||state==='error'?3600:2600);meta.lastToastAt=now}meta.key=key;meta.state=state;meta.method=method;window.captchaRuntimeStatusMeta=meta;if(state==='ready'||state==='error'||(!d.active&&!d.task_running&&state!=='running'))stopCaptchaRuntimeStatusPolling();return d}catch(_){return null}},
+        applyCaptchaRuntimeStatus=(method,d,opts={})=>{if(!d||typeof d!=='object')return null;const silent=!!opts.silent;const state=String(d.state||'idle').trim();const message=String(d.message||'').trim();const key=`${state}:${d.sequence||0}:${message}`;const meta=window.captchaRuntimeStatusMeta||{key:'',lastToastAt:0,method:method};const now=Date.now();const shouldRepeat=message&&now-(meta.lastToastAt||0)>=5000;const shouldToast=!silent&&message&&(key!==meta.key||shouldRepeat);if(shouldToast){const toastType=state==='error'?'error':(state==='ready'?'success':'info');showToast(message,toastType,state==='ready'||state==='error'?3600:2600);meta.lastToastAt=now}meta.key=key;meta.state=state;meta.method=method;window.captchaRuntimeStatusMeta=meta;if(state==='ready'||state==='error'||(!d.active&&!d.task_running&&state!=='running'))stopCaptchaRuntimeStatusPolling();return d},
+        pollCaptchaRuntimeStatus=async(method,opts={})=>{try{const r=await apiRequest(`/api/captcha/runtime-status?method=${encodeURIComponent(method)}`);if(!r)return null;return applyCaptchaRuntimeStatus(method,await r.json(),opts)}catch(_){return null}},
         startCaptchaRuntimeStatusPolling=(method,initialMessage='')=>{stopCaptchaRuntimeStatusPolling();window.captchaRuntimeStatusMeta={key:'',lastToastAt:0,method:method,state:'running'};if(initialMessage)showToast(initialMessage,'info',2800);pollCaptchaRuntimeStatus(method,{silent:true});window.captchaRuntimeStatusTimer=setInterval(()=>{pollCaptchaRuntimeStatus(method)},3000)},
         resumeCaptchaRuntimeStatusPollingIfNeeded=async(method)=>{const status=await pollCaptchaRuntimeStatus(method,{silent:true});if(status&&(status.active||status.task_running||status.state==='running'))startCaptchaRuntimeStatusPolling(method)},
         showToast=(m,t='info',duration=2200)=>{const d=document.createElement('div');d.className=`fixed bottom-4 toast ${t==='success'?'success':(t==='error'?'error':'info')} animate-slide-up`;I18n.setMessage(d, m);document.body.appendChild(d);setTimeout(()=>{d.style.opacity='0';d.style.transition='opacity .3s';setTimeout(()=>d.parentNode&&document.body.removeChild(d),300)},duration)},
@@ -1417,9 +1432,17 @@
             I18n.setText($('sheetTitle'),pair[0]);
             I18n.setText($('sheetSubtitle'),pair[1]);
             closeMobileNav();
+            if(t!=='settings'&&window.captchaRuntimeStatusMeta?.state!=='running'){
+                stopCaptchaRuntimeStatusPolling();
+            }
             if(t==='settings'){
                 stopLogsAutoRefresh();
-                loadAdminConfig();loadManagedAPIKeys();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig();
+                const bootstrapFresh=settingsBootstrapLoadedAt>0&&!settingsBootstrapDirty&&(Date.now()-settingsBootstrapLoadedAt)<10000;
+                if(!bootstrapFresh){
+                    settingsBootstrapLoadedAt=0;
+                    settingsBootstrapDirty=false;
+                    loadAdminConfig();loadManagedAPIKeys();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();
+                }
             }else if(t==='logs'){
                 startLogsAutoRefresh();
                 loadLogs();
@@ -1499,7 +1522,7 @@
             }
             tb.innerHTML=filtered.map(l=>{
                 const statusText=formatLogStatus(l),progressText=formatLogProgress(l),outcomeText=formatLogOutcome(l),outcomePreview=truncateLogText(outcomeText,96),statusCodeClass=l.status_code===102?'bg-amber-50 text-amber-700':(l.status_code===200?'bg-green-50 text-green-700':'bg-red-50 text-red-700');
-                return`<tr><td title="${escapeLogHtml(l.operation||'')}">${escapeLogHtml(formatLogOperation(l))}</td><td><span class="${l.token_email?'cell-primary':'muted-text'}">${escapeLogHtml(l.token_email||I18n.t("未知"))}</span></td><td><span class="pill ${formatLogStatusClass(l)}">${escapeLogHtml(statusText)}</span></td><td class="num tabular-nums">${escapeLogHtml(progressText)}</td><td class="num"><span class="pill tabular-nums ${statusCodeClass}">${escapeLogHtml(l.status_code??'-')}</span></td><td><div class="log-outcome ${formatLogOutcomeClass(l)}" title="${escapeLogHtml(outcomeText)}">${escapeLogHtml(outcomePreview)}</div></td><td class="num tabular-nums">${Number(l.duration||0).toFixed(2)}</td><td class="muted-text tabular-nums">${l.created_at?new Date(l.created_at).toLocaleString(I18n.locale):'-'}</td><td class="num"><button type="button" onclick="showLogDetail(${l.id})" class="act-btn"><span data-i18n="详情">详情</span></button></td></tr>`;
+                return`<tr><td title="${escapeLogHtml(l.operation||'')}">${escapeLogHtml(formatLogOperation(l))}</td><td><span class="${l.token_email?'cell-primary':'muted-text'}">${escapeLogHtml(l.token_email||I18n.t("未知"))}</span></td><td><span class="pill ${formatLogStatusClass(l)}">${escapeLogHtml(statusText)}</span></td><td class="num tabular-nums">${escapeLogHtml(progressText)}</td><td class="num"><span class="pill tabular-nums ${statusCodeClass}">${escapeLogHtml(l.status_code??'-')}</span></td><td><div class="log-outcome ${formatLogOutcomeClass(l)}" title="${escapeLogHtml(outcomeText)}">${escapeLogHtml(outcomePreview)}</div></td><td class="num tabular-nums">${Number(l.duration||0).toFixed(2)}</td><td class="muted-text tabular-nums">${l.created_at?new Date(l.created_at).toLocaleString(I18n.locale):'-'}</td><td class="num"><button type="button" onclick="showLogDetail(${Number(l.id)})" class="act-btn"><span data-i18n="详情">详情</span></button></td></tr>`;
             }).join('');
         }
 
@@ -1765,6 +1788,8 @@
             sessionId: null,
             ws: null,
             pollTimer: null,
+            pollInFlight: false,
+            needsImmediateFrameFallback: false,
             tokenId: null,
             fromModal: null,
             frameMeta: { width: 1280, height: 800, context: '' },
@@ -1891,7 +1916,9 @@
 
         async function handleBrowserLoginStatusUpdate(data) {
             if (!data) return;
-            updateBrowserLoginBadge(data.status, data.message || data.error || '');
+            if (data.status || data.message || data.error) {
+                updateBrowserLoginBadge(data.status || '', data.message || data.error || '');
+            }
             if (data.status === 'completed' && data.result) {
                 stopBrowserLoginStreams();
                 const res = data.result;
@@ -1916,18 +1943,78 @@
                 showToast(I18n.t("浏览器登录失败: {0}",{"0":data.error||data.message||I18n.t("未知错误")}), 'error');
                 const btn = $('browserLoginStartBtn');
                 if (btn) { btn.disabled = false; btn.textContent = I18n.t('启动登录浏览器'); }
+            } else if (data.status === 'cancelled') {
+                stopBrowserLoginStreams();
+                const btn = $('browserLoginStartBtn');
+                if (btn) { btn.disabled = false; btn.textContent = I18n.t('启动登录浏览器'); }
+            }
+        }
+
+        function isBrowserLoginWsOpen() {
+            return !!(browserLoginState.ws && browserLoginState.ws.readyState === WebSocket.OPEN);
+        }
+
+        function scheduleBrowserLoginPoll(sid, delayMs) {
+            if (browserLoginState.pollTimer) {
+                clearTimeout(browserLoginState.pollTimer);
+                browserLoginState.pollTimer = null;
+            }
+            if (!sid || browserLoginState.sessionId !== sid) return;
+            browserLoginState.pollTimer = setTimeout(() => {
+                pollBrowserLoginStatus(sid);
+            }, delayMs);
+        }
+
+        async function pollBrowserLoginStatus(sid) {
+            if (!sid || browserLoginState.sessionId !== sid) return;
+            if (browserLoginState.pollInFlight) {
+                scheduleBrowserLoginPoll(sid, isBrowserLoginWsOpen() ? 2000 : 1200);
+                return;
+            }
+            browserLoginState.pollInFlight = true;
+            let terminal = false;
+            try {
+                const includeFrame = !isBrowserLoginWsOpen();
+                const sr = await apiRequest(`/api/tokens/browser-login/status/${sid}?include_frame=${includeFrame ? 'true' : 'false'}`);
+                if (!sr || browserLoginState.sessionId !== sid) return;
+                const sd = await sr.json();
+                if (browserLoginState.sessionId !== sid) return;
+                if (sd.frame_b64) {
+                    handleBrowserLoginFrame(sd.frame_meta, sd.frame_b64);
+                }
+                await handleBrowserLoginStatusUpdate(sd);
+                terminal = !!(sd && (sd.status === 'completed' || sd.status === 'failed' || sd.status === 'cancelled'));
+            } catch (e) {
+            } finally {
+                browserLoginState.pollInFlight = false;
+                const retryImmediate = browserLoginState.needsImmediateFrameFallback;
+                browserLoginState.needsImmediateFrameFallback = false;
+                if (!terminal && browserLoginState.sessionId === sid) {
+                    if (retryImmediate) {
+                        pollBrowserLoginStatus(sid);
+                    } else {
+                        scheduleBrowserLoginPoll(sid, isBrowserLoginWsOpen() ? 2000 : 1200);
+                    }
+                }
             }
         }
 
         function stopBrowserLoginStreams() {
             if (browserLoginState.ws) {
-                try { browserLoginState.ws.close(); } catch (e) {}
+                const ws = browserLoginState.ws;
                 browserLoginState.ws = null;
+                ws.onopen = null;
+                ws.onmessage = null;
+                ws.onerror = null;
+                ws.onclose = null;
+                try { ws.close(); } catch (e) {}
             }
             if (browserLoginState.pollTimer) {
-                clearInterval(browserLoginState.pollTimer);
+                clearTimeout(browserLoginState.pollTimer);
                 browserLoginState.pollTimer = null;
             }
+            browserLoginState.pollInFlight = false;
+            browserLoginState.needsImmediateFrameFallback = false;
         }
 
         async function openBrowserLoginModal(opts = {}) {
@@ -1999,11 +2086,16 @@
                 updateBrowserLoginProfileHint();
                 updateBrowserLoginBadge(d.status || 'waiting', d.message || I18n.t('等待登录...'));
                 if (btn) { btn.disabled = false; btn.textContent = I18n.t('启动登录浏览器'); }
+                const sid = d.session_id;
                 const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${proto}//${location.host}/api/tokens/browser-login/ws/${d.session_id}`;
+                const wsUrl = `${proto}//${location.host}/api/tokens/browser-login/ws/${sid}`;
                 try {
                     const ws = new WebSocket(wsUrl);
                     browserLoginState.ws = ws;
+                    ws.onopen = () => {
+                        if (browserLoginState.sessionId !== sid || browserLoginState.ws !== ws) return;
+                        scheduleBrowserLoginPoll(sid, 2000);
+                    };
                     ws.onmessage = (ev) => {
                         try {
                             const msg = JSON.parse(ev.data);
@@ -2014,20 +2106,24 @@
                             }
                         } catch (e) {}
                     };
+                    const fallbackToHttpPolling = () => {
+                        if (browserLoginState.sessionId !== sid || browserLoginState.ws !== ws) return;
+                        browserLoginState.ws = null;
+                        ws.onopen = null;
+                        ws.onmessage = null;
+                        ws.onerror = null;
+                        ws.onclose = null;
+                        if (browserLoginState.pollInFlight) {
+                            browserLoginState.needsImmediateFrameFallback = true;
+                        } else {
+                            pollBrowserLoginStatus(sid);
+                        }
+                    };
+                    ws.onerror = fallbackToHttpPolling;
+                    ws.onclose = fallbackToHttpPolling;
                 } catch (e) {}
 
-                browserLoginState.pollTimer = setInterval(async () => {
-                    if (!browserLoginState.sessionId) return;
-                    try {
-                        const sr = await apiRequest(`/api/tokens/browser-login/status/${browserLoginState.sessionId}?include_frame=true`);
-                        if (!sr) return;
-                        const sd = await sr.json();
-                        if (sd.frame_b64) {
-                            handleBrowserLoginFrame(sd.frame_meta, sd.frame_b64);
-                        }
-                        await handleBrowserLoginStatusUpdate(sd);
-                    } catch (e) {}
-                }, 1200);
+                scheduleBrowserLoginPoll(sid, 1200);
             } catch (e) {
                 updateBrowserLoginBadge('failed', e.message || String(e));
                 showToast(I18n.t("启动浏览器登录失败: {0}",{"0":e.message||String(e)}), 'error');
@@ -2064,7 +2160,41 @@
             else closeMobileNav();
         });
 
-        (()=>{refreshTokens();loadATAutoRefreshConfig()})();
+        const bootstrapAdminConsole = async () => {
+            try {
+                const r = await apiRequest('/api/admin/bootstrap');
+                if (!r) return;
+                if (r.ok) {
+                    const d = await r.json().catch(() => null);
+                    if (d && d.bootstrap_version === 1) {
+                        applyStatsPayload(d.stats);
+                        applyTokensPayload(d.tokens);
+                        applyBrowserStatsPayload(d.browser_stats);
+                        applyBrowserProfilesPayload(d.browser_profiles);
+                        applyAdminConfigPayload(d.admin_config);
+                        applyManagedAPIKeysPayload(d.api_keys);
+                        applyProxyConfigPayload(d.proxy_config);
+                        applyCacheConfigPayload(d.cache_config);
+                        applyGenerationTimeoutPayload(d.generation_timeout);
+                        applyCallLogicConfigPayload(d.call_logic_config);
+                        applyCaptchaConfigPayload(d.captcha_config);
+                        applyATAutoRefreshConfigPayload(d.token_refresh_config);
+                        applyPluginConfigPayload(d.plugin_config);
+                        const rtStatus = applyCaptchaRuntimeStatus('browser', d.captcha_runtime_status, { silent: true });
+                        if (rtStatus && (rtStatus.active || rtStatus.task_running || rtStatus.state === 'running')) {
+                            startCaptchaRuntimeStatusPolling('browser');
+                        }
+                        settingsBootstrapLoadedAt = Date.now();
+                        settingsBootstrapDirty = false;
+                        return;
+                    }
+                }
+            } catch (_) {}
+            settingsBootstrapLoadedAt = 0;
+            settingsBootstrapDirty = false;
+            await Promise.all([refreshTokens(), loadATAutoRefreshConfig()]);
+        };
+        bootstrapAdminConsole();
 
         window.addEventListener('languagechange',()=>{
             renderTokens();
@@ -2075,7 +2205,7 @@
             renderProxyTestResult();
             updateLastSync();
         });
-        Object.assign(window, {$, apiRequest, toggleMobileNav, closeMobileNav, scrollSettingsTo, loadStats, loadTokens, loadBrowserStats, loadBrowserProfiles, updateBrowserLoginProfileHint, runCaptchaScoreTest, setTokenSearch, setTokenFilter, setLogSearch, setLogFilter, formatExpiry, formatAccountType, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copyProjectId, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, loadManagedAPIKeys, renderManagedApiKeys, copyManagedApiKey, generateManagedApiKeyValue, toggleApiKeyModelPicker, toggleSingleApiKeyModel, renderApiKeyModelPicker, selectVisibleApiKeyModels, openApiKeyModal, closeApiKeyModal, submitApiKeyModal, toggleManagedApiKey, deleteManagedApiKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, openBrowserLoginModal, startBrowserLoginSession, closeBrowserLoginModal, sendBrowserLoginQuickText});
+        Object.assign(window, {$, apiRequest, toggleMobileNav, closeMobileNav, scrollSettingsTo, loadStats, loadTokens, loadBrowserStats, loadBrowserProfiles, updateBrowserLoginProfileHint, runCaptchaScoreTest, setTokenSearch, setTokenFilter, setLogSearch, setLogFilter, formatExpiry, formatAccountType, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copyProjectId, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, loadManagedAPIKeys, renderManagedApiKeys, copyManagedApiKey, generateManagedApiKeyValue, toggleApiKeyModelPicker, toggleSingleApiKeyModel, renderApiKeyModelPicker, selectVisibleApiKeyModels, openApiKeyModal, closeApiKeyModal, submitApiKeyModal, toggleManagedApiKey, deleteManagedApiKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, openBrowserLoginModal, startBrowserLoginSession, closeBrowserLoginModal, sendBrowserLoginQuickText, bootstrapAdminConsole});
     });
     </script>
 </body>

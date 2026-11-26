@@ -200,6 +200,24 @@ class Config:
             self._config["debug"] = {}
         self._config["debug"]["enabled"] = enabled
 
+    def set_debug_log_requests(self, enabled: bool):
+        """Set debug request logging enabled/disabled"""
+        if "debug" not in self._config:
+            self._config["debug"] = {}
+        self._config["debug"]["log_requests"] = bool(enabled)
+
+    def set_debug_log_responses(self, enabled: bool):
+        """Set debug response logging enabled/disabled"""
+        if "debug" not in self._config:
+            self._config["debug"] = {}
+        self._config["debug"]["log_responses"] = bool(enabled)
+
+    def set_debug_mask_token(self, enabled: bool):
+        """Set debug token masking enabled/disabled"""
+        if "debug" not in self._config:
+            self._config["debug"] = {}
+        self._config["debug"]["mask_token"] = bool(enabled)
+
     @property
     def image_timeout(self) -> int:
         """Get image generation timeout in seconds"""

@@ -1747,9 +1747,15 @@ async def browser_login_liveview_ws(websocket: WebSocket, session_id: str):
 
     origin = (websocket.headers.get("origin") or "").strip()
     if origin:
-        origin_host = urlparse(origin).netloc.lower()
-        request_host = (websocket.headers.get("host") or "").strip().lower()
-        if not origin_host or origin_host != request_host:
+        if origin.lower() == "null":
+            await websocket.close(code=4401)
+            return
+        origin_host = (urlparse(origin).netloc or "").strip().lower()
+        request_host = (
+            (websocket.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+            or (websocket.headers.get("host") or "").strip()
+        ).lower()
+        if not origin_host or (request_host and origin_host != request_host):
             await websocket.close(code=4401)
             return
 
@@ -2947,3 +2953,69 @@ async def plugin_check_tokens(
         )
 
     return {"success": True, "tokens": tokens}
+
+
+@router.get("/api/admin/bootstrap")
+async def get_admin_bootstrap(
+    request: Request, token: str = Depends(verify_admin_token)
+):
+    """Return initial dashboard and settings state in a single round-trip."""
+    async def _get_proxy_payload():
+        if proxy_manager is None:
+            return {
+                "proxy_enabled": False,
+                "proxy_url": None,
+                "media_proxy_enabled": False,
+                "media_proxy_url": None,
+            }
+        return await get_proxy_config_alias(token)
+
+    (
+        stats,
+        tokens,
+        browser_stats,
+        browser_profiles,
+        admin_config,
+        api_keys,
+        proxy_config,
+        cache_config,
+        generation_timeout,
+        call_logic_config,
+        captcha_config,
+        token_refresh_config,
+        plugin_config,
+        captcha_runtime_status,
+    ) = await asyncio.gather(
+        get_stats(token),
+        get_tokens(token),
+        get_browser_captcha_stats(token),
+        list_browser_profiles(_admin_token=token),
+        get_admin_config(token),
+        list_managed_api_keys(token),
+        _get_proxy_payload(),
+        get_cache_config(token),
+        get_generation_timeout(token),
+        get_call_logic_config(token),
+        get_captcha_config(token),
+        get_token_refresh_config(token),
+        get_plugin_config(request, token),
+        get_captcha_runtime_status(method="browser", token=token),
+    )
+
+    return {
+        "bootstrap_version": 1,
+        "stats": stats,
+        "tokens": tokens,
+        "browser_stats": browser_stats,
+        "browser_profiles": browser_profiles,
+        "admin_config": admin_config,
+        "api_keys": api_keys,
+        "proxy_config": proxy_config,
+        "cache_config": cache_config,
+        "generation_timeout": generation_timeout,
+        "call_logic_config": call_logic_config,
+        "captcha_config": captcha_config,
+        "token_refresh_config": token_refresh_config,
+        "plugin_config": plugin_config,
+        "captcha_runtime_status": captcha_runtime_status,
+    }

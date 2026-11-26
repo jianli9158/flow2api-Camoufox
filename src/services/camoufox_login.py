@@ -18,13 +18,16 @@ from ..core.logger import debug_logger
 from .bidi_transport import BiDiClient, LocalSocks5Relay, wait_for_bidi_endpoint
 from .camoufox_fingerprint import (
     CAMOUFOX_FIREFOX_MAJOR,
+    _camoufox_subprocess_kwargs,
     _start_stdout_drain,
+    _terminate_camoufox_process,
     build_camoufox_env,
     ensure_camoufox_executable,
     load_or_create_account_camoufox_config,
     write_camoufox_user_js,
 )
 from .camoufox_profile import (
+    PROFILE_KERNEL_LOCK_FILENAME,
     ProfileLease,
     _clear_stale_firefox_profile_locks,
     acquire_profile_lease,
@@ -765,6 +768,7 @@ class CamoufoxLoginSession:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                **_camoufox_subprocess_kwargs(),
             )
             endpoint = await wait_for_bidi_endpoint(
                 self._process, timeout=45.0
@@ -846,6 +850,11 @@ class CamoufoxLoginSession:
                 exported.get("browser_profile_dir") or self.browser_profile_dir
             )
             if final_token_id and self._temp_account_dir and self._temp_account_dir.exists():
+                target_dir, final_canonical = resolve_account_profile_dir(
+                    self.user_data_root,
+                    token_id=int(final_token_id),
+                    profile_dir_name=target_profile_hint,
+                )
                 try:
                     from .browser_captcha import BrowserCaptchaService
                     svc = BrowserCaptchaService._instance
@@ -853,22 +862,38 @@ class CamoufoxLoginSession:
                         await svc.release_token_browsers(
                             int(final_token_id), reason="camoufox_relogin_complete"
                         )
+                        if hasattr(svc, "release_profile_browsers"):
+                            await svc.release_profile_browsers(
+                                target_dir, reason="camoufox_relogin_complete"
+                            )
                 except Exception:
                     pass
-                target_dir, final_canonical = resolve_account_profile_dir(
-                    self.user_data_root,
-                    token_id=int(final_token_id),
-                    profile_dir_name=target_profile_hint,
-                )
                 if self._temp_account_dir.resolve() != target_dir.resolve():
                     if self._is_ephemeral_staging and not target_dir.exists():
-                        target_dir.parent.mkdir(parents=True, exist_ok=True)
-                        await asyncio.to_thread(
-                            shutil.move, str(self._temp_account_dir), str(target_dir)
-                        )
-                        _clear_stale_firefox_profile_locks(target_dir / "firefox-profile")
-                        self._temp_account_dir = target_dir
-                        self._is_ephemeral_staging = False
+                        source_dir = self._temp_account_dir
+
+                        def _move_with_profile_lease() -> None:
+                            target_dir.parent.mkdir(parents=True, exist_ok=True)
+                            with acquire_profile_lease(
+                                target_dir,
+                                holder=f"camoufox_login_persist_{self.session_id}",
+                                wait_seconds=5.0,
+                            ):
+                                for item in list(source_dir.iterdir()):
+                                    if item.name == PROFILE_KERNEL_LOCK_FILENAME:
+                                        continue
+                                    dst_item = target_dir / item.name
+                                    if dst_item.exists() or dst_item.is_symlink():
+                                        if dst_item.is_dir():
+                                            shutil.rmtree(dst_item, ignore_errors=True)
+                                        else:
+                                            dst_item.unlink(missing_ok=True)
+                                    shutil.move(str(item), str(dst_item))
+                                _clear_stale_firefox_profile_locks(
+                                    target_dir / "firefox-profile"
+                                )
+
+                        await asyncio.to_thread(_move_with_profile_lease)
                     else:
                         await asyncio.to_thread(
                             persist_account_login_artifacts,
@@ -1210,19 +1235,7 @@ class CamoufoxLoginSession:
             await bidi.close()
 
         if proc is not None:
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=4.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
+            await _terminate_camoufox_process(proc, terminate_timeout=4.0)
 
         if relay is not None:
             await relay.close()

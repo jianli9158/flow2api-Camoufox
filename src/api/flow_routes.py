@@ -12,6 +12,8 @@ from ..core.model_catalog import MODEL_CONFIG
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
 from ..core.config import config
+from ..core.model_resolver import get_canonical_model_name
+from .routes import _get_request_base_url
 from .mcp_routes import build_flow_capabilities
 from ..services.flow_features import (
     FlowFeatureService,
@@ -442,7 +444,7 @@ async def create_flow_voice(
 ):
     _ = api_key
     svc = _ensure_service()
-    base_url = f"{raw_request.url.scheme}://{raw_request.headers.get('host', raw_request.url.netloc)}"
+    base_url = _get_request_base_url(raw_request)
     result = await _execute_logged_flow_call(
         svc,
         operation="flow_create_voice",
@@ -1129,16 +1131,36 @@ def _flow_video_model_key_allowed(api_key: str, model_key: str) -> bool:
     if policy.allow_all_models:
         return True
     key_clean = str(model_key or "").strip()
-    if policy.allows_execution(key_clean, upstream_model=key_clean):
+    if not key_clean:
+        return False
+    direct_cfg = MODEL_CONFIG.get(key_clean)
+    if isinstance(direct_cfg, dict) and direct_cfg.get("type") == "video":
+        if policy.allows_execution(
+            key_clean,
+            canonical_model=get_canonical_model_name(key_clean),
+            upstream_model=key_clean,
+        ):
+            return True
+    elif policy.allows_execution(key_clean, upstream_model=key_clean):
         return True
+    key_candidates = (
+        (key_clean, key_clean[: -len("_relaxed")])
+        if key_clean.endswith("_relaxed")
+        else (key_clean,)
+    )
     for alias, cfg in MODEL_CONFIG.items():
         if cfg.get("type") != "video":
             continue
-        if key_clean in (
+        upstream_keys = (
             cfg.get("model_key"),
             cfg.get("reference_model_key"),
             cfg.get("start_frame_model_key"),
-        ) and policy.allows_listed_model(alias):
+        )
+        if any(cand in upstream_keys for cand in key_candidates) and policy.allows_execution(
+            alias,
+            canonical_model=get_canonical_model_name(alias),
+            upstream_model=key_clean,
+        ):
             return True
     return False
 
@@ -1162,6 +1184,7 @@ def _filter_flow_models_payload(payload: Dict[str, Any], api_key: str) -> Dict[s
             for item in payload["imageModels"]
             if policy.allows_execution(
                 str(item.get("id") or ""),
+                canonical_model=get_canonical_model_name(str(item.get("id") or "")),
                 upstream_model=str(item.get("upstreamModel") or ""),
             )
         ]
@@ -1171,6 +1194,7 @@ def _filter_flow_models_payload(payload: Dict[str, Any], api_key: str) -> Dict[s
             for item in payload["videoModels"]
             if policy.allows_execution(
                 str(item.get("id") or ""),
+                canonical_model=get_canonical_model_name(str(item.get("id") or "")),
                 upstream_model=str(item.get("upstreamModel") or ""),
             )
         ]
@@ -1257,7 +1281,7 @@ async def chain_flow_videos(
         seg_model = str(seg.model_key or "macaron_cookie_r2v_8s_relaxed")
         _assert_flow_video_model_allowed(api_key, seg_model)
     svc = _ensure_service()
-    base_url = f"{raw_request.url.scheme}://{raw_request.headers.get('host', raw_request.url.netloc)}"
+    base_url = _get_request_base_url(raw_request)
     return await _execute_logged_flow_call(
         svc,
         operation="flow_chain_videos",

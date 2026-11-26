@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 import asyncio
 import base64
+import binascii
+import inspect
 import ipaddress
 import json
 import mimetypes
@@ -30,6 +32,7 @@ from ..core.auth import (
     assert_api_key_model_allowed,
     verify_api_key_flexible,
 )
+from ..core.config import config
 from ..core.logger import debug_logger
 from ..core.model_resolver import (
     get_base_model_aliases,
@@ -44,12 +47,14 @@ from ..core.models import (
     GeminiPredictRequest,
     OpenAIImageGenerationRequest,
 )
+from ..core.prompt_tools import validate_base64_media_payload
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
 router = APIRouter()
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
 HTML_VIDEO_RE = re.compile(r"<video[^>]+src=['\"](.*?)['\"]", re.IGNORECASE)
 DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTALL)
+MAX_INBOUND_IMAGE_BYTES = 50 * 1024 * 1024
 MEDIA_PROMPT_TOOL_BLOCK_RE = re.compile(
     r"<tools>.*?</tools>", re.IGNORECASE | re.DOTALL
 )
@@ -224,7 +229,15 @@ def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     match = DATA_URL_RE.match(data_url)
     if not match:
         raise HTTPException(status_code=400, detail="Invalid data URL")
-    return match.group("mime"), base64.b64decode(match.group("data"))
+    raw_b64 = match.group("data")
+    try:
+        return match.group("mime"), base64.b64decode(raw_b64, validate=True)
+    except (ValueError, binascii.Error):
+        compact = "".join(raw_b64.split())
+        try:
+            return match.group("mime"), base64.b64decode(compact, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=400, detail="Invalid data URL") from exc
 
 
 def _detect_image_mime_type(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -358,6 +371,61 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
     except Exception as exc:
         debug_logger.log_warning(f"[CONTEXT] 图片下载代理解析失败: {str(exc)}")
 
+    async def _close_response(resp: Any) -> None:
+        quit_now = getattr(resp, "quit_now", None)
+        if quit_now is not None and callable(getattr(quit_now, "set", None)):
+            try:
+                quit_now.set()
+            except Exception:
+                pass
+        aclose_fn = getattr(resp, "aclose", None)
+        if callable(aclose_fn):
+            try:
+                res = aclose_fn()
+                if inspect.isawaitable(res):
+                    await asyncio.wait_for(res, timeout=2.0)
+                return
+            except Exception:
+                pass
+        close_fn = getattr(resp, "close", None)
+        if callable(close_fn):
+            try:
+                res = close_fn()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                pass
+
+    def _extract_content_length(resp: Any) -> Optional[int]:
+        headers_obj = getattr(resp, "headers", None)
+        if not headers_obj:
+            return None
+        raw_val = None
+        get_fn = getattr(headers_obj, "get", None)
+        if callable(get_fn):
+            for hdr_key in ("content-length", "Content-Length"):
+                candidate = get_fn(hdr_key)
+                if isinstance(candidate, (str, bytes, int)):
+                    raw_val = candidate
+                    break
+        if raw_val is None:
+            items_fn = getattr(headers_obj, "items", None)
+            if callable(items_fn):
+                for k, v in items_fn():
+                    if str(k).lower() == "content-length" and isinstance(
+                        v, (str, bytes, int)
+                    ):
+                        raw_val = v
+                        break
+        if raw_val is None:
+            return None
+        try:
+            return int(
+                raw_val.decode("ascii") if isinstance(raw_val, bytes) else str(raw_val).strip()
+            )
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return None
+
     try:
         current_url = url
 
@@ -379,23 +447,73 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
                     impersonate="chrome120",
                     verify=True,
                     allow_redirects=False,
+                    stream=True,
                 )
-                if response.status_code in (301, 302, 303, 307, 308):
-                    location = response.headers.get("location") or response.headers.get(
-                        "Location"
-                    )
-                    if not location:
+                try:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        headers_obj = getattr(response, "headers", None)
+                        location = None
+                        if headers_obj and callable(getattr(headers_obj, "get", None)):
+                            location = headers_obj.get("location") or headers_obj.get(
+                                "Location"
+                            )
+                        if not location:
+                            break
+                        current_url = urljoin(current_url, location)
+                        continue
+                    if response.status_code != 200:
+                        debug_logger.log_warning(
+                            f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
+                        )
                         break
-                    current_url = urljoin(current_url, location)
-                    continue
-                if response.status_code == 200 and response.content:
-                    return response.content
-                debug_logger.log_warning(
-                    f"[CONTEXT] 图片下载失败，状态码: {response.status_code}"
-                )
-                break
-            return None
 
+                    content_length = _extract_content_length(response)
+                    if (
+                        content_length is not None
+                        and content_length > MAX_INBOUND_IMAGE_BYTES
+                    ):
+                        debug_logger.log_warning(
+                            f"[CONTEXT] 图片 Content-Length 超过上限 ({content_length} > {MAX_INBOUND_IMAGE_BYTES}): {current_url}"
+                        )
+                        return None
+
+                    is_unstreamed_curl_response = (
+                        getattr(response, "curl", None) is not None
+                        and getattr(response, "queue", None) is None
+                    )
+                    aiter_fn = (
+                        None
+                        if is_unstreamed_curl_response
+                        else getattr(response, "aiter_content", None)
+                    )
+                    if callable(aiter_fn):
+                        buf = bytearray()
+                        saw_stream_chunk = False
+                        async for chunk in aiter_fn():
+                            if not chunk:
+                                continue
+                            saw_stream_chunk = True
+                            if len(buf) + len(chunk) > MAX_INBOUND_IMAGE_BYTES:
+                                debug_logger.log_warning(
+                                    f"[CONTEXT] 图片流式下载超过大小上限 ({MAX_INBOUND_IMAGE_BYTES} bytes): {current_url}"
+                                )
+                                return None
+                            buf.extend(chunk)
+                        if saw_stream_chunk:
+                            return bytes(buf)
+
+                    raw_content = getattr(response, "content", None)
+                    if isinstance(raw_content, (bytes, bytearray)) and raw_content:
+                        if len(raw_content) > MAX_INBOUND_IMAGE_BYTES:
+                            debug_logger.log_warning(
+                                f"[CONTEXT] 图片响应体超过大小上限 ({len(raw_content)} > {MAX_INBOUND_IMAGE_BYTES}): {current_url}"
+                            )
+                            return None
+                        return bytes(raw_content)
+                    return None
+                finally:
+                    await _close_response(response)
+            return None
         get_pooled = getattr(file_cache, "get_http_session", None) if file_cache else None
         if callable(get_pooled):
             pool_key, pooled_session = await get_pooled(
@@ -416,21 +534,33 @@ async def retrieve_image_data(url: str) -> Optional[bytes]:
     return None
 
 async def _load_image_bytes_from_uri(uri: str) -> bytes:
-    if not uri:
+    clean_uri = str(uri or "").strip()
+    if not clean_uri:
         raise HTTPException(status_code=400, detail="Image URI cannot be empty")
 
-    if uri.startswith("data:image"):
-        _, image_bytes = _decode_data_url(uri)
+    if clean_uri.startswith("data:image"):
+        _, image_bytes = _decode_data_url(clean_uri)
         return image_bytes
 
-    if uri.startswith("http://") or uri.startswith("https://") or "/tmp/" in uri:
-        image_bytes = await retrieve_image_data(uri)
+    if (
+        clean_uri.startswith("http://")
+        or clean_uri.startswith("https://")
+        or "/tmp/" in clean_uri
+    ):
+        image_bytes = await retrieve_image_data(clean_uri)
         if image_bytes:
             return image_bytes
-        raise HTTPException(status_code=400, detail=f"Failed to load image from {uri}")
+        raise HTTPException(
+            status_code=400, detail=f"Failed to load image from {clean_uri}"
+        )
 
-    raise HTTPException(status_code=400, detail=f"Unsupported image URI: {uri}")
-
+    try:
+        return validate_base64_media_payload(clean_uri, expected_kind="image")
+    except (ValueError, binascii.Error) as exc:
+        preview = clean_uri if len(clean_uri) <= 256 else f"{clean_uri[:256]}..."
+        raise HTTPException(
+            status_code=400, detail=f"Unsupported image URI: {preview}"
+        ) from exc
 
 def _coerce_gemini_contents(raw_contents: Optional[List[Any]]) -> List[GeminiContent]:
     contents: List[GeminiContent] = []
@@ -585,7 +715,17 @@ async def _extract_prompt_and_images_from_gemini_contents(
                     status_code=400,
                     detail=f"Unsupported inlineData mime type: {part.inlineData.mimeType}",
                 )
-            images.append(base64.b64decode(part.inlineData.data))
+            try:
+                images.append(
+                    validate_base64_media_payload(
+                        part.inlineData.data, expected_kind="image"
+                    )
+                )
+            except (ValueError, binascii.Error) as exc:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid base64 inlineData payload",
+                ) from exc
         elif part.fileData is not None:
             mime_type = (part.fileData.mimeType or "").lower()
             if mime_type and not mime_type.startswith("image/"):
@@ -610,22 +750,28 @@ def _resolve_request_model(
     return resolved_model
 
 
-def _get_request_base_url(request: Request) -> Optional[str]:
-    """根据实际请求头推导对外可访问的基础地址。"""
+def _get_request_base_url(request: Optional[Request]) -> Optional[str]:
+    """根据实际请求头推导对外可访问的基础地址（含反代头与 server_path_prefix）。"""
+    if request is None:
+        return None
+    headers = getattr(request, "headers", None) or {}
     forwarded_proto = (
-        (request.headers.get("x-forwarded-proto") or "").split(",")[0].strip()
+        (headers.get("x-forwarded-proto") or "").split(",")[0].strip()
     )
     forwarded_host = (
-        (request.headers.get("x-forwarded-host") or "").split(",")[0].strip()
+        (headers.get("x-forwarded-host") or "").split(",")[0].strip()
     )
-    host = (forwarded_host or request.headers.get("host") or "").strip()
+    url_obj = getattr(request, "url", None)
+    fallback_host = (getattr(url_obj, "netloc", None) or "").strip()
+    host = (forwarded_host or headers.get("host") or fallback_host).strip()
 
     if not host:
         return None
 
-    proto = forwarded_proto or request.url.scheme or "http"
-    return f"{proto}://{host}"
-
+    proto = forwarded_proto or getattr(url_obj, "scheme", None) or "http"
+    raw_prefix = str(getattr(config, "server_path_prefix", "") or "").strip()
+    prefix = f"/{raw_prefix.strip('/')}" if raw_prefix and raw_prefix != "/" else ""
+    return f"{proto}://{host}{prefix}"
 
 async def _normalize_openai_request(
     request: ChatCompletionRequest,
@@ -836,13 +982,12 @@ def _enrich_payload_with_direct_url(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _build_image_parts_from_uri(uri: str) -> List[Dict[str, Any]]:
     if uri.startswith("data:image"):
-        mime_type, _ = _decode_data_url(uri)
         match = DATA_URL_RE.match(uri)
-        if match:
-            return [
-                {"inlineData": {"mimeType": mime_type, "data": match.group("data")}}
-            ]
-
+        if not match:
+            raise HTTPException(status_code=400, detail="Invalid data URL")
+        return [
+            {"inlineData": {"mimeType": match.group("mime"), "data": match.group("data")}}
+        ]
     image_bytes = await retrieve_image_data(uri)
     if image_bytes:
         mime_type = _detect_image_mime_type(
@@ -964,22 +1109,106 @@ async def _convert_openai_stream_chunk_to_gemini_event(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+async def _iter_generation_chunks_with_disconnect(
+    stream_iter: Any,
+    raw_request: Optional[Request],
+    *,
+    disconnect_state: Optional[Dict[str, bool]] = None,
+    poll_interval: float = 0.25,
+):
+    """Iterate an async generator while racing pending anext() against client disconnect."""
+    if raw_request is None:
+        try:
+            async for chunk in stream_iter:
+                yield chunk
+        finally:
+            aclose_fn = getattr(stream_iter, "aclose", None)
+            if callable(aclose_fn):
+                try:
+                    await aclose_fn()
+                except Exception:
+                    pass
+        return
+
+    client_disconnected = False
+    pending_next_task: Optional[asyncio.Task] = None
+    watcher_stopped = False
+
+    async def _next_chunk() -> Any:
+        return await anext(stream_iter)
+
+    async def _watch_disconnect() -> None:
+        nonlocal client_disconnected
+        try:
+            while not watcher_stopped:
+                if await raw_request.is_disconnected():
+                    client_disconnected = True
+                    if disconnect_state is not None:
+                        disconnect_state["disconnected"] = True
+                    task = pending_next_task
+                    if task is not None and not task.done():
+                        task.cancel()
+                    return
+                await asyncio.sleep(poll_interval)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            return
+
+    watch_task = asyncio.create_task(_watch_disconnect())
+    try:
+        while True:
+            if client_disconnected or await raw_request.is_disconnected():
+                client_disconnected = True
+                if disconnect_state is not None:
+                    disconnect_state["disconnected"] = True
+                break
+            pending_next_task = asyncio.create_task(_next_chunk())
+            try:
+                chunk = await pending_next_task
+            except StopAsyncIteration:
+                break
+            except asyncio.CancelledError:
+                if client_disconnected:
+                    break
+                raise
+            finally:
+                pending_next_task = None
+            yield chunk
+    finally:
+        watcher_stopped = True
+        if pending_next_task is not None and not pending_next_task.done():
+            pending_next_task.cancel()
+            await asyncio.gather(pending_next_task, return_exceptions=True)
+        if not watch_task.done():
+            watch_task.cancel()
+        await asyncio.gather(watch_task, return_exceptions=True)
+        aclose_fn = getattr(stream_iter, "aclose", None)
+        if callable(aclose_fn):
+            try:
+                await aclose_fn()
+            except Exception:
+                pass
+
+
 async def _iterate_openai_stream(
     normalized: NormalizedGenerationRequest,
     base_url_override: Optional[str] = None,
     raw_request: Optional[Request] = None,
 ):
     handler = _ensure_generation_handler()
-    async for chunk in handler.handle_generation(
+    disconnect_state = {"disconnected": False}
+    stream_iter = handler.handle_generation(
         model=normalized.model,
         prompt=normalized.prompt,
         images=normalized.images if normalized.images else None,
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
+    )
+    async for chunk in _iter_generation_chunks_with_disconnect(
+        stream_iter, raw_request, disconnect_state=disconnect_state
     ):
-        if raw_request is not None and await raw_request.is_disconnected():
-            break
         if chunk.startswith("data: "):
             yield chunk
             continue
@@ -987,7 +1216,9 @@ async def _iterate_openai_stream(
         payload = _parse_handler_result(chunk)
         yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
-    if raw_request is None or not await raw_request.is_disconnected():
+    if not disconnect_state["disconnected"] and (
+        raw_request is None or not await raw_request.is_disconnected()
+    ):
         yield "data: [DONE]\n\n"
 
 
@@ -998,36 +1229,22 @@ async def _iterate_gemini_stream(
     raw_request: Optional[Request] = None,
 ):
     handler = _ensure_generation_handler()
-    async for chunk in handler.handle_generation(
+    stream_iter = handler.handle_generation(
         model=normalized.model,
         prompt=normalized.prompt,
         images=normalized.images if normalized.images else None,
         stream=True,
         base_url_override=base_url_override,
         video_media_id=normalized.video_media_id,
-    ):
-        if raw_request is not None and await raw_request.is_disconnected():
-            break
+    )
+    async for chunk in _iter_generation_chunks_with_disconnect(stream_iter, raw_request):
         if chunk.startswith("data: "):
             payload_text = chunk[6:].strip()
             if payload_text == "[DONE]":
                 continue
             payload = _parse_handler_result(payload_text)
-            if "error" in payload:
-                yield (
-                    f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
-                )
-                return
-
-            event = await _convert_openai_stream_chunk_to_gemini_event(
-                payload,
-                response_model,
-            )
-            if event:
-                yield event
-            continue
-
-        payload = _parse_handler_result(chunk)
+        else:
+            payload = _parse_handler_result(chunk)
         if "error" in payload:
             yield (
                 f"data: {json.dumps(_build_gemini_error_payload(_get_error_status_code(payload), payload['error'].get('message', 'Generation failed')), ensure_ascii=False)}\n\n"
@@ -1040,7 +1257,6 @@ async def _iterate_gemini_stream(
         )
         if event:
             yield event
-
 
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_flexible)):
@@ -1176,6 +1392,20 @@ async def _decode_any_image_input(value: Any) -> bytes:
         raise HTTPException(status_code=400, detail=f"Invalid base64 image input: {exc}")
 
 
+async def _gather_tasks_fail_fast(coros: List[Any]) -> List[Any]:
+    if len(coros) == 1:
+        return [await coros[0]]
+    tasks = [asyncio.create_task(coro) for coro in coros]
+    try:
+        return list(await asyncio.gather(*tasks))
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 async def _run_openai_images_request(
     *,
     raw_model: str,
@@ -1211,9 +1441,9 @@ async def _run_openai_images_request(
         )
 
     request_base_url = _get_request_base_url(raw_request)
-    items: List[Dict[str, Any]] = []
-    for _ in range(count):
-        payload = _enrich_payload_with_direct_url(
+
+    async def _generate_one() -> Dict[str, Any]:
+        return _enrich_payload_with_direct_url(
             _parse_handler_result(
                 await _collect_non_stream_result(
                     resolved_model,
@@ -1224,15 +1454,22 @@ async def _run_openai_images_request(
                 )
             )
         )
+
+    payloads = await _gather_tasks_fail_fast([_generate_one() for _ in range(count)])
+    for payload in payloads:
         if "error" in payload:
             return _build_openai_json_response(payload)
-        items.append(
-            await _materialize_openai_image_item(
+
+    items = await _gather_tasks_fail_fast(
+        [
+            _materialize_openai_image_item(
                 payload,
                 prompt=prompt_clean,
                 response_format=response_format,
             )
-        )
+            for payload in payloads
+        ]
+    )
 
     return JSONResponse(
         content={
@@ -1278,26 +1515,63 @@ async def create_image_edit(
         images: List[bytes] = []
         if "multipart/form-data" in content_type:
             form = await raw_request.form()
-            raw_model = str(form.get("model") or "gemini-3.1-flash-image").strip()
-            prompt = str(form.get("prompt") or "")
-            n_raw = form.get("n")
+            upload_entries: List[Any] = []
             try:
-                n_val = int(n_raw) if n_raw not in (None, "") else 1
-            except (TypeError, ValueError):
-                raise HTTPException(status_code=400, detail="Invalid n parameter")
-            response_format = str(form.get("response_format") or "url")
-            for field_name in ("image", "image[]", "images"):
-                for entry in form.getlist(field_name):
-                    if entry is not None and entry != "":
-                        images.append(await _decode_any_image_input(entry))
-            param_carrier = SimpleNamespace(
-                size=form.get("size"),
-                quality=form.get("quality"),
-                aspect_ratio=form.get("aspect_ratio") or form.get("aspectRatio"),
-                image_size=form.get("image_size")
-                or form.get("imageSize")
-                or form.get("resolution"),
-            )
+                raw_model = str(form.get("model") or "gemini-3.1-flash-image").strip()
+                prompt = str(form.get("prompt") or "")
+                n_raw = form.get("n")
+                try:
+                    n_val = int(n_raw) if n_raw not in (None, "") else 1
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="Invalid n parameter")
+                response_format = str(form.get("response_format") or "url")
+                for field_name in ("image", "image[]", "images"):
+                    for entry in form.getlist(field_name):
+                        if entry is not None and entry != "":
+                            upload_entries.append(entry)
+                for entry in upload_entries:
+                    images.append(await _decode_any_image_input(entry))
+                param_carrier = SimpleNamespace(
+                    size=form.get("size"),
+                    quality=form.get("quality"),
+                    aspect_ratio=form.get("aspect_ratio") or form.get("aspectRatio"),
+                    image_size=form.get("image_size")
+                    or form.get("imageSize")
+                    or form.get("resolution"),
+                )
+            finally:
+                closed_ids: set[int] = set()
+                for entry in upload_entries:
+                    close_fn = getattr(entry, "close", None)
+                    if callable(close_fn):
+                        closed_ids.add(id(entry))
+                        try:
+                            res = close_fn()
+                            if inspect.isawaitable(res):
+                                await res
+                        except Exception:
+                            pass
+                multi_items = getattr(form, "multi_items", None)
+                if callable(multi_items):
+                    for _, val in multi_items():
+                        if id(val) in closed_ids:
+                            continue
+                        close_fn = getattr(val, "close", None)
+                        if callable(close_fn):
+                            closed_ids.add(id(val))
+                            try:
+                                res = close_fn()
+                                if inspect.isawaitable(res):
+                                    await res
+                            except Exception:
+                                pass
+                elif callable(getattr(form, "close", None)):
+                    try:
+                        res = form.close()
+                        if inspect.isawaitable(res):
+                            await res
+                    except Exception:
+                        pass
         else:
             body = await raw_request.json()
             if not isinstance(body, dict):
@@ -1540,9 +1814,9 @@ async def predict_images(
             )
 
         request_base_url = _get_request_base_url(raw_request)
-        predictions: List[Dict[str, Any]] = []
-        for _ in range(sample_count):
-            payload = _enrich_payload_with_direct_url(
+
+        async def _generate_one_predict() -> Dict[str, Any]:
+            return _enrich_payload_with_direct_url(
                 _parse_handler_result(
                     await _collect_non_stream_result(
                         resolved_model,
@@ -1553,8 +1827,15 @@ async def predict_images(
                     )
                 )
             )
+
+        payloads = await _gather_tasks_fail_fast(
+            [_generate_one_predict() for _ in range(sample_count)]
+        )
+        for payload in payloads:
             if "error" in payload:
                 return _build_gemini_error_response_from_handler(payload)
+
+        async def _materialize_prediction(payload: Dict[str, Any]) -> Dict[str, Any]:
             url = _extract_url_from_openai_payload(payload)
             if not url:
                 raise HTTPException(
@@ -1562,35 +1843,31 @@ async def predict_images(
                     detail="Image generation returned no image URL",
                 )
             if url.startswith("data:image"):
-                mime_type, _ = _decode_data_url(url)
                 match = DATA_URL_RE.match(url)
-                if match:
-                    predictions.append(
-                        {
-                            "bytesBase64Encoded": match.group("data"),
-                            "mimeType": mime_type,
-                        }
-                    )
-                    continue
+                if not match:
+                    raise HTTPException(status_code=400, detail="Invalid data URL")
+                return {
+                    "bytesBase64Encoded": match.group("data"),
+                    "mimeType": match.group("mime"),
+                }
             img_bytes = await retrieve_image_data(url)
             if img_bytes:
                 mime_type = _detect_image_mime_type(
                     img_bytes,
                     fallback=_guess_mime_type(url, "image/png"),
                 )
-                predictions.append(
-                    {
-                        "bytesBase64Encoded": base64.b64encode(img_bytes).decode("ascii"),
-                        "mimeType": mime_type,
-                    }
-                )
-            else:
-                predictions.append(
-                    {
-                        "imageUri": url,
-                        "mimeType": _guess_mime_type(url, "image/png"),
-                    }
-                )
+                return {
+                    "bytesBase64Encoded": base64.b64encode(img_bytes).decode("ascii"),
+                    "mimeType": mime_type,
+                }
+            return {
+                "imageUri": url,
+                "mimeType": _guess_mime_type(url, "image/png"),
+            }
+
+        predictions = await _gather_tasks_fail_fast(
+            [_materialize_prediction(payload) for payload in payloads]
+        )
 
         return JSONResponse(content={"predictions": predictions})
 

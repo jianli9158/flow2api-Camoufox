@@ -2,6 +2,8 @@
 
 import asyncio
 import base64
+from datetime import datetime, timezone
+import inspect
 import json
 import math
 import time
@@ -204,7 +206,7 @@ class GenerationHandler:
                 task_id,
                 status="failed",
                 error_message=self._normalize_error_message(error_message),
-                completed_at=time.time(),
+                completed_at=datetime.now(timezone.utc),
             )
         except Exception as exc:
             debug_logger.log_error(f"[VIDEO] 更新任务失败状态失败: {exc}")
@@ -287,7 +289,7 @@ class GenerationHandler:
         excluded_token_ids = set()
         last_failover_error: Optional[Exception] = None
         max_token_attempts = 1 if caller_pinned_token else 3
-        pending_token_state = {"active": False}
+        pending_token_state = {"active": False, "reserved": False}
         request_id = f"gen-{int(start_time * 1000)}-{id(asyncio.current_task())}"
         perf_trace: Dict[str, Any] = {
             "request_id": request_id,
@@ -313,7 +315,7 @@ class GenerationHandler:
             yield self._create_error_response(error_msg, status_code=400)
             return
 
-        model_config = MODEL_CONFIG[model]
+        model_config = dict(MODEL_CONFIG[model])
         generation_type = model_config["type"]
         video_type_for_op = model_config.get("video_type", "")
         request_operation = (
@@ -369,6 +371,7 @@ class GenerationHandler:
                 debug_logger.log_info(f"[GENERATION] 正在选择可用Token...")
                 token_select_started_at = time.time()
 
+                select_kwargs: Dict[str, Any] = {}
                 if token is None:
                     select_kwargs = {
                         "model": model,
@@ -444,7 +447,9 @@ class GenerationHandler:
                     return
 
                 debug_logger.log_info(f"[GENERATION] 已选择Token: {token.id} ({token.email})")
-                pending_token_state["active"] = True
+                if token_selected_via_lb:
+                    pending_token_state["active"] = bool(select_kwargs.get("track_pending", True))
+                    pending_token_state["reserved"] = bool(select_kwargs.get("reserve", False))
                 await self._update_request_log_progress(
                     request_log_state,
                     token_id=token.id,
@@ -636,6 +641,19 @@ class GenerationHandler:
                                 for_video_generation=(generation_type == "video"),
                             )
                             pending_token_state["active"] = False
+                        if pending_token_state.get("reserved") and self.load_balancer:
+                            release_slot_fn = getattr(
+                                self.load_balancer, "release_reserved_slot", None
+                            )
+                            if callable(release_slot_fn):
+                                res = release_slot_fn(
+                                    token.id,
+                                    for_image_generation=(generation_type == "image"),
+                                    for_video_generation=(generation_type == "video"),
+                                )
+                                if inspect.isawaitable(res):
+                                    await res
+                            pending_token_state["reserved"] = False
                         excluded_token_ids.add(token.id)
                         last_failover_error = e
                         debug_logger.log_warning(
@@ -872,6 +890,19 @@ class GenerationHandler:
                     for_video_generation=(generation_type == "video"),
                 )
                 pending_token_state["active"] = False
+            if pending_token_state.get("reserved") and token and self.load_balancer:
+                release_slot_fn = getattr(
+                    self.load_balancer, "release_reserved_slot", None
+                )
+                if callable(release_slot_fn):
+                    res = release_slot_fn(
+                        token.id,
+                        for_image_generation=(generation_type == "image"),
+                        for_video_generation=(generation_type == "video"),
+                    )
+                    if inspect.isawaitable(res):
+                        await res
+                pending_token_state["reserved"] = False
 
     def _get_no_token_error_message(self, generation_type: str) -> str:
         """获取无可用Token时的详细错误信息"""
@@ -1695,8 +1726,6 @@ class GenerationHandler:
 
             direct_video_url = str(result.get("video_url") or "").strip()
             if result.get("direct_media") and direct_video_url:
-                await self.token_manager.record_usage(token.id, is_video=True)
-                await self.token_manager.record_success(token.id)
                 if self.proxy_manager and hasattr(
                     self.proxy_manager,
                     "record_attempt_success",
@@ -1707,7 +1736,6 @@ class GenerationHandler:
                         str(fingerprint.get("proxy_url") or "").strip(),
                     )
 
-                duration = time.time() - submit_started_at
                 response_state["url"] = direct_video_url
                 response_state["generated_assets"] = {
                     "type": "video",
@@ -1717,33 +1745,6 @@ class GenerationHandler:
                 await self._update_request_log_progress(
                     request_log_state,
                     token_id=token.id,
-                    status_text="completed",
-                    progress=100,
-                )
-                prompt_for_log = (
-                    prompt if len(prompt) <= 2000 else f"{prompt[:2000]}...(truncated)"
-                )
-                await self._log_request(
-                    token.id,
-                    "generate_video",
-                    {
-                        "model": model_key,
-                        "prompt": prompt_for_log,
-                        "delivery_mode": "frontend_direct_media",
-                    },
-                    {
-                        "status": "success",
-                        "model": model_key,
-                        "prompt": prompt_for_log,
-                        "url": direct_video_url,
-                        "performance": {
-                            "status": "success",
-                            "total_ms": int(duration * 1000),
-                        },
-                    },
-                    200,
-                    duration,
-                    log_id=request_log_state.get("id"),
                     status_text="completed",
                     progress=100,
                 )
@@ -1811,6 +1812,9 @@ class GenerationHandler:
                 response_state,
                 request_log_state,
                 extend_source_media_id=extend_source_id,
+                model_config=model_config,
+                prompt=prompt,
+                is_upsample_phase=False,
             ):
                 yield chunk
 
@@ -1828,9 +1832,12 @@ class GenerationHandler:
         response_state: Optional[Dict[str, Any]] = None,
         request_log_state: Optional[Dict[str, Any]] = None,
         extend_source_media_id: Optional[str] = None,
+        model_config: Optional[Dict[str, Any]] = None,
+        prompt: str = "",
+        is_upsample_phase: bool = False,
     ) -> AsyncGenerator:
         """轮询视频生成结果
-        
+
         Args:
             upsample_config: 放大配置 {"resolution": "VIDEO_RESOLUTION_4K", "model_key": "veo_3_1_upsampler_4k"}
         """
@@ -1838,12 +1845,13 @@ class GenerationHandler:
         if response_state is None:
             response_state = self._create_response_state()
 
+        effective_model_config = model_config or {}
         normalized_tier = normalize_user_paygate_tier(token.user_paygate_tier)
         poll_interval = max(0.1, float(config.poll_interval))
         max_attempts = _video_poll_attempt_budget(
             config.video_timeout,
             poll_interval,
-            upsample=bool(upsample_config),
+            upsample=bool(is_upsample_phase),
         )
         poll_budget_seconds = max_attempts * poll_interval
         poll_deadline = time.monotonic() + poll_budget_seconds
@@ -2008,12 +2016,38 @@ class GenerationHandler:
                             
                             upsample_operations = upsample_result.get("operations", [])
                             if upsample_operations:
+                                base_task_id = (operation.get("operation") or {}).get("name")
+                                if base_task_id:
+                                    await self.db.update_task(
+                                        base_task_id,
+                                        status="completed",
+                                        progress=100,
+                                        result_urls=[video_url],
+                                        completed_at=datetime.now(timezone.utc),
+                                    )
+                                upsample_op = upsample_operations[0]
+                                upsample_task_id = (
+                                    (upsample_op.get("operation") or {}).get("name")
+                                    or upsample_op.get("name")
+                                    or ""
+                                )
+                                upsample_scene_id = upsample_op.get("sceneId")
+                                if upsample_task_id:
+                                    upsample_task = Task(
+                                        task_id=upsample_task_id,
+                                        token_id=token.id,
+                                        model=upsample_config["model_key"],
+                                        prompt=prompt,
+                                        status="processing",
+                                        scene_id=upsample_scene_id,
+                                    )
+                                    await self.db.create_task(upsample_task)
                                 if stream:
                                     yield self._create_stream_chunk(
                                         "放大任务已提交，继续轮询...\n"
                                     )
-                                
-                                # 递归轮询放大结果（不再放大）
+
+                                # 递归轮询放大结果（不再放大，获得 3x 超时预算）
                                 async for chunk in self._poll_video_result(
                                     token,
                                     project_id,
@@ -2023,6 +2057,9 @@ class GenerationHandler:
                                     generation_result,
                                     response_state,
                                     request_log_state,
+                                    model_config=effective_model_config,
+                                    prompt=prompt,
+                                    is_upsample_phase=True,
                                 ):
                                     yield chunk
                                 return
@@ -2091,11 +2128,11 @@ class GenerationHandler:
                         status="completed",
                         progress=100,
                         result_urls=[local_url],
-                        completed_at=time.time(),
+                        completed_at=datetime.now(timezone.utc),
                     )
 
                     # 存储URL用于日志记录
-                    requested_video_model = model_config.get("model_key")
+                    requested_video_model = effective_model_config.get("model_key")
                     observed_video_model = resolved_video.get("observed_model") or requested_video_model
                     if (
                         observed_video_model
@@ -2117,7 +2154,7 @@ class GenerationHandler:
                         "observed_model": observed_video_model,
                         "duration": resolved_video.get("duration"),
                     }
-                    if model_config.get("video_type") == "extend":
+                    if effective_model_config.get("video_type") == "extend" or extend_source_media_id:
                         response_state["generated_assets"]["extend_clip_metadata"] = {
                             "nominal_seconds": 8.0,
                             "effective_tail_trim_hint_seconds": 7.0,

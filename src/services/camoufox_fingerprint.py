@@ -10,13 +10,17 @@ import platform
 import random
 import re
 import shutil
+import signal
 import struct
+import subprocess
+import sys
 import tempfile
 import threading
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 import zipfile
 
+_CAMOUFOX_INSTALL_LOCK = asyncio.Lock()
 from ..core.logger import debug_logger
 
 
@@ -698,68 +702,84 @@ async def ensure_camoufox_executable(
     if existing:
         return existing
 
-    target_dir = Path(os.getcwd()) / "runtime" / "camoufox"
-    target_bin = target_dir / _camoufox_binary_relative_path()
-    if target_bin.is_file() and os.access(target_bin, os.X_OK):
-        return str(target_bin)
+    async with _CAMOUFOX_INSTALL_LOCK:
+        existing = find_camoufox_executable()
+        if existing:
+            return existing
 
-    url, archive_name = _camoufox_archive_url()
-    if progress_callback:
-        progress_callback(f"正在下载 Camoufox ({archive_name})...")
-    debug_logger.log_info(f"[Camoufox] 未找到本地可执行文件，开始下载: {url}")
-
-    def _download_and_extract() -> str:
-        target_dir.parent.mkdir(parents=True, exist_ok=True)
-        staging_dir = Path(
-            tempfile.mkdtemp(
-                prefix="camoufox-install-", dir=str(target_dir.parent)
-            )
-        )
-        zip_path = staging_dir / archive_name
-        try:
-            import urllib.request
-
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "flow2api-camoufox-installer/1.0"}
-            )
-            with urllib.request.urlopen(req, timeout=300) as resp, open(
-                zip_path, "wb"
-            ) as out_file:
-                shutil.copyfileobj(resp, out_file)
-
-            extract_dir = staging_dir / "extracted"
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for info in zf.infolist():
-                    dest = (extract_dir / info.filename).resolve()
-                    if not str(dest).startswith(str(extract_dir.resolve())):
-                        continue
-                    mode = (info.external_attr >> 16) & 0xFFFF
-                    if info.is_dir():
-                        dest.mkdir(parents=True, exist_ok=True)
-                        continue
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    if (mode & 0o170000) == 0o120000:
-                        link_target = zf.read(info).decode("utf-8")
-                        if dest.exists() or dest.is_symlink():
-                            dest.unlink()
-                        os.symlink(link_target, dest)
-                    else:
-                        with zf.open(info) as src, open(dest, "wb") as dst:
-                            shutil.copyfileobj(src, dst)
-                        if mode & 0o111:
-                            os.chmod(dest, 0o755)
-
-            if target_dir.exists():
-                shutil.rmtree(target_dir, ignore_errors=True)
-            shutil.move(str(extract_dir), str(target_dir))
-            if target_bin.is_file():
-                os.chmod(target_bin, 0o755)
+        target_dir = Path(os.getcwd()) / "runtime" / "camoufox"
+        target_bin = target_dir / _camoufox_binary_relative_path()
+        if target_bin.is_file() and os.access(target_bin, os.X_OK):
             return str(target_bin)
-        finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
 
-    return await asyncio.to_thread(_download_and_extract)
+        url, archive_name = _camoufox_archive_url()
+        if progress_callback:
+            progress_callback(f"正在下载 Camoufox ({archive_name})...")
+        debug_logger.log_info(f"[Camoufox] 未找到本地可执行文件，开始下载: {url}")
+
+        def _download_and_extract() -> str:
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            staging_dir = Path(
+                tempfile.mkdtemp(
+                    prefix="camoufox-install-", dir=str(target_dir.parent)
+                )
+            )
+            zip_path = staging_dir / archive_name
+            try:
+                import urllib.request
+
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "flow2api-camoufox-installer/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=300) as resp, open(
+                    zip_path, "wb"
+                ) as out_file:
+                    shutil.copyfileobj(resp, out_file)
+
+                extract_dir = staging_dir / "extracted"
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                extract_root = extract_dir.resolve()
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    for info in zf.infolist():
+                        dest = (extract_root / info.filename).resolve()
+                        if not dest.is_relative_to(extract_root):
+                            continue
+                        mode = (info.external_attr >> 16) & 0xFFFF
+                        if info.is_dir():
+                            dest.mkdir(parents=True, exist_ok=True)
+                            continue
+                        if dest == extract_root:
+                            continue
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        if (mode & 0o170000) == 0o120000:
+                            link_target = zf.read(info).decode("utf-8")
+                            if (
+                                not link_target
+                                or Path(link_target).is_absolute()
+                                or not (dest.parent / link_target)
+                                .resolve()
+                                .is_relative_to(extract_root)
+                            ):
+                                continue
+                            if dest.exists() or dest.is_symlink():
+                                dest.unlink()
+                            os.symlink(link_target, dest)
+                        else:
+                            with zf.open(info) as src, open(dest, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+                            if mode & 0o111:
+                                os.chmod(dest, 0o755)
+
+                if target_dir.exists():
+                    shutil.rmtree(target_dir, ignore_errors=True)
+                shutil.move(str(extract_dir), str(target_dir))
+                if target_bin.is_file():
+                    os.chmod(target_bin, 0o755)
+                return str(target_bin)
+            finally:
+                shutil.rmtree(staging_dir, ignore_errors=True)
+
+        return await asyncio.to_thread(_download_and_extract)
 
 
 def _firefox_pref_literal(value: Any) -> str:
@@ -797,10 +817,14 @@ def write_camoufox_user_js(
         "javascript.options.mem.nursery.max_kb": 4096,
         "gfx.webrender.max-shared-surface-size": 512,
         "gfx.display.frame-rate-divisor": 1,
-        "browser.cache.disk.enable": True,
+        "browser.cache.disk.enable": False,
         "browser.cache.disk.smart_size.enabled": False,
         "browser.cache.disk.capacity": 30720,
         "browser.cache.disk.max_entry_size": 5120,
+        "places.history.enabled": False,
+        "browser.chrome.site_icons": False,
+        "browser.chrome.favicons": False,
+        "browser.sessionstore.resume_from_crash": False,
         "media.gmp-widevinecdm.enabled": False,
         "media.gmp-widevinecdm.visible": False,
         "media.gmp-widevinecdm.autoupdate": False,
@@ -910,20 +934,72 @@ def write_camoufox_user_js(
             pass
 
 
+def _camoufox_subprocess_kwargs() -> Dict[str, Any]:
+    """Return OS subprocess creation kwargs isolating Camoufox into its own process group."""
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return {"creationflags": flags} if flags else {}
+    return {"start_new_session": True}
+
+
+async def _terminate_camoufox_process(
+    proc: Any, *, terminate_timeout: float = 4.0
+) -> None:
+    """Terminate Camoufox and its child process group safely (compatible with test mock Processes)."""
+    if proc is None or getattr(proc, "returncode", None) is not None:
+        return
+    pid = getattr(proc, "pid", None)
+    use_killpg = (
+        sys.platform != "win32"
+        and hasattr(os, "killpg")
+        and isinstance(pid, int)
+        and not isinstance(pid, bool)
+        and pid > 0
+    )
+
+    def _signal_group_or_proc(sig: int, fallback_method: str) -> None:
+        if use_killpg:
+            try:
+                os.killpg(pid, sig)
+                return
+            except (ProcessLookupError, PermissionError, TypeError, OSError):
+                pass
+        fn = getattr(proc, fallback_method, None)
+        if callable(fn):
+            fn()
+
+    try:
+        _signal_group_or_proc(signal.SIGTERM, "terminate")
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=terminate_timeout)
+        return
+    except Exception:
+        pass
+    try:
+        _signal_group_or_proc(signal.SIGKILL, "kill")
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+    except Exception:
+        pass
+
+
 def _start_stdout_drain(
     proc: Optional[asyncio.subprocess.Process],
 ) -> Optional[asyncio.Task]:
     """Continuously drain subprocess stdout after BiDi startup to avoid 64KB OS pipe buffer deadlocks."""
-    if proc is None or proc.stdout is None:
+    stdout = getattr(proc, "stdout", None) if proc is not None else None
+    if stdout is None:
         return None
 
     async def _drain() -> None:
         try:
-            while proc.stdout is not None:
-                chunk = await proc.stdout.read(8192)
+            at_eof = getattr(stdout, "at_eof", None)
+            while not (callable(at_eof) and at_eof() is True):
+                chunk = await stdout.read(65536)
                 if not chunk:
                     break
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             pass
 
     return asyncio.create_task(_drain())

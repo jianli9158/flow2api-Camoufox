@@ -439,15 +439,17 @@ class BiDiClient:
                     timeout=timeout,
                 )
             except BaseException:
-                await session.close()
+                if not getattr(session, "closed", False):
+                    await session.close()
                 raise
 
             async def _close_all() -> None:
                 try:
-                    await ws.close()
+                    if not getattr(ws, "closed", False):
+                        await ws.close()
                 finally:
-                    await session.close()
-
+                    if not getattr(session, "closed", False):
+                        await session.close()
             client = cls(ws.send_str, _close_all)
 
             async def _read_loop() -> None:
@@ -468,8 +470,8 @@ class BiDiClient:
                     client._fail_all(exc)
                 finally:
                     client._fail_all(RuntimeError("BiDi WebSocket closed"))
-                    await session.close()
-
+                    if not getattr(session, "closed", False):
+                        await session.close()
             client._reader_task = asyncio.create_task(_read_loop())
             return client
 

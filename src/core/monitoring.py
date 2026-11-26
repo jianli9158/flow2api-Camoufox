@@ -6,8 +6,6 @@ import asyncio
 import inspect
 import json
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -366,6 +364,17 @@ async def update_main_runtime_metrics(
     total_image_inflight = 0
     total_video_inflight = 0
 
+    image_inflight_map: Optional[dict[int, int]] = None
+    video_inflight_map: Optional[dict[int, int]] = None
+    if concurrency_manager is not None:
+        get_snapshot = getattr(concurrency_manager, "get_inflight_snapshot", None)
+        if callable(get_snapshot):
+            candidate = get_snapshot()
+            if inspect.isawaitable(candidate):
+                snapshot = await candidate
+                if isinstance(snapshot, tuple) and len(snapshot) == 2:
+                    image_inflight_map, video_inflight_map = snapshot
+
     for row in rows:
         token_id = str(row.get("id") or "")
         if not token_id:
@@ -410,12 +419,17 @@ async def update_main_runtime_metrics(
         image_inflight = 0
         video_inflight = 0
         if concurrency_manager is not None:
-            image_inflight = int(
-                await concurrency_manager.get_image_inflight(int(token_id))
-            )
-            video_inflight = int(
-                await concurrency_manager.get_video_inflight(int(token_id))
-            )
+            tid = int(token_id)
+            if image_inflight_map is not None and video_inflight_map is not None:
+                image_inflight = int(image_inflight_map.get(tid, 0) or 0)
+                video_inflight = int(video_inflight_map.get(tid, 0) or 0)
+            else:
+                image_inflight = int(
+                    await concurrency_manager.get_image_inflight(tid)
+                )
+                video_inflight = int(
+                    await concurrency_manager.get_video_inflight(tid)
+                )
         total_image_inflight += image_inflight
         total_video_inflight += video_inflight
 

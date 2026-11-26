@@ -497,8 +497,12 @@ class BrowserCaptchaService:
                 if success is False:
                     request.failed = True
                 return
-            self._requests.pop(browser_ref)
-            request.owner.remove_done_callback(request.owner_callback)
+            self._requests.pop(browser_ref, None)
+            if request.owner and request.owner_callback:
+                try:
+                    request.owner.remove_done_callback(request.owner_callback)
+                except Exception:
+                    pass
             state = self._slot_recovery.get(request.slot_id)
             if (
                 state
@@ -530,35 +534,64 @@ class BrowserCaptchaService:
         wait_timeout=None,
     ):
         request = None
+        wait_seconds = (
+            self.QUEUE_WAIT_SECONDS
+            if wait_timeout is None
+            else max(0.0, float(wait_timeout))
+        )
+        deadline = time.monotonic() + wait_seconds
+        candidate = None
         async with self._slot_condition:
-            candidate = self._requests.get(browser_ref)
-            if (
-                candidate
-                and candidate.token_id == token_id
-                and not candidate.owner.done()
-            ):
+            while True:
+                if self._closed:
+                    raise RuntimeError("Browser captcha service is closed")
+                candidate = (
+                    self._requests.get(browser_ref)
+                    if browser_ref is not None
+                    else None
+                )
+                if not (
+                    candidate
+                    and candidate.token_id == token_id
+                    and not (candidate.owner and candidate.owner.done())
+                ):
+                    break
+                if candidate.in_browser_op:
+                    raise RuntimeError("Browser captcha request is already submitting")
                 state = self._slot_recovery.get(candidate.slot_id)
-                if (
+                if not (
                     candidate.generation
                     == getattr(candidate.browser, "_runtime_generation", 0)
                     and not candidate.failed
                     and (not state or state.phase in {"ready", "probe"})
-                    and not self._slot_reservations.get(candidate.slot_id, 0)
                 ):
+                    break
+                if not self._slot_reservations.get(candidate.slot_id, 0):
                     request = candidate
                     request.hold = False
                     request.in_browser_op = True
                     request.borrower = asyncio.current_task()
                     self._reserve_slot_locked(request.slot_id)
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._queue_timeouts += 1
+                    raise BrowserCaptchaQueueTimeout(
+                        "Browser captcha queue wait timeout"
+                    )
+                try:
+                    await asyncio.wait_for(self._slot_condition.wait(), remaining)
+                except asyncio.TimeoutError:
+                    pass
         if not request:
             if candidate and candidate.token_id == token_id:
-                if self._slot_reservations.get(candidate.slot_id, 0):
+                if candidate.in_browser_op:
                     raise RuntimeError("Browser captcha request is already submitting")
                 await self._finish_request(candidate.ref, success=False)
             slot_id = await self._select_browser_id(
                 project_id,
                 token_id=token_id,
-                timeout_seconds=wait_timeout,
+                timeout_seconds=max(0.0, deadline - time.monotonic()),
             )
             try:
                 browser = await self._get_or_create_browser(slot_id)
@@ -579,7 +612,8 @@ class BrowserCaptchaService:
                     if self._closed:
                         raise RuntimeError("Browser captcha service is closed")
                     self._requests[request.ref] = request
-                    request.owner.add_done_callback(request.owner_callback)
+                    if request.owner and request.owner_callback:
+                        request.owner.add_done_callback(request.owner_callback)
             except BaseException:
                 await self._release_slot_reservation(slot_id)
                 raise
@@ -639,11 +673,14 @@ class BrowserCaptchaService:
                     bound_token_id = self._slot_bound_token_id(slot_id)
                     is_bound_to_expected = expected_token_id is not None and (
                         bound_token_id == expected_token_id
-                        or any(
-                            r.slot_id == slot_id
-                            and CamoufoxWorker._normalize_token_key(r.token_id)
-                            == expected_token_id
-                            for r in self._requests.values()
+                        or (
+                            bound_token_id is None
+                            and any(
+                                r.slot_id == slot_id
+                                and CamoufoxWorker._normalize_token_key(r.token_id)
+                                == expected_token_id
+                                for r in self._requests.values()
+                            )
                         )
                     )
                     if self._is_slot_busy_for_allocation(slot_id):
@@ -690,18 +727,36 @@ class BrowserCaptchaService:
                 # while another slot already holds that account's profile open!
                 if matching_idle_slot is not None:
                     selected_slot = matching_idle_slot
+                    selected_via_leased = False
                 elif matching_busy_slot is not None:
                     selected_slot = None
+                    selected_via_leased = False
                 elif unbound_warm_idle_slot is not None:
                     selected_slot = unbound_warm_idle_slot
+                    selected_via_leased = False
                 elif cold_idle_slot is not None:
                     selected_slot = cold_idle_slot
+                    selected_via_leased = False
                 elif unleased_idle_slot is not None:
                     selected_slot = unleased_idle_slot
+                    selected_via_leased = False
                 else:
                     selected_slot = leased_idle_slot
+                    selected_via_leased = leased_idle_slot is not None
 
                 if selected_slot is not None:
+                    for ref, req in list(self._requests.items()):
+                        if req.slot_id == selected_slot and req.hold and (
+                            selected_via_leased
+                            or CamoufoxWorker._normalize_token_key(req.token_id)
+                            != expected_token_id
+                        ):
+                            self._requests.pop(ref, None)
+                            if req.owner and req.owner_callback:
+                                try:
+                                    req.owner.remove_done_callback(req.owner_callback)
+                                except Exception:
+                                    pass
                     self._round_robin_index = (selected_slot + 1) % self._browser_count
                     self._reserve_slot_locked(selected_slot)
                     self._admitted_requests += 1
@@ -1207,7 +1262,11 @@ class BrowserCaptchaService:
                 state.task for state in self._slot_recovery.values() if state.task
             ]
             for request in self._requests.values():
-                request.owner.remove_done_callback(request.owner_callback)
+                if request.owner and request.owner_callback:
+                    try:
+                        request.owner.remove_done_callback(request.owner_callback)
+                    except Exception:
+                        pass
             self._requests.clear()
             self._slot_reservations.clear()
             self._slot_condition.notify_all()

@@ -5,7 +5,7 @@ import aiosqlite
 import json
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional, List, Dict, Any
 from pathlib import Path
 from .models import (
@@ -30,6 +30,54 @@ from .models import (
 class Database:
     """SQLite database manager"""
     READ_POOL_SIZE = 4
+    ALLOWED_TOKEN_UPDATE_COLUMNS = frozenset(
+        {
+            "st",
+            "at",
+            "at_expires",
+            "email",
+            "name",
+            "remark",
+            "is_active",
+            "last_used_at",
+            "use_count",
+            "credits",
+            "user_paygate_tier",
+            "current_project_id",
+            "current_project_name",
+            "image_enabled",
+            "video_enabled",
+            "image_concurrency",
+            "video_concurrency",
+            "captcha_proxy_url",
+            "extension_route_key",
+            "browser_profile_dir",
+            "protocol_mode",
+            "google_cookies",
+            "login_account",
+            "login_password",
+            "proxy_url",
+            "auto_refresh_enabled",
+            "refresh_interval_minutes",
+            "last_st_refresh_at",
+            "last_st_refresh_result",
+            "ban_reason",
+            "banned_at",
+        }
+    )
+    ALLOWED_TASK_UPDATE_COLUMNS = frozenset(
+        {
+            "token_id",
+            "model",
+            "prompt",
+            "status",
+            "progress",
+            "result_urls",
+            "error_message",
+            "scene_id",
+            "completed_at",
+        }
+    )
 
     def __init__(self, db_path: str = None):
         if db_path is None:
@@ -824,6 +872,9 @@ class Database:
                     "CREATE INDEX IF NOT EXISTS idx_tokens_login_account_nocase ON tokens(login_account COLLATE NOCASE)"
                 )
                 await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tokens_browser_profile_dir_nocase ON tokens(browser_profile_dir COLLATE NOCASE)"
+                )
+                await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)"
                 )
             if await self._table_exists(db, "projects"):
@@ -1117,6 +1168,9 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS idx_tokens_login_account_nocase ON tokens(login_account COLLATE NOCASE)"
             )
             await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tokens_browser_profile_dir_nocase ON tokens(browser_profile_dir COLLATE NOCASE)"
+            )
+            await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_tokens_is_active_last_used_at ON tokens(is_active, last_used_at)"
             )
 
@@ -1345,7 +1399,6 @@ class Database:
                     (default_profile_dir, token_id),
                 )
                 token.browser_profile_dir = default_profile_dir
-            await db.commit()
             await db.execute(
                 """
                 INSERT INTO token_stats (token_id) VALUES (?)
@@ -1519,6 +1572,11 @@ class Database:
             return [tok.model_copy() for tok in tokens]
     async def update_token(self, token_id: int, **kwargs):
         """Update token fields"""
+        for key in kwargs:
+            if key not in self.ALLOWED_TOKEN_UPDATE_COLUMNS:
+                raise ValueError(f"Unsupported column: {key}")
+        if not kwargs:
+            return
         async with self._connect(write=True) as db:
             if (
                 "email" in kwargs
@@ -1551,6 +1609,17 @@ class Database:
                 await db.execute(query, params)
                 await db.commit()
                 self.invalidate_active_tokens_cache()
+
+    async def increment_token_use_count(self, token_id: int) -> None:
+        """Atomically increment token use_count and update last_used_at."""
+        async with self._connect(write=True) as db:
+            await db.execute(
+                "UPDATE tokens SET use_count = COALESCE(use_count, 0) + 1, "
+                "last_used_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (token_id,),
+            )
+            await db.commit()
+            self.invalidate_active_tokens_cache()
 
     async def update_token_if_cookie_matches(
         self, token_id: int, expected_cookies: str, **kwargs
@@ -1659,6 +1728,29 @@ class Database:
             await db.commit()
             return cursor.lastrowid
 
+
+    @staticmethod
+    def _coerce_task_timestamp(value: Any) -> Any:
+        if value is None or isinstance(value, datetime):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                return datetime.fromtimestamp(float(value), tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            try:
+                epoch = float(raw)
+            except ValueError:
+                return raw
+            try:
+                return datetime.fromtimestamp(epoch, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+        return value
     async def get_task(self, task_id: str) -> Optional[Task]:
         """Get task by ID"""
         async with self._connect() as db:
@@ -1669,14 +1761,27 @@ class Database:
             row = await cursor.fetchone()
             if row:
                 task_dict = dict(row)
-                # Parse result_urls from JSON
-                if task_dict.get("result_urls"):
-                    task_dict["result_urls"] = json.loads(task_dict["result_urls"])
+                raw_urls = task_dict.get("result_urls")
+                if isinstance(raw_urls, str) and raw_urls:
+                    task_dict["result_urls"] = json.loads(raw_urls)
+                if "completed_at" in task_dict:
+                    task_dict["completed_at"] = self._coerce_task_timestamp(
+                        task_dict.get("completed_at")
+                    )
+                if "created_at" in task_dict:
+                    task_dict["created_at"] = self._coerce_task_timestamp(
+                        task_dict.get("created_at")
+                    )
                 return Task(**task_dict)
             return None
 
     async def update_task(self, task_id: str, **kwargs):
         """Update task"""
+        for key in kwargs:
+            if key not in self.ALLOWED_TASK_UPDATE_COLUMNS:
+                raise ValueError(f"Unsupported column: {key}")
+        if not kwargs:
+            return
         async with self._connect(write=True) as db:
             updates = []
             params = []
@@ -1694,6 +1799,104 @@ class Database:
                 query = f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = ?"
                 await db.execute(query, params)
                 await db.commit()
+
+    async def recover_stale_processing_tasks(self) -> int:
+        """Mark tasks left in processing/upsampling state across restarts as failed."""
+        async with self._connect(write=True) as db:
+            if not await self._table_exists(db, "tasks"):
+                return 0
+            cursor = await db.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed',
+                    error_message = 'Server restarted before task completed',
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE status IN ('processing', 'upsampling')
+                """
+            )
+            await db.commit()
+            return int(cursor.rowcount) if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    async def cleanup_old_tasks(
+        self, retention_days: int = 14, max_rows: int = 10000
+    ) -> int:
+        """Delete terminal (completed/failed) task rows older than retention_days or beyond max_rows."""
+        deleted_total = 0
+        async with self._connect(write=True) as db:
+            if not await self._table_exists(db, "tasks"):
+                return 0
+
+            if retention_days and retention_days > 0:
+                cursor = await db.execute(
+                    """
+                    DELETE FROM tasks
+                    WHERE status IN ('completed', 'failed')
+                      AND COALESCE(
+                          CASE
+                              WHEN typeof(completed_at) IN ('integer', 'real') THEN datetime(completed_at, 'unixepoch')
+                              WHEN completed_at IS NOT NULL AND TRIM(CAST(completed_at AS TEXT)) != '' THEN datetime(completed_at)
+                              ELSE NULL
+                          END,
+                          datetime(created_at),
+                          created_at
+                      ) < datetime('now', ?)
+                    """,
+                    (f"-{int(retention_days)} days",),
+                )
+                if cursor.rowcount and cursor.rowcount > 0:
+                    deleted_total += cursor.rowcount
+
+            if max_rows and max_rows > 0:
+                cutoff_cursor = await db.execute(
+                    """
+                    SELECT created_at, id
+                    FROM tasks
+                    WHERE status IN ('completed', 'failed')
+                    ORDER BY created_at DESC, id DESC
+                    LIMIT 1 OFFSET ?
+                    """,
+                    (int(max_rows),),
+                )
+                cutoff_row = await cutoff_cursor.fetchone()
+                if cutoff_row is not None:
+                    cutoff_created_at = cutoff_row[0]
+                    cutoff_id = cutoff_row[1]
+                    if cutoff_created_at is None:
+                        excess_cursor = await db.execute(
+                            """
+                            DELETE FROM tasks
+                            WHERE status IN ('completed', 'failed')
+                              AND created_at IS NULL
+                              AND id <= ?
+                            """,
+                            (cutoff_id,),
+                        )
+                    else:
+                        excess_cursor = await db.execute(
+                            """
+                            DELETE FROM tasks
+                            WHERE status IN ('completed', 'failed')
+                              AND (
+                                  created_at IS NULL
+                                  OR created_at < ?
+                                  OR (created_at = ? AND id <= ?)
+                              )
+                            """,
+                            (cutoff_created_at, cutoff_created_at, cutoff_id),
+                        )
+                    if excess_cursor.rowcount and excess_cursor.rowcount > 0:
+                        deleted_total += excess_cursor.rowcount
+
+            if db.in_transaction or deleted_total > 0:
+                await db.commit()
+
+        if deleted_total > 0 and not self._is_memory_db:
+            try:
+                await self.run_maintenance_pragmas()
+            except Exception:
+                pass
+
+        return deleted_total
 
     # Token stats operations (kept for compatibility, now delegates to specific methods)
     async def increment_token_stats(self, token_id: int, stat_type: str):
@@ -1829,6 +2032,31 @@ class Database:
             """,
                 (token_id,),
             )
+            await db.commit()
+
+    async def record_token_success(self, token_id: int) -> None:
+        """Atomically increment success_count, update last_success_at, and reset consecutive_error_count."""
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                """
+                UPDATE token_stats
+                SET success_count = COALESCE(success_count, 0) + 1,
+                    last_success_at = CURRENT_TIMESTAMP,
+                    consecutive_error_count = 0
+                WHERE token_id = ?
+                """,
+                (token_id,),
+            )
+            if cursor.rowcount == 0:
+                await db.execute(
+                    """
+                    INSERT INTO token_stats (
+                        token_id, success_count, last_success_at, consecutive_error_count
+                    )
+                    VALUES (?, 1, CURRENT_TIMESTAMP, 0)
+                    """,
+                    (token_id,),
+                )
             await db.commit()
 
     # Config operations
@@ -2371,6 +2599,9 @@ class Database:
         debug_config = await self.get_debug_config()
         if debug_config:
             config.set_debug_enabled(debug_config.enabled)
+            config.set_debug_log_requests(debug_config.log_requests)
+            config.set_debug_log_responses(debug_config.log_responses)
+            config.set_debug_mask_token(debug_config.mask_token)
 
         # Reload captcha config
         captcha_config = await self.get_captcha_config()

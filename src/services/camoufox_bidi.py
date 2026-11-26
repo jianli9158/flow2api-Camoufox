@@ -66,8 +66,10 @@ from .camoufox_fingerprint import (
     CAMOUFOX_FIREFOX_MAJOR,
     CAMOUFOX_RELEASE_VERSION,
     FIREFOX_VERSION_PATTERN,
+    _camoufox_subprocess_kwargs,
     _firefox_pref_literal,
     _start_stdout_drain,
+    _terminate_camoufox_process,
     add_windows_substitute_names,
     build_camoufox_env,
     build_camoufox_fingerprint_config,
@@ -511,6 +513,7 @@ class CamoufoxWorker:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
+                **_camoufox_subprocess_kwargs(),
             )
             self._shared_browser_pid = self._process.pid
 
@@ -585,19 +588,8 @@ class CamoufoxWorker:
                     await bidi.close()
                 except Exception:
                     pass
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=3.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
+            if proc is not None:
+                await _terminate_camoufox_process(proc, terminate_timeout=3.0)
             if relay is not None:
                 try:
                     await relay.close()
@@ -1125,19 +1117,7 @@ class CamoufoxWorker:
                 await close_fn()
 
         if proc is not None:
-            if proc.returncode is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    pass
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=4.0)
-                except Exception:
-                    try:
-                        proc.kill()
-                        await asyncio.wait_for(proc.wait(), timeout=2.0)
-                    except Exception:
-                        pass
+            await _terminate_camoufox_process(proc, terminate_timeout=4.0)
 
         if relay is not None:
             await relay.close()
@@ -1397,16 +1377,38 @@ class CamoufoxWorker:
                         )
                 if force_reload:
                     await asyncio.sleep(1.5)
-            for _ in range(30):
-                try:
-                    state = await self._bidi.evaluate(
-                        context_id, "document.readyState", await_promise=False
-                    )
-                    if state in ("interactive", "complete"):
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.3)
+            try:
+                await self._bidi.evaluate(
+                    context_id,
+                    """(() => {
+                        if (document.readyState === "interactive" || document.readyState === "complete") {
+                            return document.readyState;
+                        }
+                        return new Promise((resolve) => {
+                            let done = false;
+                            const finish = () => {
+                                if (done) return;
+                                done = true;
+                                document.removeEventListener("readystatechange", onChange);
+                                document.removeEventListener("DOMContentLoaded", onChange);
+                                clearTimeout(timer);
+                                resolve(document.readyState);
+                            };
+                            const onChange = () => {
+                                if (document.readyState === "interactive" || document.readyState === "complete") {
+                                    finish();
+                                }
+                            };
+                            const timer = setTimeout(finish, 9000);
+                            document.addEventListener("readystatechange", onChange);
+                            document.addEventListener("DOMContentLoaded", onChange, { once: true });
+                        });
+                    })()""",
+                    await_promise=True,
+                    timeout=12.0,
+                )
+            except Exception:
+                pass
             # Verify we did not get redirected to signed-out /about or accounts.google.com
             if needs_nav:
                 await asyncio.sleep(0.4)
@@ -1552,19 +1554,43 @@ class CamoufoxWorker:
                 pass
             await self._send_trusted_gesture(context_id)
             ready = False
-            for _ in range(30):
-                try:
-                    ok = await self._bidi.evaluate(
-                        context_id,
-                        "Boolean(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')",
-                        await_promise=False,
-                    )
-                    if ok is True:
-                        ready = True
-                        break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
+            try:
+                ok = await self._bidi.evaluate(
+                    context_id,
+                    """(() => {
+                        const isReady = () => Boolean(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function');
+                        if (isReady()) return true;
+                        return new Promise((resolve) => {
+                            let settled = false;
+                            let obs = null;
+                            let pollTimer = null;
+                            let endTimer = null;
+                            const finish = (val) => {
+                                if (settled) return;
+                                settled = true;
+                                if (obs) { try { obs.disconnect(); } catch (_) {} }
+                                if (pollTimer) clearInterval(pollTimer);
+                                if (endTimer) clearTimeout(endTimer);
+                                resolve(Boolean(val));
+                            };
+                            const check = () => {
+                                if (isReady()) finish(true);
+                            };
+                            const root = document.head || document.documentElement;
+                            if (root && typeof MutationObserver === "function") {
+                                obs = new MutationObserver(check);
+                                obs.observe(root, { childList: true, subtree: true });
+                            }
+                            pollTimer = setInterval(check, 80);
+                            endTimer = setTimeout(() => finish(isReady()), 12000);
+                        });
+                    })()""",
+                    await_promise=True,
+                    timeout=18.0,
+                )
+                ready = ok is True
+            except Exception:
+                ready = False
 
             if not ready:
                 # Inject enterprise.js if Flow page deferred it
@@ -1575,33 +1601,44 @@ class CamoufoxWorker:
                 )
                 inject_expr = f"""
                 (() => {{
-                    if (window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') return true;
-                    const script = document.createElement('script');
-                    script.src = {json.dumps(f"{primary_host}/recaptcha/enterprise.js?render={FLOW_WEBSITE_KEY}")};
-                    script.async = true;
-                    (document.head || document.documentElement).appendChild(script);
-                    return false;
+                    const isReady = () => Boolean(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function');
+                    if (isReady()) return true;
+                    return new Promise((resolve) => {{
+                        let settled = false;
+                        let pollTimer = null;
+                        let endTimer = null;
+                        const finish = (val) => {{
+                            if (settled) return;
+                            settled = true;
+                            if (pollTimer) clearInterval(pollTimer);
+                            if (endTimer) clearTimeout(endTimer);
+                            resolve(Boolean(val));
+                        }};
+                        const script = document.createElement('script');
+                        script.src = {json.dumps(f"{primary_host}/recaptcha/enterprise.js?render={FLOW_WEBSITE_KEY}")};
+                        script.async = true;
+                        script.addEventListener('load', () => {{
+                            if (isReady()) finish(true);
+                        }}, {{ once: true }});
+                        script.addEventListener('error', () => finish(false), {{ once: true }});
+                        (document.head || document.documentElement).appendChild(script);
+                        pollTimer = setInterval(() => {{
+                            if (isReady()) finish(true);
+                        }}, 80);
+                        endTimer = setTimeout(() => finish(isReady()), 12500);
+                    }});
                 }})()
                 """
                 try:
-                    await self._bidi.evaluate(
-                        context_id, inject_expr, await_promise=False
+                    ok = await self._bidi.evaluate(
+                        context_id,
+                        inject_expr,
+                        await_promise=True,
+                        timeout=18.0,
                     )
+                    ready = ok is True
                 except Exception:
-                    pass
-                for _ in range(25):
-                    try:
-                        ok = await self._bidi.evaluate(
-                            context_id,
-                            "Boolean(window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')",
-                            await_promise=False,
-                        )
-                        if ok is True:
-                            ready = True
-                            break
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.5)
+                    ready = False
 
             return ready
 
@@ -2654,11 +2691,10 @@ class CamoufoxWorker:
                                 )
                                 await asyncio.sleep(0.2)
 
-                            pm_rect = None
-                            for _ in range(40):
-                                pm_rect = await bidi.evaluate(
-                                    context_id,
-                                    """(() => {
+                            pm_rect = await bidi.evaluate(
+                                context_id,
+                                """(() => new Promise((resolve) => {
+                                    const probe = () => {
                                         const wiz = window.WIZ_global_data || {};
                                         const pm = document.querySelector(".ProseMirror");
                                         if (!pm) return null;
@@ -2675,18 +2711,43 @@ class CamoufoxWorker:
                                             fSid: String(wiz.FdrFJe || ""),
                                             at: String(wiz.SNlM0e || "")
                                         };
-                                    })()""",
-                                    await_promise=False,
-                                )
-                                if isinstance(pm_rect, dict):
-                                    if pm_rect.get("bl") and pm_rect.get("fSid"):
-                                        self._cached_wiz = {
-                                            "bl": str(pm_rect.get("bl") or ""),
-                                            "fSid": str(pm_rect.get("fSid") or ""),
-                                            "at": str(pm_rect.get("at") or ""),
-                                        }
-                                    break
-                                await asyncio.sleep(0.2)
+                                    };
+                                    const immediate = probe();
+                                    if (immediate) { resolve(immediate); return; }
+                                    let settled = false;
+                                    let obs = null;
+                                    let pollTimer = null;
+                                    let endTimer = null;
+                                    const finish = (val) => {
+                                        if (settled) return;
+                                        settled = true;
+                                        if (obs) { try { obs.disconnect(); } catch (_) {} }
+                                        if (pollTimer) clearInterval(pollTimer);
+                                        if (endTimer) clearTimeout(endTimer);
+                                        resolve(val);
+                                    };
+                                    const check = () => {
+                                        const res = probe();
+                                        if (res) finish(res);
+                                    };
+                                    const root = document.body || document.documentElement;
+                                    if (root && typeof MutationObserver === "function") {
+                                        obs = new MutationObserver(check);
+                                        obs.observe(root, { childList: true, subtree: true, attributes: true });
+                                    }
+                                    pollTimer = setInterval(check, 100);
+                                    endTimer = setTimeout(() => finish(probe()), 8000);
+                                }))()""",
+                                await_promise=True,
+                                timeout=15.0,
+                            )
+                            if isinstance(pm_rect, dict):
+                                if pm_rect.get("bl") and pm_rect.get("fSid"):
+                                    self._cached_wiz = {
+                                        "bl": str(pm_rect.get("bl") or ""),
+                                        "fSid": str(pm_rect.get("fSid") or ""),
+                                        "at": str(pm_rect.get("at") or ""),
+                                    }
                             if not isinstance(pm_rect, dict):
                                 raise RuntimeError("Camoufox 页面未找到 .ProseMirror 输入框")
 
@@ -2775,15 +2836,12 @@ class CamoufoxWorker:
                                     ],
                                 },
                             )
-                            await asyncio.sleep(0.25)
-
-                            gen_rect = None
-                            for _ in range(10):
-                                gen_rect = await bidi.evaluate(
-                                    context_id,
-                                    """(() => {
+                            gen_rect = await bidi.evaluate(
+                                context_id,
+                                """(() => new Promise((resolve) => {
+                                    const probe = () => {
                                         const btn = document.querySelector("button.generate-icon-button:not([disabled])");
-                                        if (!btn || btn.disabled) return null;
+                                        if (!btn || btn.disabled || btn.getAttribute("aria-disabled") === "true") return null;
                                         const r = btn.getBoundingClientRect();
                                         const vw = window.innerWidth || document.documentElement.clientWidth || 1280;
                                         const vh = window.innerHeight || document.documentElement.clientHeight || 720;
@@ -2792,12 +2850,36 @@ class CamoufoxWorker:
                                             x: Math.max(4, Math.min(vw - 4, Math.round(r.left + r.width / 2))),
                                             y: Math.max(4, Math.min(vh - 4, Math.round(r.top + r.height / 2)))
                                         };
-                                    })()""",
-                                    await_promise=False,
-                                )
-                                if isinstance(gen_rect, dict):
-                                    break
-                                await asyncio.sleep(0.15)
+                                    };
+                                    const immediate = probe();
+                                    if (immediate) { resolve(immediate); return; }
+                                    let settled = false;
+                                    let obs = null;
+                                    let pollTimer = null;
+                                    let endTimer = null;
+                                    const finish = (val) => {
+                                        if (settled) return;
+                                        settled = true;
+                                        if (obs) { try { obs.disconnect(); } catch (_) {} }
+                                        if (pollTimer) clearInterval(pollTimer);
+                                        if (endTimer) clearTimeout(endTimer);
+                                        resolve(val);
+                                    };
+                                    const check = () => {
+                                        const res = probe();
+                                        if (res) finish(res);
+                                    };
+                                    const root = document.body || document.documentElement;
+                                    if (root && typeof MutationObserver === "function") {
+                                        obs = new MutationObserver(check);
+                                        obs.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ["disabled", "aria-disabled", "class", "style"] });
+                                    }
+                                    pollTimer = setInterval(check, 50);
+                                    endTimer = setTimeout(() => finish(probe()), 2000);
+                                }))()""",
+                                await_promise=True,
+                                timeout=10.0,
+                            )
                             if not isinstance(gen_rect, dict):
                                 raise RuntimeError(
                                     "Camoufox 页面未找到可点击的 generate-icon-button"
@@ -2879,12 +2961,10 @@ class CamoufoxWorker:
                                     FlowFrontendMixin._parse_batchexecute_frames(full_chunks)
                                 )
                             ) and "PUBLIC_ERROR_" not in full_chunks:
-                                perm_rect = None
-                                for _ in range(12):
-                                    await asyncio.sleep(0.5)
-                                    perm_rect = await bidi.evaluate(
-                                        context_id,
-                                        """(() => {
+                                perm_rect = await bidi.evaluate(
+                                    context_id,
+                                    """(() => new Promise((resolve) => {
+                                        const probe = () => {
                                             const msgs = Array.from(document.querySelectorAll("flow-permission-message"));
                                             if (!msgs.length) return null;
                                             const lastMsg = msgs[msgs.length - 1];
@@ -2900,11 +2980,36 @@ class CamoufoxWorker:
                                                 x: Math.max(4, Math.min(vw - 4, Math.round(r.left + r.width / 2))),
                                                 y: Math.max(4, Math.min(vh - 4, Math.round(r.top + r.height / 2)))
                                             };
-                                        })()""",
-                                        await_promise=False,
-                                    )
-                                    if isinstance(perm_rect, dict):
-                                        break
+                                        };
+                                        const immediate = probe();
+                                        if (immediate) { resolve(immediate); return; }
+                                        let settled = false;
+                                        let obs = null;
+                                        let pollTimer = null;
+                                        let endTimer = null;
+                                        const finish = (val) => {
+                                            if (settled) return;
+                                            settled = true;
+                                            if (obs) { try { obs.disconnect(); } catch (_) {} }
+                                            if (pollTimer) clearInterval(pollTimer);
+                                            if (endTimer) clearTimeout(endTimer);
+                                            resolve(val);
+                                        };
+                                        const check = () => {
+                                            const res = probe();
+                                            if (res) finish(res);
+                                        };
+                                        const root = document.body || document.documentElement;
+                                        if (root && typeof MutationObserver === "function") {
+                                            obs = new MutationObserver(check);
+                                            obs.observe(root, { childList: true, subtree: true, attributes: true });
+                                        }
+                                        pollTimer = setInterval(check, 100);
+                                        endTimer = setTimeout(() => finish(probe()), 6000);
+                                    }))()""",
+                                    await_promise=True,
+                                    timeout=12.0,
+                                )
                                 if isinstance(perm_rect, dict):
                                     prev_count = int(
                                         await bidi.evaluate(

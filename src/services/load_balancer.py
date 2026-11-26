@@ -183,6 +183,21 @@ class LoadBalancer:
 
         return True
 
+    async def release_reserved_slot(
+        self,
+        token_id: int,
+        for_image_generation: bool = False,
+        for_video_generation: bool = False,
+    ) -> None:
+        """释放通过 select_token(reserve=True) 预占的并发槽位。"""
+        if not self.concurrency_manager:
+            return
+
+        if for_image_generation:
+            await self.concurrency_manager.release_image(token_id)
+        elif for_video_generation:
+            await self.concurrency_manager.release_video(token_id)
+
     async def _select_round_robin(
         self, tokens: list[dict], scenario: str
     ) -> Optional[dict]:
@@ -460,32 +475,51 @@ class LoadBalancer:
         for item in available_tokens:
             token = item["token"]
             token_id = token.id
+            pending_added = False
+            try:
+                if track_pending:
+                    await self._add_pending(
+                        token_id, for_image_generation, for_video_generation
+                    )
+                    pending_added = True
 
-            token = await self.token_manager.ensure_valid_token(token)
-            if not token:
+                validated_token = await self.token_manager.ensure_valid_token(token)
+                if not validated_token:
+                    debug_logger.log_info(
+                        f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期"
+                    )
+                    if pending_added:
+                        await self.release_pending(
+                            token_id, for_image_generation, for_video_generation
+                        )
+                        pending_added = False
+                    continue
+
+                if reserve and not await self._reserve_slot(
+                    validated_token.id, for_image_generation, for_video_generation
+                ):
+                    debug_logger.log_info(
+                        f"[LOAD_BALANCER] 跳过 Token {validated_token.id}: 预占槽位失败"
+                    )
+                    if pending_added:
+                        await self.release_pending(
+                            token_id, for_image_generation, for_video_generation
+                        )
+                        pending_added = False
+                    continue
+
                 debug_logger.log_info(
-                    f"[LOAD_BALANCER] 跳过 Token {token_id}: AT无效或已过期"
+                    f"[LOAD_BALANCER] ✅ 已选择Token {validated_token.id} ({validated_token.email}) - "
+                    f"余额: {validated_token.credits}, inflight={item['inflight']}"
                 )
-                continue
-
-            if reserve and not await self._reserve_slot(
-                token.id, for_image_generation, for_video_generation
-            ):
-                debug_logger.log_info(
-                    f"[LOAD_BALANCER] 跳过 Token {token.id}: 预占槽位失败"
-                )
-                continue
-
-            if track_pending:
-                await self._add_pending(
-                    token.id, for_image_generation, for_video_generation
-                )
-
-            debug_logger.log_info(
-                f"[LOAD_BALANCER] ✅ 已选择Token {token.id} ({token.email}) - "
-                f"余额: {token.credits}, inflight={item['inflight']}"
-            )
-            return token
+                pending_added = False
+                return validated_token
+            except BaseException:
+                if pending_added:
+                    await self.release_pending(
+                        token_id, for_image_generation, for_video_generation
+                    )
+                raise
 
         debug_logger.log_info(
             f"[LOAD_BALANCER] ❌ 候选Token均不可用 (图片生成={for_image_generation}, 视频生成={for_video_generation})"

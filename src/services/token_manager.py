@@ -2,6 +2,7 @@
 
 import asyncio
 import hashlib
+import inspect
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, List
@@ -989,6 +990,15 @@ class TokenManager:
                     token_id, token.google_cookies, **updates
                 )
                 if not saved:
+                    current_snap = await self.db.get_token(token_id)
+                    if (
+                        current_snap is not None
+                        and current_snap.google_cookies == latest_cookies
+                    ):
+                        saved = await self.db.update_token_if_cookie_matches(
+                            token_id, current_snap.google_cookies, **updates
+                        )
+                if not saved:
                     raise RuntimeError("Cookie 在刷新期间已更新，请使用最新登录态重试")
             elif credits_result is not None:
                 await self.db.update_token(
@@ -1174,6 +1184,15 @@ class TokenManager:
             token_id, token.google_cookies, **updates
         )
         if not saved:
+            current_snap = await self.db.get_token(token_id)
+            if (
+                current_snap is not None
+                and current_snap.google_cookies == cookies
+            ):
+                saved = await self.db.update_token_if_cookie_matches(
+                    token_id, current_snap.google_cookies, **updates
+                )
+        if not saved:
             raise RuntimeError("Cookie 在刷新期间已更新，请使用最新登录态重试")
         self._mark_at_valid(token_id)
         self._last_at_refresh_error.pop(token_id, None)
@@ -1274,6 +1293,20 @@ class TokenManager:
             debug_logger.log_warning(f"[COOKIE_REFRESH] Token {token_id}: 浏览器刷新失败 - {error}")
             return None
 
+    @staticmethod
+    def _is_expired_session_error(message: Optional[str]) -> bool:
+        text = str(message or "")
+        lowered = text.lower()
+        return (
+            "登录已失效" in text
+            or "登录态已失效" in text
+            or "Cookie 已失效" in text
+            or "Cookie已失效" in text
+            or "Flow Cookie 已失效" in text
+            or "页面已跳转到 Google 登录" in text
+            or "identity_recheck_required" in lowered
+        )
+
     async def refresh_cookies(self, token_id: int) -> bool:
         """Explicitly renew current-Flow Cookies even when the AT marker is valid."""
         refresh_lock = await self._get_token_lock(
@@ -1303,11 +1336,8 @@ class TokenManager:
                 )
                 await self._record_cookie_refresh_failure(latest, fallback_err)
                 latest = await self.db.get_token(token_id)
-            if latest and (
-                "登录已失效" in str(latest.last_st_refresh_result or "")
-                or "登录态已失效" in str(latest.last_st_refresh_result or "")
-                or "identity_recheck_required"
-                in str(latest.last_st_refresh_result or "").lower()
+            if latest and self._is_expired_session_error(
+                latest.last_st_refresh_result
             ):
                 await self.disable_token(token_id)
                 self._clear_at_validation_cache(token_id)
@@ -1353,9 +1383,8 @@ class TokenManager:
             # Cookie and AT metadata are committed together after current RPC validation.
             if not await self._try_refresh_st(token_id, latest):
                 refreshed_snapshot = await self.db.get_token(token_id)
-                if refreshed_snapshot and (
-                    "登录已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
-                    or "登录态已失效" in str(refreshed_snapshot.last_st_refresh_result or "")
+                if refreshed_snapshot and self._is_expired_session_error(
+                    refreshed_snapshot.last_st_refresh_result
                 ):
                     await self.disable_token(token_id)
                     self._clear_at_validation_cache(token_id)
@@ -1430,11 +1459,19 @@ class TokenManager:
             due_tokens.append(token)
 
         # Refresh warm-idle slots first (zero cold restart); stagger cold slots (max 1 per tick when idle)
-        due_tokens.sort(key=lambda t: (0 if int(t.id) in warm_idle_ids else 1, int(t.id)))
+        min_dt = datetime.min.replace(tzinfo=timezone.utc)
+        due_tokens.sort(
+            key=lambda t: (
+                0 if int(t.id or 0) in warm_idle_ids else 1,
+                t.last_st_refresh_at is not None,
+                self._as_utc(t.last_st_refresh_at) or min_dt,
+                int(t.id or 0),
+            )
+        )
         cold_refreshed_count = 0
         for token in due_tokens:
             try:
-                is_warm_idle = int(token.id) in warm_idle_ids
+                is_warm_idle = int(token.id or 0) in warm_idle_ids
                 if camoufox_svc is not None and not is_warm_idle:
                     has_idle_fn = getattr(camoufox_svc, "has_any_idle_slot", None)
                     if callable(has_idle_fn) and isinstance(has_idle_fn(), bool) and not has_idle_fn():
@@ -1521,14 +1558,43 @@ class TokenManager:
             except Exception as e:
                 raise ValueError(f"Failed to prepare project pool: {str(e)}")
 
-    async def record_usage(self, token_id: int, is_video: bool = False):
-        """Record token usage"""
-        await self.db.update_token(token_id, use_count=1, last_used_at=datetime.now())
+    async def record_usage(
+        self, token_id: int, is_video: bool = False, *, count_media: bool = True
+    ) -> None:
+        """Record token usage."""
+        increment_fn = getattr(self.db, "increment_token_use_count", None)
+        used_atomic = False
+        if callable(increment_fn):
+            result = increment_fn(token_id)
+            if inspect.isawaitable(result):
+                await result
+                used_atomic = True
+        if not used_atomic:
+            existing = None
+            get_token_fn = getattr(self.db, "get_token", None)
+            if callable(get_token_fn):
+                existing_res = get_token_fn(token_id)
+                existing = (
+                    await existing_res
+                    if inspect.isawaitable(existing_res)
+                    else existing_res
+                )
+            next_use_count = (
+                int(getattr(existing, "use_count", 0) or 0) + 1
+                if existing is not None
+                else 1
+            )
+            await self.db.update_token(
+                token_id,
+                use_count=next_use_count,
+                last_used_at=datetime.now(timezone.utc),
+            )
 
-        if is_video:
-            await self.db.increment_token_stats(token_id, "video")
-        else:
-            await self.db.increment_token_stats(token_id, "image")
+        if count_media:
+            if is_video:
+                await self.db.increment_token_stats(token_id, "video")
+            else:
+                await self.db.increment_token_stats(token_id, "image")
 
     async def record_error(self, token_id: int):
         """Record token error and auto-disable if threshold reached"""
@@ -1545,12 +1611,14 @@ class TokenManager:
             )
             await self.disable_token(token_id)
 
-    async def record_success(self, token_id: int):
-        """Record successful request (reset consecutive error count)
-
-        This method resets error_count to 0, which is used for auto-disable threshold checking.
-        Note: today_error_count and historical statistics are NOT reset.
-        """
+    async def record_success(self, token_id: int) -> None:
+        """Record successful request and reset consecutive error count."""
+        record_fn = getattr(self.db, "record_token_success", None)
+        if callable(record_fn):
+            result = record_fn(token_id)
+            if inspect.isawaitable(result):
+                await result
+                return
         await self.db.reset_error_count(token_id)
 
     async def ban_token_for_429(self, token_id: int):
@@ -1573,8 +1641,7 @@ class TokenManager:
         """自动解禁因429被禁用的token
 
         规则:
-        - 距离禁用时间12小时后自动解禁
-        - 仅解禁未过期的token
+        - 距离禁用时间12小时后自动解禁（忽略短效 AT 过期时间，下次使用时自动刷新）
         - 仅解禁因429被禁用的token
         """
         all_tokens = await self.db.get_all_tokens()
@@ -1592,21 +1659,6 @@ class TokenManager:
             # 跳过没有禁用时间的token
             if not token.banned_at:
                 continue
-
-            # 检查token是否已过期
-            if token.at_expires:
-                # 确保时区一致
-                if token.at_expires.tzinfo is None:
-                    at_expires_aware = token.at_expires.replace(tzinfo=timezone.utc)
-                else:
-                    at_expires_aware = token.at_expires
-
-                # 如果已过期，跳过
-                if at_expires_aware <= now:
-                    debug_logger.log_info(
-                        f"[AUTO_UNBAN] Token {token.id} 已过期，跳过解禁"
-                    )
-                    continue
 
             # 确保banned_at时区一致
             if token.banned_at.tzinfo is None:

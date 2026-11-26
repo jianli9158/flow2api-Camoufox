@@ -10,7 +10,8 @@ import re
 from collections import OrderedDict
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from unittest.mock import NonCallableMock
 
 from curl_cffi.requests import AsyncSession
 from fastapi import HTTPException
@@ -24,6 +25,7 @@ from ..core.account_tiers import (
 )
 from ..core.config import config
 from ..core.database import Database
+from ..core import flow_errors as _flow_errors_module
 from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
 from ..core.models import RequestLog, Token
@@ -38,6 +40,25 @@ DATA_URL_RE = re.compile(r"^data:(?P<mime>[^;]+);base64,(?P<data>.+)$", re.DOTAL
 _resolved_flow_token_id: contextvars.ContextVar[Optional[int]] = contextvars.ContextVar(
     "_resolved_flow_token_id", default=None
 )
+_nested_feature_recording: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_nested_feature_recording", default=False
+)
+
+
+def _should_count_feature_token_error(exc: BaseException) -> bool:
+    if isinstance(exc, HTTPException) and int(getattr(exc, "status_code", 500) or 500) < 500:
+        return False
+    if isinstance(exc, ValueError):
+        return False
+    error_text = str(exc or "").strip().lower()
+    if not error_text:
+        return True
+    if "没有可用的token进行" in error_text:
+        return False
+    core_fn = getattr(_flow_errors_module, "should_count_token_error", None)
+    if callable(core_fn):
+        return bool(core_fn(exc))
+    return bool(classify_flow_error(exc).counts_toward_ban)
 
 
 def get_resolved_flow_token_id() -> Optional[int]:
@@ -163,6 +184,64 @@ class FlowFeatureService:
                 if callable(clear_cache):
                     clear_cache(token_id)
         return classified.failover_other_token
+    async def _record_feature_success(
+        self,
+        token: Optional[Token],
+        *,
+        is_video: bool = False,
+        count_media: bool = False,
+    ) -> None:
+        if _nested_feature_recording.get():
+            return
+        if self.token_manager is None or token is None or getattr(token, "id", None) is None:
+            return
+        record_usage_fn = getattr(self.token_manager, "record_usage", None)
+        if callable(record_usage_fn):
+            try:
+                try:
+                    res = record_usage_fn(
+                        token.id, is_video=is_video, count_media=count_media
+                    )
+                    if inspect.isawaitable(res):
+                        await res
+                except TypeError:
+                    res = record_usage_fn(token.id, is_video=is_video)
+                    if inspect.isawaitable(res):
+                        await res
+            except Exception as exc:
+                debug_logger.log_warning(
+                    f"[FlowFeatures] Failed to record token usage ({token.id}): {exc}"
+                )
+        record_success_fn = getattr(self.token_manager, "record_success", None)
+        if callable(record_success_fn):
+            try:
+                res = record_success_fn(token.id)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception as exc:
+                debug_logger.log_warning(
+                    f"[FlowFeatures] Failed to record token success ({token.id}): {exc}"
+                )
+
+    async def _record_feature_error(
+        self, token: Optional[Token], exc: BaseException
+    ) -> None:
+        if _nested_feature_recording.get():
+            return
+        if self.token_manager is None or token is None or getattr(token, "id", None) is None:
+            return
+        if not _should_count_feature_token_error(exc):
+            return
+        record_error_fn = getattr(self.token_manager, "record_error", None)
+        if callable(record_error_fn):
+            try:
+                res = record_error_fn(token.id)
+                if inspect.isawaitable(res):
+                    await res
+            except Exception as rec_exc:
+                debug_logger.log_warning(
+                    f"[FlowFeatures] Failed to record token error ({token.id}): {rec_exc}"
+                )
 
     async def _run_with_account_failover(
         self,
@@ -527,9 +606,51 @@ class FlowFeatureService:
             failover_on_404=True,
         )
 
+    @staticmethod
+    def _is_real_async_iter(candidate: Any) -> bool:
+        if candidate is None or isinstance(candidate, NonCallableMock):
+            return False
+        return inspect.isasyncgen(candidate) or (
+            hasattr(candidate, "__aiter__")
+            and callable(getattr(type(candidate), "__anext__", None))
+        )
+
+    @staticmethod
+    async def _close_stream_response(response: Any) -> None:
+        if response is None or isinstance(response, NonCallableMock):
+            return
+        quit_now = getattr(response, "quit_now", None)
+        if (
+            quit_now is not None
+            and not isinstance(quit_now, NonCallableMock)
+            and callable(getattr(quit_now, "set", None))
+        ):
+            quit_now.set()
+        aclose = getattr(response, "aclose", None)
+        if callable(aclose) and not isinstance(aclose, NonCallableMock):
+            try:
+                res = aclose()
+                if inspect.isawaitable(res):
+                    await res
+            except BaseException:
+                pass
+
     async def _download_binary(
-        self, url: str, *, media_type: str = "audio"
+        self,
+        url: str,
+        *,
+        media_type: str = "audio",
+        max_bytes: Optional[int] = None,
+        dest_path: Optional[Path] = None,
     ) -> bytes:
+        from ..api.routes import _validate_safe_remote_url
+
+        effective_max_bytes = (
+            int(max_bytes)
+            if max_bytes is not None
+            else (300 * 1024 * 1024 if media_type == "video" else 50 * 1024 * 1024)
+        )
+
         proxy_url = None
         if self.proxy_manager is not None:
             try:
@@ -539,6 +660,136 @@ class FlowFeatureService:
                     proxy_url = await self.proxy_manager.get_request_proxy_url()
             except Exception as exc:
                 debug_logger.log_warning(f"[FlowFeatures] Resolve download proxy failed: {exc}")
+
+        async def _fetch_with_session(session: Any) -> bytes:
+            current_url = str(url or "").strip()
+            for _ in range(5):
+                await _validate_safe_remote_url(current_url)
+                try:
+                    resp = await session.get(
+                        current_url,
+                        timeout=90,
+                        proxy=proxy_url,
+                        impersonate="chrome",
+                        headers={"Referer": "https://flow.google.com/"},
+                        allow_redirects=False,
+                        stream=True,
+                    )
+                except TypeError:
+                    resp = await session.get(
+                        current_url,
+                        timeout=90,
+                        proxy=proxy_url,
+                        impersonate="chrome",
+                        headers={"Referer": "https://flow.google.com/"},
+                        allow_redirects=False,
+                    )
+
+                try:
+                    if resp.status_code in (301, 302, 303, 307, 308):
+                        headers_obj = getattr(resp, "headers", None)
+                        location = None
+                        if headers_obj is not None and hasattr(headers_obj, "get") and not isinstance(headers_obj, NonCallableMock):
+                            location = headers_obj.get("location") or headers_obj.get("Location")
+                        elif isinstance(headers_obj, dict):
+                            location = headers_obj.get("location") or headers_obj.get("Location")
+                        if not location:
+                            raise RuntimeError(
+                                f"Failed to download Flow media ({resp.status_code}): missing redirect location"
+                            )
+                        current_url = urljoin(current_url, str(location).strip())
+                        continue
+
+                    if resp.status_code >= 400:
+                        raise RuntimeError(
+                            f"Failed to download Flow media ({resp.status_code})"
+                        )
+
+                    headers_obj = getattr(resp, "headers", None)
+                    raw_cl = None
+                    if headers_obj is not None and hasattr(headers_obj, "get") and not isinstance(headers_obj, NonCallableMock):
+                        raw_cl = headers_obj.get("content-length") or headers_obj.get("Content-Length")
+                    elif isinstance(headers_obj, dict):
+                        raw_cl = headers_obj.get("content-length") or headers_obj.get("Content-Length")
+                    if isinstance(raw_cl, (str, bytes, int)) and str(raw_cl).strip():
+                        try:
+                            content_length = int(str(raw_cl).strip())
+                        except ValueError:
+                            content_length = -1
+                        if content_length > effective_max_bytes:
+                            raise RuntimeError(
+                                f"Flow media exceeds maximum allowed size ({content_length} > {effective_max_bytes} bytes)"
+                            )
+
+                    aiter_fn = getattr(resp, "aiter_content", None)
+                    stream_iter = None
+                    if callable(aiter_fn):
+                        candidate_iter = aiter_fn()
+                        if self._is_real_async_iter(candidate_iter):
+                            stream_iter = candidate_iter
+                        elif callable(getattr(candidate_iter, "aclose", None)) and not isinstance(candidate_iter, NonCallableMock):
+                            await candidate_iter.aclose()
+
+                    if dest_path is not None:
+                        part_path = dest_path.with_name(f"{dest_path.name}.part")
+                        total_bytes = 0
+                        try:
+                            if stream_iter is not None:
+                                write_buf = bytearray()
+                                with open(part_path, "wb") as f:
+                                    async for chunk in stream_iter:
+                                        if not chunk:
+                                            continue
+                                        total_bytes += len(chunk)
+                                        if total_bytes > effective_max_bytes:
+                                            raise RuntimeError(
+                                                f"Flow media exceeds maximum allowed size (> {effective_max_bytes} bytes)"
+                                            )
+                                        write_buf.extend(chunk)
+                                        if len(write_buf) >= 65536:
+                                            await asyncio.to_thread(f.write, bytes(write_buf))
+                                            write_buf.clear()
+                                    if write_buf:
+                                        await asyncio.to_thread(f.write, bytes(write_buf))
+                                        write_buf.clear()
+                            else:
+                                raw_bytes = bytes(getattr(resp, "content", None) or b"")
+                                total_bytes = len(raw_bytes)
+                                if total_bytes > effective_max_bytes:
+                                    raise RuntimeError(
+                                        f"Flow media exceeds maximum allowed size ({total_bytes} > {effective_max_bytes} bytes)"
+                                    )
+                                if total_bytes > 0:
+                                    await asyncio.to_thread(part_path.write_bytes, raw_bytes)
+                            if total_bytes <= 0:
+                                raise RuntimeError("Downloaded Flow media is empty")
+                            await asyncio.to_thread(part_path.replace, dest_path)
+                            return b""
+                        finally:
+                            part_path.unlink(missing_ok=True)
+
+                    if stream_iter is not None:
+                        out_buf = bytearray()
+                        async for chunk in stream_iter:
+                            if not chunk:
+                                continue
+                            if len(out_buf) + len(chunk) > effective_max_bytes:
+                                raise RuntimeError(
+                                    f"Flow media exceeds maximum allowed size (> {effective_max_bytes} bytes)"
+                                )
+                            out_buf.extend(chunk)
+                        return bytes(out_buf)
+
+                    raw_bytes = bytes(getattr(resp, "content", None) or b"")
+                    if len(raw_bytes) > effective_max_bytes:
+                        raise RuntimeError(
+                            f"Flow media exceeds maximum allowed size ({len(raw_bytes)} > {effective_max_bytes} bytes)"
+                        )
+                    return raw_bytes
+                finally:
+                    await self._close_stream_response(resp)
+
+            raise RuntimeError("Flow media download exceeded maximum redirect hops (5)")
 
         get_pooled = (
             getattr(self.file_cache, "get_http_session", None)
@@ -552,18 +803,7 @@ class FlowFeatureService:
                 verify=True,
             )
             try:
-                resp = await pooled_session.get(
-                    url,
-                    timeout=90,
-                    proxy=proxy_url,
-                    impersonate="chrome",
-                    headers={"Referer": "https://flow.google.com/"},
-                )
-                if resp.status_code >= 400:
-                    raise RuntimeError(
-                        f"Failed to download Flow media ({resp.status_code})"
-                    )
-                return bytes(resp.content or b"")
+                return await _fetch_with_session(pooled_session)
             except Exception:
                 evict_fn = getattr(self.file_cache, "evict_http_session", None)
                 if callable(evict_fn):
@@ -577,15 +817,7 @@ class FlowFeatureService:
         if proxy_url:
             session_kwargs["proxy"] = proxy_url
         async with AsyncSession(**session_kwargs) as session:
-            resp = await session.get(
-                url,
-                headers={"Referer": "https://flow.google.com/"},
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(
-                    f"Failed to download Flow media ({resp.status_code})"
-                )
-            return bytes(resp.content or b"")
+            return await _fetch_with_session(session)
     @staticmethod
     def _decode_image_input(
         *,
@@ -630,15 +862,22 @@ class FlowFeatureService:
                 raise ValueError("Provide file, image_base64, or image_url")
 
         async def _op(token: Token, resolved_project_id: str) -> Dict[str, Any]:
-            media_id = await self.flow_client.upload_image(
-                token.at or self.flow_client.FRONTEND_ACCESS_TOKEN,
-                image_bytes,
-                aspect_ratio=aspect_ratio,
-                project_id=resolved_project_id,
-                token_id=token.id,
-                google_cookies=token.google_cookies,
-            )
+            try:
+                media_id = await self.flow_client.upload_image(
+                    token.at or self.flow_client.FRONTEND_ACCESS_TOKEN,
+                    image_bytes,
+                    aspect_ratio=aspect_ratio,
+                    project_id=resolved_project_id,
+                    token_id=token.id,
+                    google_cookies=token.google_cookies,
+                )
+            except Exception as exc:
+                await self._record_feature_error(token, exc)
+                raise
             self.remember_asset_owner(media_id, token.id, resolved_project_id)
+            await self._record_feature_success(
+                token, is_video=False, count_media=False
+            )
             return {
                 "mediaId": media_id,
                 "projectId": resolved_project_id,
@@ -646,7 +885,6 @@ class FlowFeatureService:
                 "email": token.email,
                 "frontendRpc": "maseQ",
             }
-
         return await self._run_with_account_failover(
             _op,
             email=email,
@@ -757,47 +995,60 @@ class FlowFeatureService:
             raise ValueError(f"Unsupported response_format: {response_format}")
 
         async def _op(token: Token, resolved_project_id: str) -> Dict[str, Any]:
-            result = await self.flow_client.generate_voice_audio(
-                project_id=resolved_project_id,
-                text=text,
-                voice=voice,
-                style=style,
-                name=name,
-                model_key=model_key or self.flow_client.DEFAULT_TTS_MODEL_KEY,
-                save=save,
-                google_cookies=token.google_cookies,
-                token_id=token.id,
-            )
-            self.remember_asset_owner(
-                result.get("mediaId"), token.id, resolved_project_id
-            )
-            result["tokenId"] = token.id
-            result["email"] = token.email
-
-            if fmt in {"wav", "pcm"} or cache_audio:
-                audio_url = str(result.get("audioUrl") or "").strip()
-                if not audio_url:
-                    raise RuntimeError("Generated voice audio has no downloadable URL")
-                pcm_bytes = await self._download_binary(audio_url, media_type="audio")
-                payload_bytes = (
-                    self.flow_client.pcm_to_wav(pcm_bytes) if fmt != "pcm" else pcm_bytes
+            try:
+                result = await self.flow_client.generate_voice_audio(
+                    project_id=resolved_project_id,
+                    text=text,
+                    voice=voice,
+                    style=style,
+                    name=name,
+                    model_key=model_key or self.flow_client.DEFAULT_TTS_MODEL_KEY,
+                    save=save,
+                    google_cookies=token.google_cookies,
+                    token_id=token.id,
                 )
-                if fmt in {"wav", "pcm"}:
-                    return {
-                        **result,
-                        "audioBytes": payload_bytes,
-                        "contentType": "audio/wav" if fmt == "wav" else "audio/pcm",
-                    }
-                if cache_audio:
-                    wav_bytes = self.flow_client.pcm_to_wav(pcm_bytes)
-                    cached_url = await asyncio.to_thread(
-                        self._cache_audio_bytes, wav_bytes, "wav", base_url
+                self.remember_asset_owner(
+                    result.get("mediaId"), token.id, resolved_project_id
+                )
+                result["tokenId"] = token.id
+                result["email"] = token.email
+
+                if fmt in {"wav", "pcm"} or cache_audio:
+                    audio_url = str(result.get("audioUrl") or "").strip()
+                    if not audio_url:
+                        raise RuntimeError("Generated voice audio has no downloadable URL")
+                    pcm_bytes = await self._download_binary(audio_url, media_type="audio")
+                    payload_bytes = (
+                        self.flow_client.pcm_to_wav(pcm_bytes) if fmt != "pcm" else pcm_bytes
                     )
-                    if cached_url:
-                        result["wavUrl"] = cached_url
+                    if cache_audio:
+                        wav_bytes = (
+                            payload_bytes
+                            if fmt == "wav"
+                            else self.flow_client.pcm_to_wav(pcm_bytes)
+                        )
+                        cached_url = await asyncio.to_thread(
+                            self._cache_audio_bytes, wav_bytes, "wav", base_url
+                        )
+                        if cached_url:
+                            result["wavUrl"] = cached_url
+                    if fmt in {"wav", "pcm"}:
+                        await self._record_feature_success(
+                            token, is_video=False, count_media=False
+                        )
+                        return {
+                            **result,
+                            "audioBytes": payload_bytes,
+                            "contentType": "audio/wav" if fmt == "wav" else "audio/pcm",
+                        }
+            except Exception as exc:
+                await self._record_feature_error(token, exc)
+                raise
 
+            await self._record_feature_success(
+                token, is_video=False, count_media=False
+            )
             return result
-
         return await self._run_with_account_failover(
             _op,
             email=email,
@@ -935,6 +1186,30 @@ class FlowFeatureService:
         has_face_prompt = bool(str(face_prompt or "").strip())
         has_body_prompt = bool(str(body_prompt or "").strip())
         if not has_face_prompt and not has_body_prompt:
+            try:
+                created = await self.flow_client.create_character(
+                    project_id=resolved_project_id,
+                    display_name=display_name,
+                    voice_id=voice_id,
+                    personality_notes=personality_notes,
+                    image_refs=image_refs,
+                    google_cookies=token.google_cookies,
+                    token_id=token.id,
+                )
+            except Exception as exc:
+                await self._record_feature_error(token, exc)
+                raise
+            await self._record_feature_success(
+                token, is_video=False, count_media=False
+            )
+            return {
+                **created,
+                "tokenId": token.id,
+                "email": token.email,
+            }
+
+        # Two-step Saga: anchor entity first so generated media IDs stay traceable on partial failure.
+        try:
             created = await self.flow_client.create_character(
                 project_id=resolved_project_id,
                 display_name=display_name,
@@ -944,22 +1219,9 @@ class FlowFeatureService:
                 google_cookies=token.google_cookies,
                 token_id=token.id,
             )
-            return {
-                **created,
-                "tokenId": token.id,
-                "email": token.email,
-            }
-
-        # Two-step Saga: anchor entity first so generated media IDs stay traceable on partial failure.
-        created = await self.flow_client.create_character(
-            project_id=resolved_project_id,
-            display_name=display_name,
-            voice_id=voice_id,
-            personality_notes=personality_notes,
-            image_refs=image_refs,
-            google_cookies=token.google_cookies,
-            token_id=token.id,
-        )
+        except Exception as exc:
+            await self._record_feature_error(token, exc)
+            raise
         character_id = str(created["id"])
         generated_media_ids: List[str] = []
         face_media_id: Optional[str] = None
@@ -1018,18 +1280,20 @@ class FlowFeatureService:
                 google_cookies=token.google_cookies,
                 token_id=token.id,
             )
-            return {
-                **updated,
-                "generatedMediaIds": generated_media_ids,
-                "faceMediaId": face_media_id,
-                "bodyMediaId": body_media_id,
-                "tokenId": token.id,
-                "email": token.email,
-            }
         except Exception as exc:
+            await self._record_feature_error(token, exc)
             raise RuntimeError(
                 f"Character creation saga failed (characterId={character_id}, generatedMediaIds={generated_media_ids}): {exc}"
             ) from exc
+        await self._record_feature_success(token, is_video=False, count_media=False)
+        return {
+            **updated,
+            "generatedMediaIds": generated_media_ids,
+            "faceMediaId": face_media_id,
+            "bodyMediaId": body_media_id,
+            "tokenId": token.id,
+            "email": token.email,
+        }
     async def update_character(
         self,
         character_id: str,
@@ -1507,6 +1771,20 @@ class FlowFeatureService:
                     cfg.get("supported_resolutions") or ["720p", "1080p", "4K"]
                 )
                 video_models.append(item)
+        native_video_models: List[str] = []
+        seen_native_video_models: Set[str] = set()
+        for cfg in MODEL_CONFIG.values():
+            if cfg.get("type") != "video":
+                continue
+            for key_field in (
+                "model_key",
+                "start_frame_model_key",
+                "reference_model_key",
+            ):
+                candidate = str(cfg.get(key_field) or "").strip()
+                if candidate and candidate not in seen_native_video_models:
+                    seen_native_video_models.add(candidate)
+                    native_video_models.append(candidate)
         return {
             "tokenId": token.id,
             "email": token.email,
@@ -1514,14 +1792,7 @@ class FlowFeatureService:
             "credits": getattr(token, "credits", 0),
             "imageModels": image_models,
             "videoModels": video_models,
-            "nativeVideoModels": [
-                "macaron_cookie_r2v_8s_relaxed",
-                "macaron_cookie_r2v_8s",
-                "veo_3_1_r2v_fast_landscape_ultra",
-                "veo_3_1_t2v_fast_landscape",
-                "veo_3_1_i2v_s_fast_fl",
-                "veo_3_1_extension_lite",
-            ],
+            "nativeVideoModels": native_video_models,
             "supportedResolutions": {
                 "image": ["standard", "2K", "4K"],
                 "video": ["720p", "1080p", "4k"],
@@ -1565,110 +1836,149 @@ class FlowFeatureService:
         has_mentions = bool(resolve_mentions and parse_prompt_mentions(effective_prompt))
 
         async def _op(token: Token, resolved_project_id: str) -> Dict[str, Any]:
-            op_media_ids = list(media_ids)
-            op_char_refs = list(resolved_char_refs)
-            resolved_mentions: List[Dict[str, str]] = []
+            try:
+                op_media_ids = list(media_ids)
+                op_char_refs = list(resolved_char_refs)
+                resolved_mentions: List[Dict[str, str]] = []
 
-            if has_mentions:
-                project_snapshot = await self.flow_client.get_project(
-                    resolved_project_id,
-                    google_cookies=token.google_cookies,
+                if has_mentions:
+                    project_snapshot = await self.flow_client.get_project(
+                        resolved_project_id,
+                        google_cookies=token.google_cookies,
+                        token_id=token.id,
+                    )
+                    mention_res = resolve_prompt_mentions(
+                        effective_prompt,
+                        characters=project_snapshot.get("characters"),
+                        workflows=project_snapshot.get("workflows"),
+                    )
+                    resolved_mentions = mention_res.resolved_mentions
+                    existing_cids = {
+                        str(c.get("id") or c.get("characterId") or c.get("entityId") if isinstance(c, dict) else c).strip()
+                        for c in op_char_refs
+                    }
+                    for cid in mention_res.character_ids:
+                        if cid not in existing_cids:
+                            op_char_refs.append(cid)
+                            existing_cids.add(cid)
+                    for mid in mention_res.image_media_ids:
+                        if mid not in op_media_ids:
+                            op_media_ids.append(mid)
+
+                has_refs = bool(op_media_ids or op_char_refs or voice_refs)
+                is_start_i2v = "_i2v_" in str(model_key or "") and bool(op_media_ids)
+                is_start_end_i2v = is_start_i2v and len(op_media_ids) > 1
+                mode = (
+                    "start_end"
+                    if is_start_end_i2v
+                    else ("start" if is_start_i2v else ("references" if has_refs else "text"))
+                )
+
+                submission = await self.flow_client._current_generate_video(
+                    project_id=resolved_project_id,
+                    prompt=effective_prompt,
+                    model_key=model_key,
+                    aspect_ratio=aspect_ratio,
+                    mode=mode,
+                    reference_media_ids=None if is_start_i2v else (op_media_ids or None),
+                    start_media_id=op_media_ids[0] if is_start_i2v else None,
+                    end_media_id=op_media_ids[1] if (is_start_i2v and len(op_media_ids) > 1) else None,
+                    reference_entity_ids=op_char_refs or None,
+                    reference_audio_ids=voice_refs or None,
+                    resolution=resolution,
                     token_id=token.id,
+                    token_video_concurrency=None,
+                    google_cookies=token.google_cookies,
                 )
-                mention_res = resolve_prompt_mentions(
-                    effective_prompt,
-                    characters=project_snapshot.get("characters"),
-                    workflows=project_snapshot.get("workflows"),
-                )
-                resolved_mentions = mention_res.resolved_mentions
-                existing_cids = {
-                    str(c.get("id") or c.get("characterId") or c.get("entityId") if isinstance(c, dict) else c).strip()
-                    for c in op_char_refs
+                ops = submission.get("operations") or []
+                extra_meta: Dict[str, Any] = {}
+                if removed_terms:
+                    extra_meta["removedTerms"] = removed_terms
+                    extra_meta["cleanedPrompt"] = effective_prompt
+                if resolved_mentions:
+                    extra_meta["resolvedMentions"] = resolved_mentions
+                if not wait or not ops:
+                    submission["projectId"] = resolved_project_id
+                    submission["tokenId"] = token.id
+                    submission["email"] = token.email
+                    submission.update(extra_meta)
+                    await self._record_feature_success(
+                        token, is_video=True, count_media=True
+                    )
+                    return submission
+                deadline = asyncio.get_event_loop().time() + max(timeout, 30)
+                last_status = submission
+                while asyncio.get_event_loop().time() < deadline:
+                    await asyncio.sleep(poll_interval)
+                    last_status = await self.flow_client.check_video_status(
+                        at=token.at or "",
+                        operations=ops,
+                        token_id=token.id,
+                        google_cookies=token.google_cookies,
+                    )
+                    checked_ops = last_status.get("operations") or []
+                    if checked_ops:
+                        first_op = checked_ops[0]
+                        status = str(first_op.get("status") or "")
+                        meta_video = ((first_op.get("operation") or {}).get("metadata") or {}).get("video") or {}
+                        fife_url = meta_video.get("fifeUrl")
+                        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and not fife_url:
+                            media_lookup_id = (
+                                meta_video.get("mediaGenerationId")
+                                or first_op.get("name")
+                                or (first_op.get("operation") or {}).get("name")
+                                or first_op.get("mediaName")
+                            )
+                            if media_lookup_id and hasattr(
+                                self.flow_client, "get_media_url_redirect"
+                            ):
+                                try:
+                                    fife_url = await self.flow_client.get_media_url_redirect(
+                                        token.st or "",
+                                        str(media_lookup_id),
+                                        media_url_type="MEDIA_URL_TYPE_FULL_MEDIA",
+                                        google_cookies=token.google_cookies,
+                                        token_id=token.id,
+                                        project_id=resolved_project_id,
+                                    )
+                                except Exception as redirect_err:
+                                    debug_logger.log_warning(
+                                        f"[FlowFeatures] get_media_url_redirect failed ({media_lookup_id}): {redirect_err}"
+                                    )
+                        if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and fife_url:
+                            self.remember_asset_owner(
+                                (first_op.get("operation") or {}).get("name")
+                                or meta_video.get("mediaGenerationId"),
+                                token.id,
+                                resolved_project_id,
+                            )
+                            await self._record_feature_success(
+                                token, is_video=True, count_media=True
+                            )
+                            return {
+                                "status": status,
+                                "videoUrl": fife_url,
+                                "mediaId": (first_op.get("operation") or {}).get("name") or meta_video.get("mediaGenerationId"),
+                                "observedModel": meta_video.get("observedModel") or meta_video.get("model"),
+                                "projectId": resolved_project_id,
+                                "tokenId": token.id,
+                                "email": token.email,
+                                "operations": checked_ops,
+                                **extra_meta,
+                            }
+                        if "FAILED" in status:
+                            raise RuntimeError(f"Flow video generation failed: {first_op}")
+                return {
+                    "status": "TIMEOUT",
+                    "projectId": resolved_project_id,
+                    "tokenId": token.id,
+                    "email": token.email,
+                    "lastStatus": last_status,
+                    **extra_meta,
                 }
-                for cid in mention_res.character_ids:
-                    if cid not in existing_cids:
-                        op_char_refs.append(cid)
-                        existing_cids.add(cid)
-                for mid in mention_res.image_media_ids:
-                    if mid not in op_media_ids:
-                        op_media_ids.append(mid)
-
-            has_refs = bool(op_media_ids or op_char_refs or voice_refs)
-            is_start_i2v = "_i2v_" in str(model_key or "") and bool(op_media_ids)
-            mode = "start" if is_start_i2v else ("references" if has_refs else "text")
-
-            submission = await self.flow_client._current_generate_video(
-                project_id=resolved_project_id,
-                prompt=effective_prompt,
-                model_key=model_key,
-                aspect_ratio=aspect_ratio,
-                mode=mode,
-                reference_media_ids=None if is_start_i2v else (op_media_ids or None),
-                start_media_id=op_media_ids[0] if is_start_i2v else None,
-                reference_entity_ids=op_char_refs or None,
-                reference_audio_ids=voice_refs or None,
-                resolution=resolution,
-                token_id=token.id,
-                token_video_concurrency=None,
-                google_cookies=token.google_cookies,
-            )
-            ops = submission.get("operations") or []
-            extra_meta: Dict[str, Any] = {}
-            if removed_terms:
-                extra_meta["removedTerms"] = removed_terms
-                extra_meta["cleanedPrompt"] = effective_prompt
-            if resolved_mentions:
-                extra_meta["resolvedMentions"] = resolved_mentions
-            if not wait or not ops:
-                submission["projectId"] = resolved_project_id
-                submission["tokenId"] = token.id
-                submission["email"] = token.email
-                submission.update(extra_meta)
-                return submission
-            deadline = asyncio.get_event_loop().time() + max(timeout, 30)
-            last_status = submission
-            while asyncio.get_event_loop().time() < deadline:
-                await asyncio.sleep(poll_interval)
-                last_status = await self.flow_client.check_video_status(
-                    at=token.at or "",
-                    operations=ops,
-                    token_id=token.id,
-                    google_cookies=token.google_cookies,
-                )
-                checked_ops = last_status.get("operations") or []
-                if checked_ops:
-                    first_op = checked_ops[0]
-                    status = str(first_op.get("status") or "")
-                    meta_video = ((first_op.get("operation") or {}).get("metadata") or {}).get("video") or {}
-                    fife_url = meta_video.get("fifeUrl")
-                    if status == "MEDIA_GENERATION_STATUS_SUCCESSFUL" and fife_url:
-                        self.remember_asset_owner(
-                            (first_op.get("operation") or {}).get("name")
-                            or meta_video.get("mediaGenerationId"),
-                            token.id,
-                            resolved_project_id,
-                        )
-                        return {
-                            "status": status,
-                            "videoUrl": fife_url,
-                            "mediaId": (first_op.get("operation") or {}).get("name") or meta_video.get("mediaGenerationId"),
-                            "observedModel": meta_video.get("observedModel") or meta_video.get("model"),
-                            "projectId": resolved_project_id,
-                            "tokenId": token.id,
-                            "email": token.email,
-                            "operations": checked_ops,
-                            **extra_meta,
-                        }
-                    if "FAILED" in status:
-                        raise RuntimeError(f"Flow video generation failed: {first_op}")
-            return {
-                "status": "TIMEOUT",
-                "projectId": resolved_project_id,
-                "tokenId": token.id,
-                "email": token.email,
-                "lastStatus": last_status,
-                **extra_meta,
-            }
+            except Exception as exc:
+                await self._record_feature_error(token, exc)
+                raise
 
         has_explicit_refs = bool(media_ids or resolved_char_refs or voice_refs or has_mentions)
         return await self._run_with_account_failover(
@@ -1716,105 +2026,133 @@ class FlowFeatureService:
             "VIDEO_ASPECT_RATIO_LANDSCAPE": "IMAGE_ASPECT_RATIO_LANDSCAPE",
         }
 
-        with tempfile.TemporaryDirectory(prefix="flow2api-chain-") as tmp_dir_str:
-            tmp_dir = Path(tmp_dir_str)
-            clip_paths: List[Path] = []
+        try:
+            nested_tok = _nested_feature_recording.set(True)
+            try:
+                with tempfile.TemporaryDirectory(prefix="flow2api-chain-") as tmp_dir_str:
+                    tmp_dir = Path(tmp_dir_str)
+                    clip_paths: List[Path] = []
 
-            for idx, seg in enumerate(segments):
-                seg_prompt = str(seg.get("prompt") or "").strip()
-                if not seg_prompt:
-                    raise ValueError(f"Segment {idx} prompt is required")
-                seg_aspect = str(seg.get("aspect_ratio") or "VIDEO_ASPECT_RATIO_LANDSCAPE")
-                seg_image_refs = list(seg.get("image_refs") or [])
-                if next_frame_media_id:
-                    seg_image_refs = [next_frame_media_id, *seg_image_refs]
-                default_model = (
-                    "veo_3_1_i2v_s_fast_fl"
-                    if seg_image_refs and not seg.get("character_refs")
-                    else "macaron_cookie_r2v_8s_relaxed"
-                )
-                seg_model = str(seg.get("model_key") or default_model)
-
-                res = await self.generate_reference_video(
-                    prompt=seg_prompt,
-                    model_key=seg_model,
-                    aspect_ratio=seg_aspect,
-                    character_refs=seg.get("character_refs"),
-                    voice_refs=seg.get("voice_refs"),
-                    image_refs=seg_image_refs or None,
-                    resolution=seg.get("resolution"),
-                    clean_prompt=clean_prompt,
-                    resolve_mentions=resolve_mentions,
-                    wait=True,
-                    poll_interval=poll_interval,
-                    timeout=timeout,
-                    project_id=resolved_project_id,
-                    token_id=token.id,
-                )
-                if res.get("status") != "MEDIA_GENERATION_STATUS_SUCCESSFUL" or not res.get("videoUrl"):
-                    raise RuntimeError(
-                        f"Video chain segment {idx} did not complete successfully (status={res.get('status')})"
-                    )
-                clip_media_id = str(res.get("mediaId") or "").strip()
-                if clip_media_id:
-                    clip_media_ids.append(clip_media_id)
-
-                need_local_clip = concat or (idx < len(segments) - 1)
-                if need_local_clip:
-                    clip_bytes = await self._download_binary(
-                        str(res["videoUrl"]), media_type="video"
-                    )
-                    clip_path = tmp_dir / f"seg_{idx}.mp4"
-                    clip_path.write_bytes(clip_bytes)
-                    clip_paths.append(clip_path)
-
-                    if idx < len(segments) - 1:
-                        frame_path = tmp_dir / f"tail_{idx}.jpg"
-                        frame_bytes = await extract_tail_frame(
-                            ffmpeg_bin,
-                            ffprobe_bin,
-                            clip_path,
-                            frame_path,
-                            offset_ms=frame_offset_ms,
+                    for idx, seg in enumerate(segments):
+                        seg_prompt = str(seg.get("prompt") or "").strip()
+                        if not seg_prompt:
+                            raise ValueError(f"Segment {idx} prompt is required")
+                        seg_aspect = str(seg.get("aspect_ratio") or "VIDEO_ASPECT_RATIO_LANDSCAPE")
+                        seg_image_refs = list(seg.get("image_refs") or [])
+                        if next_frame_media_id:
+                            seg_image_refs = [next_frame_media_id, *seg_image_refs]
+                        default_model = (
+                            "veo_3_1_i2v_s_fast_fl"
+                            if seg_image_refs and not seg.get("character_refs")
+                            else "macaron_cookie_r2v_8s_relaxed"
                         )
-                        uploaded_frame_id = await self.flow_client.upload_image(
-                            token.at or getattr(self.flow_client, "FRONTEND_ACCESS_TOKEN", ""),
-                            frame_bytes,
-                            aspect_ratio=aspect_to_image_ratio.get(
-                                seg_aspect, "IMAGE_ASPECT_RATIO_LANDSCAPE"
-                            ),
+                        seg_model = str(seg.get("model_key") or default_model)
+
+                        res = await self.generate_reference_video(
+                            prompt=seg_prompt,
+                            model_key=seg_model,
+                            aspect_ratio=seg_aspect,
+                            character_refs=seg.get("character_refs"),
+                            voice_refs=seg.get("voice_refs"),
+                            image_refs=seg_image_refs or None,
+                            resolution=seg.get("resolution"),
+                            clean_prompt=clean_prompt,
+                            resolve_mentions=resolve_mentions,
+                            wait=True,
+                            poll_interval=poll_interval,
+                            timeout=timeout,
                             project_id=resolved_project_id,
                             token_id=token.id,
-                            google_cookies=token.google_cookies,
                         )
-                        self.remember_asset_owner(
-                            uploaded_frame_id, token.id, resolved_project_id
+                        if res.get("status") != "MEDIA_GENERATION_STATUS_SUCCESSFUL" or not res.get("videoUrl"):
+                            raise RuntimeError(
+                                f"Video chain segment {idx} did not complete successfully (status={res.get('status')})"
+                            )
+                        clip_media_id = str(res.get("mediaId") or "").strip()
+                        if clip_media_id:
+                            clip_media_ids.append(clip_media_id)
+
+                        need_local_clip = concat or (idx < len(segments) - 1)
+                        if need_local_clip:
+                            clip_path = tmp_dir / f"seg_{idx}.mp4"
+                            clip_url = str(res["videoUrl"])
+                            try:
+                                clip_bytes = await self._download_binary(
+                                    clip_url,
+                                    media_type="video",
+                                    max_bytes=300 * 1024 * 1024,
+                                    dest_path=clip_path,
+                                )
+                            except TypeError:
+                                clip_bytes = await self._download_binary(
+                                    clip_url, media_type="video"
+                                )
+                            if not clip_path.exists():
+                                if not clip_bytes:
+                                    raise RuntimeError(
+                                        f"Video chain segment {idx} downloaded empty clip"
+                                    )
+                                part_path = clip_path.with_name(f"{clip_path.name}.part")
+                                try:
+                                    part_path.write_bytes(clip_bytes)
+                                    part_path.replace(clip_path)
+                                finally:
+                                    part_path.unlink(missing_ok=True)
+                            clip_paths.append(clip_path)
+
+                            if idx < len(segments) - 1:
+                                frame_path = tmp_dir / f"tail_{idx}.jpg"
+                                frame_bytes = await extract_tail_frame(
+                                    ffmpeg_bin,
+                                    ffprobe_bin,
+                                    clip_path,
+                                    frame_path,
+                                    offset_ms=frame_offset_ms,
+                                )
+                                uploaded_frame_id = await self.flow_client.upload_image(
+                                    token.at or getattr(self.flow_client, "FRONTEND_ACCESS_TOKEN", ""),
+                                    frame_bytes,
+                                    aspect_ratio=aspect_to_image_ratio.get(
+                                        seg_aspect, "IMAGE_ASPECT_RATIO_LANDSCAPE"
+                                    ),
+                                    project_id=resolved_project_id,
+                                    token_id=token.id,
+                                    google_cookies=token.google_cookies,
+                                )
+                                self.remember_asset_owner(
+                                    uploaded_frame_id, token.id, resolved_project_id
+                                )
+                                next_frame_media_id = uploaded_frame_id
+
+                        segment_results.append(
+                            {
+                                "index": idx,
+                                "mediaId": clip_media_id,
+                                "videoUrl": res.get("videoUrl"),
+                                "modelKey": seg_model,
+                                "bridgedFromMediaId": seg_image_refs[0] if idx > 0 and seg_image_refs else None,
+                            }
                         )
-                        next_frame_media_id = uploaded_frame_id
 
-                segment_results.append(
-                    {
-                        "index": idx,
-                        "mediaId": clip_media_id,
-                        "videoUrl": res.get("videoUrl"),
-                        "modelKey": seg_model,
-                        "bridgedFromMediaId": seg_image_refs[0] if idx > 0 and seg_image_refs else None,
-                    }
-                )
+                    final_video_url = segment_results[-1]["videoUrl"]
+                    if concat and clip_paths:
+                        merged_name = f"chain_{uuid.uuid4().hex[:16]}.mp4"
+                        if self.file_cache is not None:
+                            merged_path = self.file_cache.get_cache_path(merged_name)
+                            await concat_videos(ffmpeg_bin, clip_paths, merged_path)
+                            if base_url:
+                                final_video_url = f"{base_url.rstrip('/')}/tmp/{merged_name}"
+                            elif getattr(config, "cache_base_url", None):
+                                final_video_url = f"{str(config.cache_base_url).rstrip('/')}/tmp/{merged_name}"
+                            else:
+                                final_video_url = f"/tmp/{merged_name}"
+            finally:
+                _nested_feature_recording.reset(nested_tok)
+        except Exception as exc:
+            await self._record_feature_error(token, exc)
+            raise
 
-            final_video_url = segment_results[-1]["videoUrl"]
-            if concat and clip_paths:
-                merged_name = f"chain_{uuid.uuid4().hex[:16]}.mp4"
-                if self.file_cache is not None:
-                    merged_path = self.file_cache.get_cache_path(merged_name)
-                    await concat_videos(ffmpeg_bin, clip_paths, merged_path)
-                    if base_url:
-                        final_video_url = f"{base_url.rstrip('/')}/tmp/{merged_name}"
-                    elif getattr(config, "cache_base_url", None):
-                        final_video_url = f"{str(config.cache_base_url).rstrip('/')}/tmp/{merged_name}"
-                    else:
-                        final_video_url = f"/tmp/{merged_name}"
-
+        await self._record_feature_success(token, is_video=True, count_media=True)
         return {
             "status": "MEDIA_GENERATION_STATUS_SUCCESSFUL",
             "projectId": resolved_project_id,

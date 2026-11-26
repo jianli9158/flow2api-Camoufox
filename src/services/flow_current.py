@@ -17,6 +17,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from ..core.config import config as _runtime_config
 from ..core.flow_errors import FlowErrorCategory, classify_flow_error
 from ..core.logger import debug_logger
 from ..core.prompt_tools import jitter_sleep, validate_base64_media_payload
@@ -658,7 +659,9 @@ class CurrentFlowClientMixin:
         )
         if not str(cookie_storage or "").strip():
             raise RuntimeError("Flow frontend generation requires Google session cookies")
-        for retry_attempt in range(max_retries):
+        attempt_budget = max_retries
+        retry_attempt = 0
+        while retry_attempt < attempt_budget:
             started_at = time.time()
             browser_id = None
             submission_accepted = False
@@ -733,8 +736,41 @@ class CurrentFlowClientMixin:
                     )
                     if not should_retry:
                         raise
-                if retry_attempt >= max_retries - 1:
+                    budget_resolver = getattr(
+                        self, "_resolve_generation_retry_budget", None
+                    )
+                    if callable(budget_resolver):
+                        expanded_budget = int(
+                            budget_resolver(max_retries, error) or attempt_budget
+                        )
+                        attempt_budget = max(attempt_budget, expanded_budget)
+                    else:
+                        err_str = str(error)
+                        err_lower = err_str.lower()
+                        if (
+                            "recaptcha evaluation failed" in err_lower
+                            or "recaptcha 验证失败" in err_str
+                        ):
+                            captcha_retries = int(
+                                getattr(
+                                    self._get_runtime_config(),
+                                    "browser_captcha_generation_retries",
+                                    getattr(
+                                        _runtime_config,
+                                        "browser_captcha_generation_retries",
+                                        6,
+                                    ),
+                                )
+                                or 6
+                            )
+                            attempt_budget = max(attempt_budget, captcha_retries)
+                    if retry_attempt >= attempt_budget - 1:
+                        raise
+                    retry_attempt += 1
+                    continue
+                if retry_attempt >= attempt_budget - 1:
                     raise
+                retry_attempt += 1
             finally:
                 if isinstance(browser_id, str) and ":lease-" in browser_id:
                     await self._notify_browser_captcha_request_finished(
@@ -963,7 +999,7 @@ class CurrentFlowClientMixin:
                         f"{request_model_key} -> {model_keys[-1]}"
                     )
                     continue
-                if retry_attempt >= max_retries - 1:
+                if retry_attempt >= attempt_budget - 1:
                     raise
             finally:
                 if isinstance(browser_id, str) and ":lease-" in browser_id:
@@ -3297,8 +3333,28 @@ class CurrentFlowClientMixin:
             raise RuntimeError("Flow StreamChat requires Google session cookies")
         original_cookies = cookie_storage if str(cookie_storage or "").strip() else cookie_header
         cookie_jar = FlowCookieJar(self.get_updated_flow_cookies(original_cookies))
-        bootstrap_text = await self._load_flow_frontend_bootstrap(
-            page_url, bootstrap_cookie_header, timeout, cookie_jar=cookie_jar
+        pinned_proxy_resolver = getattr(self, "_resolve_frontend_proxy_url", None)
+        pinned_proxy_url = (
+            await pinned_proxy_resolver() if callable(pinned_proxy_resolver) else None
+        )
+        try:
+            bootstrap_text = await self._load_flow_frontend_bootstrap(
+                page_url,
+                bootstrap_cookie_header,
+                timeout,
+                cookie_jar=cookie_jar,
+                proxy_url=pinned_proxy_url,
+            )
+        except TypeError:
+            bootstrap_text = await self._load_flow_frontend_bootstrap(
+                page_url,
+                bootstrap_cookie_header,
+                timeout,
+                cookie_jar=cookie_jar,
+            )
+        ctx_getter = getattr(self, "_get_captcha_request_context", None)
+        effective_token_id = (
+            (ctx_getter() or {}).get("token_id") if callable(ctx_getter) else None
         )
         self._remember_flow_cookies(original_cookies, cookie_jar)
         bl_m = re.search(r"boq_labs-ai-sandbox-frontend_[A-Za-z0-9_.-]+", bootstrap_text)
@@ -3336,6 +3392,8 @@ class CurrentFlowClientMixin:
             return_error_response=True,
             redact_sensitive_logs=True,
             cookie_jar=cookie_jar,
+            proxy_url=pinned_proxy_url,
+            token_id=effective_token_id,
         )
         err_match = re.search(r"PUBLIC_ERROR_[A-Z_]+", text)
         if err_match:

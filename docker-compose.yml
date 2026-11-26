@@ -2,6 +2,7 @@ version: '3.8'
 
 services:
   flow2api:
+    init: true
     build:
       context: .
       dockerfile: Dockerfile
@@ -13,8 +14,10 @@ services:
       - ./data:/app/data
       - ./tmp:/app/tmp
       - ./browser_data_rt:/app/browser_data_rt
+      - ./runtime:/app/runtime
       - ./config/setting.toml:/app/config/setting.toml
     environment:
       - PYTHONUNBUFFERED=1
       - FLOW2API_SERVER_PORT=8000
+    shm_size: "2gb"
     restart: unless-stopped
