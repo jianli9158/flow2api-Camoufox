@@ -7,7 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, ValidationError
 
-from ..core.auth import verify_api_key_flexible
+from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.model_catalog import MODEL_CONFIG
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
 from ..core.config import config
@@ -1123,21 +1124,80 @@ class ChainVideosRequest(BaseModel):
     token_id: Optional[int] = None
 
 
+def _flow_video_model_key_allowed(api_key: str, model_key: str) -> bool:
+    policy = AuthManager.get_policy_for_verified_key(api_key)
+    if policy.allow_all_models:
+        return True
+    key_clean = str(model_key or "").strip()
+    if policy.allows_execution(key_clean, upstream_model=key_clean):
+        return True
+    for alias, cfg in MODEL_CONFIG.items():
+        if cfg.get("type") != "video":
+            continue
+        if key_clean in (
+            cfg.get("model_key"),
+            cfg.get("reference_model_key"),
+            cfg.get("start_frame_model_key"),
+        ) and policy.allows_listed_model(alias):
+            return True
+    return False
+
+
+def _assert_flow_video_model_allowed(api_key: str, model_key: str) -> None:
+    if not _flow_video_model_key_allowed(api_key, model_key):
+        raise HTTPException(
+            status_code=403,
+            detail=f"该 API Key 未公开此模型: {model_key}",
+        )
+
+
+def _filter_flow_models_payload(payload: Dict[str, Any], api_key: str) -> Dict[str, Any]:
+    policy = AuthManager.get_policy_for_verified_key(api_key)
+    if policy.allow_all_models or not isinstance(payload, dict):
+        return payload
+    filtered = dict(payload)
+    if isinstance(payload.get("imageModels"), list):
+        filtered["imageModels"] = [
+            item
+            for item in payload["imageModels"]
+            if policy.allows_execution(
+                str(item.get("id") or ""),
+                upstream_model=str(item.get("upstreamModel") or ""),
+            )
+        ]
+    if isinstance(payload.get("videoModels"), list):
+        filtered["videoModels"] = [
+            item
+            for item in payload["videoModels"]
+            if policy.allows_execution(
+                str(item.get("id") or ""),
+                upstream_model=str(item.get("upstreamModel") or ""),
+            )
+        ]
+    if isinstance(payload.get("nativeVideoModels"), list):
+        filtered["nativeVideoModels"] = [
+            m
+            for m in payload["nativeVideoModels"]
+            if _flow_video_model_key_allowed(api_key, str(m))
+        ]
+    return filtered
+
+
 @router.get("/models")
 async def list_flow_models(
     email: Optional[str] = Query(None),
     token_id: Optional[int] = Query(None),
     api_key: str = Depends(verify_api_key_flexible),
 ):
-    _ = api_key
     svc = _ensure_service()
-    return await _execute_logged_flow_call(
+    result = await _execute_logged_flow_call(
         svc,
         operation="flow_list_models",
         request_data={"email": email, "token_id": token_id},
         explicit_token_id=token_id,
         fn=lambda: svc.list_models(email=email, token_id=token_id),
     )
+    return _filter_flow_models_payload(result, api_key)
 
 
 @router.get("/capabilities")
@@ -1156,7 +1216,7 @@ async def generate_flow_reference_video(
     request: GenerateReferenceVideoRequest,
     api_key: str = Depends(verify_api_key_flexible),
 ):
-    _ = api_key
+    _assert_flow_video_model_allowed(api_key, request.model_key)
     svc = _ensure_service()
     extra_flags: Dict[str, Any] = {}
     if request.clean_prompt:
@@ -1193,7 +1253,9 @@ async def chain_flow_videos(
     raw_request: Request,
     api_key: str = Depends(verify_api_key_flexible),
 ):
-    _ = api_key
+    for seg in request.segments:
+        seg_model = str(seg.model_key or "macaron_cookie_r2v_8s_relaxed")
+        _assert_flow_video_model_allowed(api_key, seg_model)
     svc = _ensure_service()
     base_url = f"{raw_request.url.scheme}://{raw_request.headers.get('host', raw_request.url.netloc)}"
     return await _execute_logged_flow_call(

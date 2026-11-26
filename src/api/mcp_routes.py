@@ -10,7 +10,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from ..core.auth import verify_api_key_flexible
+from ..core.auth import (
+    AuthManager,
+    assert_api_key_model_allowed,
+    verify_api_key_flexible,
+)
+from ..core.model_resolver import get_base_model_aliases
 from ..core.config import config
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
@@ -287,6 +292,20 @@ async def _dispatch_mcp_tool(
             detail=f"MCP no-spend mode blocks paid credit tool '{tool_name}'",
         )
 
+    if tool_name == "flow_generate_image":
+        target_img_model = str(args.get("model") or "gemini-3.0-pro-image-landscape")
+        assert_api_key_model_allowed(
+            caller_key,
+            target_img_model,
+            raw_model=target_img_model,
+            base_aliases=get_base_model_aliases(),
+        )
+    elif tool_name == "flow_generate_video":
+        from .flow_routes import _assert_flow_video_model_allowed
+
+        target_vid_model = str(args.get("model_key") or "macaron_cookie_r2v_8s_relaxed")
+        _assert_flow_video_model_allowed(caller_key, target_vid_model)
+
     needs_spend_token = tool_name in _SPEND_PROTECTED_TOOLS
     if tool_name == "flow_create_character" and not (
         args.get("face_prompt") or args.get("body_prompt")
@@ -302,10 +321,13 @@ async def _dispatch_mcp_tool(
             )
     svc = _flow_feature_service
     if tool_name == "flow_list_models":
-        return await svc.list_models(
+        from .flow_routes import _filter_flow_models_payload
+
+        raw_models = await svc.list_models(
             email=args.get("email"),
             token_id=args.get("token_id"),
         )
+        return _filter_flow_models_payload(raw_models, caller_key)
     if tool_name == "flow_get_project":
         return await svc.get_project(
             project_id=str(args["project_id"]),
@@ -544,6 +566,20 @@ async def mcp_rpc_endpoint(
                 return JSONResponse(
                     status_code=403,
                     content=_jsonrpc_error(req_id, -32030, detail_text, data=payload),
+                )
+            if http_exc.status_code == 403 and "未公开此模型" in detail_text:
+                payload = {
+                    "error": detail_text,
+                    "status_code": 403,
+                    "category": "model_not_allowed",
+                    "retryable": False,
+                    "charged": "no",
+                    "next_action": "fix_input",
+                    "remediation_hint": "当前 API Key 未开放该模型，请在管理后台 API Key 设置中勾选对应模型。",
+                }
+                return JSONResponse(
+                    status_code=403,
+                    content=_jsonrpc_error(req_id, -32031, detail_text, data=payload),
                 )
             classified = classify_flow_error(
                 detail_text, billed_operation=is_billed_tool

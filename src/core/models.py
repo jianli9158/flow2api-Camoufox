@@ -1,6 +1,6 @@
 """Data models for Flow2API"""
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List, Union, Any, Literal
 from datetime import datetime
 
@@ -133,6 +133,21 @@ class AdminConfig(BaseModel):
     api_key: str
     error_ban_threshold: int = 3  # Auto-disable token after N consecutive errors
 
+
+
+class APIKeyRecord(BaseModel):
+    """Managed client API key with optional per-key model allowlist."""
+
+    id: Optional[int] = None
+    name: str = ""
+    key_value: str
+    is_active: bool = True
+    allow_all_models: bool = True
+    allowed_models: List[str] = Field(default_factory=list)
+    remark: str = ""
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    last_used_at: Optional[datetime] = None
 
 class ProxyConfig(BaseModel):
     """Proxy configuration"""

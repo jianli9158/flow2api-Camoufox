@@ -430,6 +430,32 @@
                                         </div>
                                     </div>
                                 </div>
+
+                                <div class="settings-subblock">
+                                    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+                                        <div>
+                                            <strong data-i18n="多 API Key 管理">多 API Key 管理</strong>
+                                            <div class="hint" data-i18n="主密钥默认公开全部模型；可创建多个子 API Key，分别指定各自公开的模型或通配符规则。">主密钥默认公开全部模型；可创建多个子 API Key，分别指定各自公开的模型或通配符规则。</div>
+                                        </div>
+                                        <button type="button" onclick="openApiKeyModal()" class="btn primary sm" data-i18n="新建 API Key">新建 API Key</button>
+                                    </div>
+                                    <div class="table-wrap">
+                                        <table>
+                                            <thead>
+                                                <tr>
+                                                    <th data-i18n="名称">名称</th>
+                                                    <th>API Key</th>
+                                                    <th data-i18n="公开模型">公开模型</th>
+                                                    <th data-i18n="状态">状态</th>
+                                                    <th class="num" data-i18n="操作">操作</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody id="apiKeysTableBody">
+                                                <tr><td colspan="5" style="text-align:center;padding:20px;color:var(--faint);" data-i18n="暂无自定义 API Key">暂无自定义 API Key</td></tr>
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                </div>
                             </div>
                         </div>
 
@@ -847,6 +873,83 @@
         </div>
     </div>
 
+    <!-- 多 API Key 创建/编辑模态框 -->
+    <div id="apiKeyModal" class="hidden modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="apiKeyModalTitle">
+        <div class="modal-dialog">
+            <div class="modal-head">
+                <h3 id="apiKeyModalTitle" data-i18n="新建 API Key">新建 API Key</h3>
+                <button type="button" onclick="closeApiKeyModal()" class="icon-btn" aria-label="关闭" data-i18n-aria-label="关闭">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="apiKeyEditId">
+                <div class="field-grid-2">
+                    <div class="field">
+                        <label for="apiKeyName" data-i18n="名称">名称</label>
+                        <input id="apiKeyName" type="text" class="input" placeholder="例如：生图专用 / 客户A" data-i18n-placeholder="例如：生图专用 / 客户A">
+                    </div>
+                    <div class="field">
+                        <label for="apiKeyRemark" data-i18n="备注">备注</label>
+                        <input id="apiKeyRemark" type="text" class="input" placeholder="可选备注说明" data-i18n-placeholder="可选备注说明">
+                    </div>
+                </div>
+                <div class="field">
+                    <label for="apiKeyValue">API Key</label>
+                    <div class="input-join">
+                        <input id="apiKeyValue" type="text" class="input mono-id" placeholder="留空自动生成 sk-flow-..." data-i18n-placeholder="留空自动生成 sk-flow-...">
+                        <button type="button" onclick="generateManagedApiKeyValue()" class="btn" data-i18n="随机生成">随机生成</button>
+                    </div>
+                </div>
+                <label class="checkbox-row">
+                    <input type="checkbox" id="apiKeyIsActive" checked>
+                    <span data-i18n="启用此 API Key">启用此 API Key</span>
+                </label>
+                <div class="field">
+                    <label data-i18n="模型公开范围">模型公开范围</label>
+                    <div style="display:flex;gap:16px;flex-wrap:wrap;">
+                        <label class="checkbox-row">
+                            <input type="radio" name="apiKeyModelScope" id="apiKeyScopeAll" value="all" checked onchange="toggleApiKeyModelPicker()">
+                            <span data-i18n="公开全部模型">公开全部模型</span>
+                        </label>
+                        <label class="checkbox-row">
+                            <input type="radio" name="apiKeyModelScope" id="apiKeyScopeSpecific" value="specific" onchange="toggleApiKeyModelPicker()">
+                            <span data-i18n="仅公开指定模型">仅公开指定模型</span>
+                        </label>
+                    </div>
+                </div>
+                <div id="apiKeyModelPickerWrap" class="hidden" style="display:flex;flex-direction:column;gap:10px;border:1px solid var(--border);border-radius:8px;padding:12px;background:var(--surface-2,transparent);">
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+                        <input id="apiKeyModelSearch" type="text" class="input sm" style="flex:1 1 180px;" placeholder="搜索模型 ID 或名称..." data-i18n-placeholder="搜索模型 ID 或名称..." oninput="renderApiKeyModelPicker()">
+                        <select id="apiKeyModelCategory" class="input sm" style="width:auto;" onchange="renderApiKeyModelPicker()">
+                            <option value="all" data-i18n="全部类型">全部类型</option>
+                            <option value="image" data-i18n="图像模型">图像模型</option>
+                            <option value="video" data-i18n="视频模型">视频模型</option>
+                            <option value="alias" data-i18n="简化别名">简化别名</option>
+                        </select>
+                        <button type="button" onclick="selectVisibleApiKeyModels(true)" class="btn sm" data-i18n="全选当前">全选当前</button>
+                        <button type="button" onclick="selectVisibleApiKeyModels(false)" class="btn sm" data-i18n="清空已选">清空已选</button>
+                    </div>
+                    <div id="apiKeyModelSelectedCount" class="hint"></div>
+                    <div id="apiKeyModelList" style="max-height:220px;overflow-y:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:6px;padding:4px 2px;"></div>
+                    <div class="field" style="margin-top:4px;">
+                        <label for="apiKeyCustomPatterns" data-i18n="自定义模型或通配符（可选）">自定义模型或通配符（可选）</label>
+                        <textarea id="apiKeyCustomPatterns" class="input mono-id" rows="2" placeholder="每行或逗号分隔，例如：gemini-3.1-flash-image-*, macaron_cookie_r2v_8s_relaxed" data-i18n-placeholder="每行或逗号分隔，例如：gemini-3.1-flash-image-*, macaron_cookie_r2v_8s_relaxed"></textarea>
+                        <span class="hint" data-i18n="支持 * 通配符与 Flow 原生视频 model_key，将与上方勾选结果合并生效。">支持 * 通配符与 Flow 原生视频 model_key，将与上方勾选结果合并生效。</span>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-foot">
+                <div class="modal-foot-actions">
+                    <button type="button" onclick="closeApiKeyModal()" class="btn" data-i18n="取消">取消</button>
+                    <button type="button" id="apiKeySaveBtn" onclick="submitApiKeyModal()" class="btn primary" data-i18n="保存">保存</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <!-- Camoufox 浏览器直接登录模态框 -->
     <div id="browserLoginModal" class="hidden modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="browserLoginTitle">
         <div class="modal-dialog xl">
@@ -928,6 +1031,9 @@
         let allTokens=[];
         let tokenSearchQuery='';
         let tokenStatusFilter='all';
+        let allManagedApiKeys=[];
+        let allSelectableModels=[];
+        let apiKeySelectedModelSet=new Set();
         let logSearchQuery='';
         let logStatusFilter='all';
         let proxyTestResultState=null;
@@ -1099,7 +1205,9 @@
                 const expiryDisplay=formatExpiry(t.at_expires);
                 const modeLabel=t.protocol_mode==='protocol'?I18n.t("协议"):'ST';
                 const statusBadge=t.is_active?`<span class="pill pos">${I18n.t("已启用")}</span>`:`<span class="pill">${I18n.t("已禁用")}</span>`;
-                const refreshNote=t.last_st_refresh_result?`<div class="cell-sub" title="${escapeLogHtml(t.last_st_refresh_result)}">${escapeLogHtml(modeLabel)} · ${escapeLogHtml(t.last_st_refresh_result)}</div>`:`<div class="cell-sub">${escapeLogHtml(modeLabel)}</div>`;
+                const refreshRes=String(t.last_st_refresh_result||'').trim();
+                const isRefreshErr=Boolean(refreshRes&&refreshRes.toLowerCase()!=='success'&&refreshRes.toLowerCase()!=='pushed');
+                const refreshNote=refreshRes?`<div class="cell-sub${isRefreshErr?' text-neg':''}" title="${escapeLogHtml(refreshRes)}">${escapeLogHtml(modeLabel)} · ${escapeLogHtml(refreshRes)}</div>`:`<div class="cell-sub">${escapeLogHtml(modeLabel)}</div>`;
                 const remarkLine=t.remark?`<div class="cell-sub" title="${escapeLogHtml(t.remark)}">${escapeLogHtml(t.remark)}</div>`:'';
                 const profileLine=t.browser_profile_dir?`<div class="cell-sub" title="browser_data_rt/${escapeLogHtml(t.browser_profile_dir)}"><code>${escapeLogHtml(t.browser_profile_dir)}</code>${t.browser_profile_exists?'':` · ${escapeLogHtml(I18n.t("未初始化"))}`}</div>`:'';
                 const errBadge=errCount>0?` <span class="pill neg tabular-nums">${errCount}</span>`:` <span class="muted-text tabular-nums">0</span>`;
@@ -1107,8 +1215,8 @@
             }).join('');
         },
 
-        refreshTokenCredits=async(id)=>{try{showToast(I18n.t("正在刷新余额..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-credits`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("余额刷新成功: {0}", {"0": (d.credits)}),'success');await refreshTokens()}else{showToast(I18n.t("刷新余额失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("刷新余额失败: {error}", {error: (e.message)}),'error')}},
-        refreshTokenAT=async(id)=>{try{showToast(I18n.t("正在更新AT..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-at`,{method:'POST'});if(!r)return;const d=await r.json();if(d.success){const expiresDate=d.token.at_expires?new Date(d.token.at_expires):null;const expiresStr=expiresDate?expiresDate.toLocaleString(I18n.locale, {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).replace(/\//g,'-'):I18n.t("未知");showToast(I18n.t("AT更新成功! 新过期时间: {0}", {"0": (expiresStr)}),'success');await refreshTokens()}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error')}},
+        refreshTokenCredits=async(id)=>{try{showToast(I18n.t("正在刷新余额..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-credits`,{method:'POST'});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){showToast(I18n.t("余额刷新成功: {0}", {"0": (d.credits)}),'success')}else{showToast(I18n.t("刷新余额失败: {error}", {error: (d.detail||d.message||I18n.t("未知错误"))}),'error')}await refreshTokens()}catch(e){showToast(I18n.t("刷新余额失败: {error}", {error: (e.message)}),'error');await refreshTokens()}},
+        refreshTokenAT=async(id)=>{try{showToast(I18n.t("正在更新AT..."),'info');const r=await apiRequest(`/api/tokens/${id}/refresh-at`,{method:'POST'});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){const expiresDate=d.token&&d.token.at_expires?new Date(d.token.at_expires):null;const expiresStr=expiresDate?expiresDate.toLocaleString(I18n.locale, {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).replace(/\//g,'-'):I18n.t("未知");showToast(I18n.t("AT更新成功! 新过期时间: {0}", {"0": (expiresStr)}),'success')}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||d.message||I18n.t("未知错误"))}),'error')}await refreshTokens()}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error');await refreshTokens()}},
         refreshTokens=async()=>{await Promise.all([loadTokens(),loadStats(),loadBrowserStats(),loadBrowserProfiles()])},
 
         openAddModal=()=>$('addModal').classList.remove('hidden'),
@@ -1132,6 +1240,106 @@
         saveAdminConfig=async()=>{try{const r=await apiRequest('/api/admin/config',{method:'POST',body:JSON.stringify({error_ban_threshold:parseInt($('cfgErrorBan').value)||3})});if(!r)return;const d=await r.json();d.success?showToast(I18n.t("配置保存成功"),'success'):showToast(I18n.t("保存失败"),'error')}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
         updateAdminPassword=async()=>{const username=$('cfgAdminUsername').value.trim(),oldPwd=$('cfgOldPassword').value.trim(),newPwd=$('cfgNewPassword').value.trim();if(!oldPwd||!newPwd)return showToast(I18n.t("请输入旧密码和新密码"),'error');if(newPwd.length<4)return showToast(I18n.t("新密码至少4个字符"),'error');try{const r=await apiRequest('/api/admin/password',{method:'POST',body:JSON.stringify({username:username||undefined,old_password:oldPwd,new_password:newPwd})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("密码修改成功，请重新登录"),'success');setTimeout(()=>{location.href='/login'},2000)}else{showToast(I18n.t("修改失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("修改失败: {error}", {error: (e.message)}),'error')}},
         updateAPIKey=async()=>{const newKey=$('cfgNewAPIKey').value.trim();if(!newKey)return showToast(I18n.t("请输入新的 API Key"),'error');if(newKey.length<6)return showToast(I18n.t("API Key 至少6个字符"),'error');if(!confirm(I18n.t("确定要更新 API Key 吗？更新后需要通知所有客户端使用新密钥。")))return;try{const r=await apiRequest('/api/admin/apikey',{method:'POST',body:JSON.stringify({new_api_key:newKey})});if(!r)return;const d=await r.json();if(d.success){showToast(I18n.t("API Key 更新成功"),'success');$('cfgCurrentAPIKey').value=newKey;$('cfgNewAPIKey').value=''}else{showToast(I18n.t("更新失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("更新失败: {error}", {error: (e.message)}),'error')}},
+        maskApiKeyValue=(val)=>{const s=String(val||'');if(s.length<=12)return s;return `${s.slice(0,8)}…${s.slice(-4)}`},
+        copyManagedApiKey=async(id)=>{const rec=allManagedApiKeys.find(k=>k.id===id);const val=rec?String(rec.key_value||''):'';if(!val)return;try{if(navigator.clipboard&&navigator.clipboard.writeText){await navigator.clipboard.writeText(val);showToast(I18n.t("API Key 已复制"),'success');return}}catch(e){}try{const ta=document.createElement('textarea');ta.value=val;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);showToast(I18n.t("API Key 已复制"),'success')}catch(e){showToast(I18n.t("复制失败: {error}",{error:e.message}),'error')}},
+        renderManagedApiKeys=()=>{
+            const tb=$('apiKeysTableBody');
+            if(!tb)return;
+            if(!allManagedApiKeys.length){
+                tb.innerHTML=`<tr><td colspan="5" style="text-align:center;padding:20px;color:var(--faint);">${escapeLogHtml(I18n.t("暂无自定义 API Key"))}</td></tr>`;
+                return;
+            }
+            tb.innerHTML=allManagedApiKeys.map(k=>{
+                const remarkHtml=k.remark?`<div class="cell-sub" title="${escapeLogHtml(k.remark)}">${escapeLogHtml(k.remark)}</div>`:'';
+                const models=Array.isArray(k.allowed_models)?k.allowed_models:[];
+                const scopeHtml=k.allow_all_models
+                    ?`<span class="pill pos">${escapeLogHtml(I18n.t("全部模型"))}</span>`
+                    :`<span class="pill accent" title="${escapeLogHtml(models.join('\n'))}">${escapeLogHtml(I18n.t("仅 {0} 个模型",{"0":models.length}))}</span>${models.length?`<div class="cell-sub" title="${escapeLogHtml(models.join(', '))}">${escapeLogHtml(models.slice(0,2).join(', '))}${models.length>2?' …':''}</div>`:''}`;
+                const statusHtml=k.is_active?`<span class="pill pos">${escapeLogHtml(I18n.t("已启用"))}</span>`:`<span class="pill">${escapeLogHtml(I18n.t("已禁用"))}</span>`;
+                const toggleText=k.is_active?I18n.t("禁用"):I18n.t("启用");
+                return`<tr><td><div class="cell-primary">${escapeLogHtml(k.name||'-')}</div>${remarkHtml}</td><td><div style="display:flex;align-items:center;gap:6px;"><code title="${escapeLogHtml(k.key_value)}">${escapeLogHtml(maskApiKeyValue(k.key_value))}</code><button type="button" onclick="copyManagedApiKey(${Number(k.id)})" class="act-btn">${escapeLogHtml(I18n.t("复制"))}</button></div></td><td>${scopeHtml}</td><td>${statusHtml}</td><td class="num"><div class="row-actions"><button type="button" onclick="openApiKeyModal(${Number(k.id)})" class="act-btn">${escapeLogHtml(I18n.t("编辑"))}</button><button type="button" onclick="toggleManagedApiKey(${Number(k.id)},${!k.is_active})" class="act-btn">${escapeLogHtml(toggleText)}</button><button type="button" onclick="deleteManagedApiKey(${Number(k.id)})" class="act-btn danger">${escapeLogHtml(I18n.t("删除"))}</button></div></td></tr>`;
+            }).join('');
+        },
+        loadManagedAPIKeys=async()=>{try{const r=await apiRequest('/api/admin/apikeys');if(!r)return;const d=await r.json();if(d.success){allManagedApiKeys=Array.isArray(d.keys)?d.keys:[];allSelectableModels=Array.isArray(d.available_models)?d.available_models:[];renderManagedApiKeys()}}catch(e){console.error(e)}},
+        generateManagedApiKeyValue=()=>{const chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';const bytes=new Uint8Array(32);crypto.getRandomValues(bytes);let out='sk-flow-';for(let i=0;i<bytes.length;i++)out+=chars[bytes[i]%chars.length];$('apiKeyValue').value=out},
+        toggleApiKeyModelPicker=()=>{const specific=$('apiKeyScopeSpecific')?.checked;const wrap=$('apiKeyModelPickerWrap');if(!wrap)return;wrap.classList.toggle('hidden',!specific);wrap.style.display=specific?'flex':'none';if(specific)renderApiKeyModelPicker()},
+        toggleSingleApiKeyModel=(modelId,checked)=>{if(checked)apiKeySelectedModelSet.add(modelId);else apiKeySelectedModelSet.delete(modelId);updateApiKeySelectedCount()},
+        updateApiKeySelectedCount=()=>{const el=$('apiKeyModelSelectedCount');if(el)el.textContent=I18n.t("已勾选 {0} 个模型",{"0":apiKeySelectedModelSet.size})},
+        getFilteredSelectableModels=()=>{const q=($('apiKeyModelSearch')?.value||'').trim().toLowerCase();const cat=$('apiKeyModelCategory')?.value||'all';return allSelectableModels.filter(m=>{if(cat!=='all'&&m.category!==cat)return false;if(q&&!(`${m.id} ${m.label||''}`.toLowerCase().includes(q)))return false;return true})},
+        renderApiKeyModelPicker=()=>{
+            const box=$('apiKeyModelList');
+            if(!box)return;
+            const list=getFilteredSelectableModels();
+            updateApiKeySelectedCount();
+            if(!list.length){
+                box.innerHTML=`<div class="hint" style="grid-column:1/-1;text-align:center;padding:12px;">${escapeLogHtml(I18n.t("无匹配模型"))}</div>`;
+                return;
+            }
+            box.innerHTML=list.map(m=>{
+                const checked=apiKeySelectedModelSet.has(m.id)?'checked':'';
+                return`<label class="checkbox-row" style="align-items:flex-start;padding:4px 6px;border-radius:6px;border:1px solid var(--border);"><input type="checkbox" ${checked} data-model-id="${escapeLogHtml(m.id)}" onchange="toggleSingleApiKeyModel(this.dataset.modelId,this.checked)"><span><code style="font-size:12px;word-break:break-all;">${escapeLogHtml(m.id)}</code><div class="cell-sub" style="margin-top:1px;">${escapeLogHtml(m.label||'')}</div></span></label>`;
+            }).join('');
+        },
+        selectVisibleApiKeyModels=(selectAll)=>{if(selectAll){getFilteredSelectableModels().forEach(m=>apiKeySelectedModelSet.add(m.id))}else{apiKeySelectedModelSet.clear();if($('apiKeyCustomPatterns'))$('apiKeyCustomPatterns').value=''}renderApiKeyModelPicker()},
+        openApiKeyModal=async(id=null)=>{
+            if(!allSelectableModels.length)await loadManagedAPIKeys();
+            const rec=id!==null?allManagedApiKeys.find(k=>k.id===id):null;
+            $('apiKeyEditId').value=rec?String(rec.id):'';
+            I18n.setMessage($('apiKeyModalTitle'),rec?I18n.t("编辑 API Key"):I18n.t("新建 API Key"));
+            $('apiKeyName').value=rec?(rec.name||''):'';
+            $('apiKeyRemark').value=rec?(rec.remark||''):'';
+            $('apiKeyValue').value=rec?(rec.key_value||''):'';
+            $('apiKeyIsActive').checked=rec?(rec.is_active!==false):true;
+            const allowAll=rec?(rec.allow_all_models!==false):true;
+            $('apiKeyScopeAll').checked=allowAll;
+            $('apiKeyScopeSpecific').checked=!allowAll;
+            if($('apiKeyModelSearch'))$('apiKeyModelSearch').value='';
+            if($('apiKeyModelCategory'))$('apiKeyModelCategory').value='all';
+            const catalogIds=new Set(allSelectableModels.map(m=>m.id));
+            apiKeySelectedModelSet=new Set();
+            const extraPatterns=[];
+            if(rec&&Array.isArray(rec.allowed_models)){
+                rec.allowed_models.forEach(m=>{if(catalogIds.has(m))apiKeySelectedModelSet.add(m);else extraPatterns.push(m)});
+            }
+            if($('apiKeyCustomPatterns'))$('apiKeyCustomPatterns').value=extraPatterns.join('\n');
+            toggleApiKeyModelPicker();
+            $('apiKeyModal').classList.remove('hidden');
+        },
+        closeApiKeyModal=()=>{$('apiKeyModal').classList.add('hidden')},
+        submitApiKeyModal=async()=>{
+            const editId=$('apiKeyEditId').value.trim();
+            const name=$('apiKeyName').value.trim();
+            const remark=$('apiKeyRemark').value.trim();
+            const keyValue=$('apiKeyValue').value.trim();
+            const isActive=$('apiKeyIsActive').checked;
+            const allowAll=$('apiKeyScopeAll').checked;
+            if(!name)return showToast(I18n.t("请输入 API Key 名称"),'error');
+            if(keyValue&&keyValue.length<6)return showToast(I18n.t("API Key 至少6个字符"),'error');
+            const extraRaw=($('apiKeyCustomPatterns')?.value||'').split(/[\n,]+/).map(s=>s.trim()).filter(Boolean);
+            const allowedModels=allowAll?[]:Array.from(new Set([...apiKeySelectedModelSet,...extraRaw]));
+            if(!allowAll&&!allowedModels.length)return showToast(I18n.t("请至少选择一个公开模型或输入模型规则"),'error');
+            const payload={name,remark,is_active:isActive,allow_all_models:allowAll,allowed_models:allowedModels};
+            if(keyValue)payload.key_value=keyValue;
+            const btn=$('apiKeySaveBtn');if(btn)btn.disabled=true;
+            try{
+                const url=editId?`/api/admin/apikeys/${editId}`:'/api/admin/apikeys';
+                const method=editId?'PUT':'POST';
+                const r=await apiRequest(url,{method,body:JSON.stringify(payload)});
+                if(!r)return;
+                const d=await r.json().catch(()=>({}));
+                if(r.ok&&d.success){
+                    closeApiKeyModal();
+                    await loadManagedAPIKeys();
+                    showToast(editId?I18n.t("API Key 更新成功"):I18n.t("API Key 创建成功"),'success');
+                }else{
+                    showToast(I18n.t("保存失败: {error}",{error:(d.detail||d.message||I18n.t("未知错误"))}),'error');
+                }
+            }catch(e){
+                showToast(I18n.t("保存失败: {error}",{error:e.message}),'error');
+            }finally{if(btn)btn.disabled=false}
+        },
+        toggleManagedApiKey=async(id,nextActive)=>{try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'PUT',body:JSON.stringify({is_active:nextActive})});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){await loadManagedAPIKeys();showToast(nextActive?I18n.t("API Key 已启用"):I18n.t("API Key 已禁用"),'success')}else{showToast(I18n.t("操作失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("操作失败: {error}",{error:e.message}),'error')}},
+        deleteManagedApiKey=async(id)=>{if(!confirm(I18n.t("确定要删除这个 API Key 吗？")))return;try{const r=await apiRequest(`/api/admin/apikeys/${id}`,{method:'DELETE'});if(!r)return;const d=await r.json().catch(()=>({}));if(r.ok&&d.success){await loadManagedAPIKeys();showToast(I18n.t("删除成功"),'success')}else{showToast(I18n.t("删除失败: {error}",{error:(d.detail||I18n.t("未知错误"))}),'error')}}catch(e){showToast(I18n.t("删除失败: {error}",{error:e.message}),'error')}},
         toggleDebugMode=async()=>{const enabled=$('cfgDebugEnabled').checked;try{const r=await apiRequest('/api/admin/debug',{method:'POST',body:JSON.stringify({enabled:enabled})});if(!r)return;const d=await r.json();if(d.success){showToast(enabled?I18n.t("调试模式已开启"):I18n.t("调试模式已关闭"),'success')}else{showToast(I18n.t("操作失败: {error}", {error: (d.detail||I18n.t("未知错误"))}),'error');$('cfgDebugEnabled').checked=!enabled}}catch(e){showToast(I18n.t("操作失败: {error}", {error: (e.message)}),'error');$('cfgDebugEnabled').checked=!enabled}},
         loadProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config');if(!r)return;const d=await r.json();$('cfgProxyEnabled').checked=d.proxy_enabled||false;$('cfgProxyUrl').value=d.proxy_url||'';$('cfgMediaProxyEnabled').checked=d.media_proxy_enabled||false;$('cfgMediaProxyUrl').value=d.media_proxy_url||'';toggleMediaProxyInput()}catch(e){console.error(I18n.t("加载代理配置失败:"),e)}},
         saveProxyConfig=async()=>{try{const r=await apiRequest('/api/proxy/config',{method:'POST',body:JSON.stringify({proxy_enabled:$('cfgProxyEnabled').checked,proxy_url:$('cfgProxyUrl').value.trim(),media_proxy_enabled:$('cfgMediaProxyEnabled').checked,media_proxy_url:$('cfgMediaProxyUrl').value.trim()})});if(!r)return;const d=await r.json();d.success?showToast(I18n.t("代理配置保存成功"),'success'):showToast(I18n.t("保存失败"),'error')}catch(e){showToast(I18n.t("保存失败: {error}", {error: (e.message)}),'error')}},
@@ -1209,7 +1417,7 @@
             closeMobileNav();
             if(t==='settings'){
                 stopLogsAutoRefresh();
-                loadAdminConfig();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig();
+                loadAdminConfig();loadManagedAPIKeys();loadProxyConfig();loadCacheConfig();loadGenerationTimeout();loadCallLogicConfig();loadCaptchaConfig();loadPluginConfig();loadATAutoRefreshConfig();
             }else if(t==='logs'){
                 startLogsAutoRefresh();
                 loadLogs();
@@ -1849,6 +2057,7 @@
             else if (!$('addModal').classList.contains('hidden')) closeAddModal();
             else if (!$('editModal').classList.contains('hidden')) closeEditModal();
             else if (!$('importModal').classList.contains('hidden')) closeImportModal();
+            else if (!$('apiKeyModal').classList.contains('hidden')) closeApiKeyModal();
             else if (!$('browserLoginModal').classList.contains('hidden')) closeBrowserLoginModal();
             else closeMobileNav();
         });
@@ -1857,13 +2066,14 @@
 
         window.addEventListener('languagechange',()=>{
             renderTokens();
+            renderManagedApiKeys();
             if(Array.isArray(window.allLogs)) renderLogs(window.allLogs);
             renderBrowserProfileDatalist();
             if(lastBrowserStats) renderBrowserStats(lastBrowserStats);
             renderProxyTestResult();
             updateLastSync();
         });
-        Object.assign(window, {$, apiRequest, toggleMobileNav, closeMobileNav, scrollSettingsTo, loadStats, loadTokens, loadBrowserStats, loadBrowserProfiles, updateBrowserLoginProfileHint, runCaptchaScoreTest, setTokenSearch, setTokenFilter, setLogSearch, setLogFilter, formatExpiry, formatAccountType, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copyProjectId, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, openBrowserLoginModal, startBrowserLoginSession, closeBrowserLoginModal, sendBrowserLoginQuickText});
+        Object.assign(window, {$, apiRequest, toggleMobileNav, closeMobileNav, scrollSettingsTo, loadStats, loadTokens, loadBrowserStats, loadBrowserProfiles, updateBrowserLoginProfileHint, runCaptchaScoreTest, setTokenSearch, setTokenFilter, setLogSearch, setLogFilter, formatExpiry, formatAccountType, formatProjectIdDisplay, renderTokenActions, renderTokens, refreshTokenCredits, refreshTokenAT, refreshTokens, openAddModal, closeAddModal, openEditModal, closeEditModal, submitEditToken, submitAddToken, testToken, toggleToken, toggleTokenStatus, deleteToken, copyProjectId, openImportModal, closeImportModal, exportTokens, normalizeImportPayload, submitImportTokens, loadAdminConfig, saveAdminConfig, updateAdminPassword, updateAPIKey, loadManagedAPIKeys, renderManagedApiKeys, copyManagedApiKey, generateManagedApiKeyValue, toggleApiKeyModelPicker, toggleSingleApiKeyModel, renderApiKeyModelPicker, selectVisibleApiKeyModels, openApiKeyModal, closeApiKeyModal, submitApiKeyModal, toggleManagedApiKey, deleteManagedApiKey, toggleDebugMode, loadProxyConfig, saveProxyConfig, updateProxyTestResult, testProxyConfig, toggleMediaProxyInput, toggleCacheOptions, loadCacheConfig, loadGenerationTimeout, loadCallLogicConfig, saveCacheConfig, saveGenerationTimeout, saveCallLogicConfig, toggleCaptchaOptions, toggleBrowserProxyInput, loadCaptchaConfig, saveCaptchaConfig, loadPluginConfig, savePluginConfig, copyConnectionUrl, copyConnectionToken, generateRandomToken, toggleATAutoRefresh, loadATAutoRefreshConfig, applyGlobalRefreshInterval, formatLogStatus, formatLogStatusClass, formatLogProgress, getLogOperationLabel, formatLogOutcome, formatLogOutcomeClass, startLogsAutoRefresh, stopLogsAutoRefresh, loadLogs, refreshLogs, clearAllLogs, showLogDetail, closeLogDetailModal, stopCaptchaRuntimeStatusPolling, pollCaptchaRuntimeStatus, startCaptchaRuntimeStatusPolling, resumeCaptchaRuntimeStatusPollingIfNeeded, showToast, logout, switchTab, openBrowserLoginModal, startBrowserLoginSession, closeBrowserLoginModal, sendBrowserLoginQuickText});
     });
     </script>
 </body>

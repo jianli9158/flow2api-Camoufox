@@ -152,7 +152,16 @@
     "分数测试失败: {error}": "分数测试失败: {error}",
     "Google Cookie 验证失败：{error}": "Google Cookie 验证失败：{error}",
     "Failed to update token: {error}": "更新 Token 失败: {error}",
-    "Failed to add token: {error}": "添加 Token 失败: {error}"
+    "Failed to add token: {error}": "添加 Token 失败: {error}",
+    "该 API Key 未公开此模型: {0}": "该 API Key 未公开此模型: {0}",
+    "API Key 名称不能为空": "API Key 名称不能为空",
+    "该 API Key 与主密钥重复": "该 API Key 与主密钥重复",
+    "该 API Key 已存在": "该 API Key 已存在",
+    "该 API Key 已被子密钥使用": "该 API Key 已被子密钥使用",
+    "API Key 不存在": "API Key 不存在",
+    "API Key 创建成功": "API Key 创建成功",
+    "API Key 更新成功": "API Key 更新成功",
+    "API Key 删除成功": "API Key 删除成功"
   },
   "en": {
     "旧版本的邮箱不匹配报错直接丢弃，不再回显给前端。": "Discard legacy email-mismatch errors instead of returning them to the frontend.",
@@ -307,6 +316,15 @@
     "分数测试失败: {error}": "Score test failed: {error}",
     "Google Cookie 验证失败：{error}": "Google Cookie validation failed: {error}",
     "Failed to update token: {error}": "Failed to update token: {error}",
-    "Failed to add token: {error}": "Failed to add token: {error}"
+    "Failed to add token: {error}": "Failed to add token: {error}",
+    "该 API Key 未公开此模型: {0}": "Model not exposed for this API key: {0}",
+    "API Key 名称不能为空": "API key name cannot be empty",
+    "该 API Key 与主密钥重复": "API key duplicates the master API key",
+    "该 API Key 已存在": "API key already exists",
+    "该 API Key 已被子密钥使用": "API key is already used by a managed sub-key",
+    "API Key 不存在": "API key not found",
+    "API Key 创建成功": "API key created",
+    "API Key 更新成功": "API key updated",
+    "API Key 删除成功": "API key deleted"
   }
 }

@@ -752,7 +752,11 @@ class CamoufoxWorker:
         return exported
 
     async def _sync_live_cookies_to_db(
-        self, token_id: Optional[int] = None, *, update_db: bool = True
+        self,
+        token_id: Optional[int] = None,
+        *,
+        update_db: bool = True,
+        mark_refresh_success: bool = False,
     ) -> Optional[str]:
         """Persist rotated Google/Flow cookies (`__Secure-1PSIDTS`, `SIDCC`, `OSID`, etc.) back to `storage-state.json` and SQLite."""
         bound_id = self._normalize_token_key(token_id) or self._shared_bound_token_id
@@ -808,24 +812,27 @@ class CamoufoxWorker:
 
         if update_db and bound_id is not None and self.db is not None:
             try:
-                now_utc = datetime.now(timezone.utc)
-                interval_minutes = 30
-                if hasattr(self.db, "get_token"):
-                    tok_snapshot = await self.db.get_token(bound_id)
-                    if tok_snapshot and getattr(tok_snapshot, "refresh_interval_minutes", None):
-                        try:
-                            interval_minutes = max(1, int(tok_snapshot.refresh_interval_minutes))
-                        except Exception:
-                            interval_minutes = 30
                 new_st = "frontend-" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:32]
-                await self.db.update_token(
-                    bound_id,
-                    google_cookies=serialized,
-                    st=new_st,
-                    at_expires=now_utc + timedelta(minutes=max(55, interval_minutes + 15)),
-                    last_st_refresh_at=now_utc,
-                    last_st_refresh_result="success",
-                )
+                update_fields: Dict[str, Any] = {
+                    "google_cookies": serialized,
+                    "st": new_st,
+                }
+                if mark_refresh_success:
+                    now_utc = datetime.now(timezone.utc)
+                    interval_minutes = 30
+                    if hasattr(self.db, "get_token"):
+                        tok_snapshot = await self.db.get_token(bound_id)
+                        if tok_snapshot and getattr(tok_snapshot, "refresh_interval_minutes", None):
+                            try:
+                                interval_minutes = max(1, int(tok_snapshot.refresh_interval_minutes))
+                            except Exception:
+                                interval_minutes = 30
+                    update_fields["at_expires"] = now_utc + timedelta(
+                        minutes=max(55, interval_minutes + 15)
+                    )
+                    update_fields["last_st_refresh_at"] = now_utc
+                    update_fields["last_st_refresh_result"] = "success"
+                await self.db.update_token(bound_id, **update_fields)
             except Exception as exc:
                 debug_logger.log_warning(
                     f"[Camoufox] 同步 Token-{bound_id} 轮换 Cookie 到数据库失败: {exc}"
@@ -1065,9 +1072,19 @@ class CamoufoxWorker:
             and not bidi._closed
             and bound_token_id is not None
             and self._consecutive_browser_failures == 0
-            and "relogin" not in reason_lower
-            and "failed" not in reason_lower
-            and "error" not in reason_lower
+            and not any(
+                marker in reason_lower
+                for marker in (
+                    "relogin",
+                    "failed",
+                    "error",
+                    "expired",
+                    "invalid",
+                    "auth",
+                    "unauth",
+                    "logout",
+                )
+            )
         ):
             try:
                 await self._sync_live_cookies_to_db(bound_token_id)
@@ -3208,7 +3225,17 @@ class CamoufoxWorker:
                                     break
                             except Exception:
                                 pass
-                    if urlparse(current_url).hostname != "flow.google.com":
+                    parsed_final = urlparse(current_url)
+                    final_path = (parsed_final.path or "").rstrip("/")
+                    if (
+                        parsed_final.hostname != "flow.google.com"
+                        or final_path == "/about"
+                        or not email
+                    ):
+                        if final_path == "/about":
+                            raise RuntimeError(
+                                "Flow 登录已失效 (identity_recheck_required: redirected to /about)，请重新登录"
+                            )
                         raise RuntimeError(
                             "Flow 登录已失效，请重新同步 Google Cookies"
                         )

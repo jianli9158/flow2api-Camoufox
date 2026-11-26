@@ -23,6 +23,7 @@ from .models import (
     PluginConfig,
     CallLogicConfig,
     TokenRefreshConfig,
+    APIKeyRecord,
 )
 
 
@@ -598,6 +599,23 @@ class Database:
                     )
                 """)
 
+            if not await self._table_exists(db, "api_keys"):
+                print("  ✓ Creating missing table: api_keys")
+                await db.execute("""
+                    CREATE TABLE api_keys (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL DEFAULT '',
+                        key_value TEXT UNIQUE NOT NULL,
+                        is_active BOOLEAN DEFAULT 1,
+                        allow_all_models BOOLEAN DEFAULT 1,
+                        allowed_models TEXT DEFAULT '[]',
+                        remark TEXT DEFAULT '',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_used_at TIMESTAMP
+                    )
+                """)
+
             # ========== Step 2: Add missing columns to existing tables ==========
             # Check and add missing columns to tokens table
             if await self._table_exists(db, "tokens"):
@@ -963,6 +981,22 @@ class Database:
                     api_key TEXT DEFAULT 'han1234',
                     error_ban_threshold INTEGER DEFAULT 3,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Managed multi-API keys table
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL DEFAULT '',
+                    key_value TEXT UNIQUE NOT NULL,
+                    is_active BOOLEAN DEFAULT 1,
+                    allow_all_models BOOLEAN DEFAULT 1,
+                    allowed_models TEXT DEFAULT '[]',
+                    remark TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used_at TIMESTAMP
                 )
             """)
 
@@ -2305,6 +2339,15 @@ class Database:
             config.set_admin_password_from_db(admin_config.password)
             config.api_key = admin_config.api_key
 
+        # Reload managed multi-API keys into AuthManager
+        try:
+            from .auth import AuthManager
+
+            managed_keys = await self.list_api_keys()
+            AuthManager.set_api_keys(managed_keys)
+        except Exception:
+            pass
+
         # Reload cache config
         cache_config = await self.get_cache_config()
         if cache_config:
@@ -2708,3 +2751,150 @@ class Database:
             await db.commit()
 
         return await self.get_token_refresh_config()
+
+    # ========== Managed Multi-API Key Operations ==========
+
+    @staticmethod
+    def _normalize_allowed_models(models: Optional[List[str]]) -> List[str]:
+        seen = set()
+        normalized: List[str] = []
+        for item in models or []:
+            val = str(item or "").strip()
+            if val and val not in seen:
+                seen.add(val)
+                normalized.append(val)
+        return normalized
+
+    @classmethod
+    def _row_to_api_key_record(cls, row: Any) -> APIKeyRecord:
+        data = dict(row)
+        raw_models = data.get("allowed_models")
+        parsed_models: List[str] = []
+        if isinstance(raw_models, str) and raw_models.strip():
+            try:
+                loaded = json.loads(raw_models)
+                if isinstance(loaded, list):
+                    parsed_models = cls._normalize_allowed_models(loaded)
+            except Exception:
+                parsed_models = []
+        elif isinstance(raw_models, list):
+            parsed_models = cls._normalize_allowed_models(raw_models)
+        return APIKeyRecord(
+            id=data.get("id"),
+            name=str(data.get("name") or ""),
+            key_value=str(data.get("key_value") or ""),
+            is_active=bool(data.get("is_active", True)),
+            allow_all_models=bool(data.get("allow_all_models", True)),
+            allowed_models=parsed_models,
+            remark=str(data.get("remark") or ""),
+            created_at=data.get("created_at"),
+            updated_at=data.get("updated_at"),
+            last_used_at=data.get("last_used_at"),
+        )
+
+    async def list_api_keys(self) -> List[APIKeyRecord]:
+        """List all managed client API keys."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if not await self._table_exists(db, "api_keys"):
+                return []
+            cursor = await db.execute(
+                "SELECT * FROM api_keys ORDER BY id ASC"
+            )
+            rows = await cursor.fetchall()
+            return [self._row_to_api_key_record(row) for row in rows]
+
+    async def get_api_key(self, key_id: int) -> Optional[APIKeyRecord]:
+        """Get a managed API key by ID."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if not await self._table_exists(db, "api_keys"):
+                return None
+            cursor = await db.execute(
+                "SELECT * FROM api_keys WHERE id = ?", (key_id,)
+            )
+            row = await cursor.fetchone()
+            return self._row_to_api_key_record(row) if row else None
+
+    async def get_api_key_by_value(self, key_value: str) -> Optional[APIKeyRecord]:
+        """Get a managed API key by its raw secret value."""
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            if not await self._table_exists(db, "api_keys"):
+                return None
+            cursor = await db.execute(
+                "SELECT * FROM api_keys WHERE key_value = ?", (key_value,)
+            )
+            row = await cursor.fetchone()
+            return self._row_to_api_key_record(row) if row else None
+
+    async def create_api_key(self, record: APIKeyRecord) -> int:
+        """Create a managed API key and return its row ID."""
+        allowed_json = json.dumps(
+            self._normalize_allowed_models(record.allowed_models),
+            ensure_ascii=False,
+        )
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                """
+                INSERT INTO api_keys (
+                    name, key_value, is_active, allow_all_models, allowed_models, remark
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(record.name or "").strip(),
+                    str(record.key_value or "").strip(),
+                    bool(record.is_active),
+                    bool(record.allow_all_models),
+                    allowed_json,
+                    str(record.remark or "").strip(),
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    async def update_api_key(self, key_id: int, **kwargs) -> bool:
+        """Update a managed API key record."""
+        allowed_cols = {
+            "name",
+            "key_value",
+            "is_active",
+            "allow_all_models",
+            "allowed_models",
+            "remark",
+            "last_used_at",
+        }
+        updates = []
+        params = []
+        for key, value in kwargs.items():
+            if key not in allowed_cols:
+                continue
+            if key == "allowed_models":
+                value = json.dumps(
+                    self._normalize_allowed_models(value),
+                    ensure_ascii=False,
+                )
+            elif key in ("name", "key_value", "remark") and value is not None:
+                value = str(value).strip()
+            updates.append(f"{key} = ?")
+            params.append(value)
+        if not updates:
+            return False
+        updates.append("updated_at = CURRENT_TIMESTAMP")
+        params.append(key_id)
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                f"UPDATE api_keys SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            await db.commit()
+            return cursor.rowcount > 0
+
+    async def delete_api_key(self, key_id: int) -> bool:
+        """Delete a managed API key by ID."""
+        async with self._connect(write=True) as db:
+            cursor = await db.execute(
+                "DELETE FROM api_keys WHERE id = ?", (key_id,)
+            )
+            await db.commit()
+            return cursor.rowcount > 0

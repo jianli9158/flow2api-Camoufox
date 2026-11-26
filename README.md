@@ -128,7 +128,7 @@ python main.py
 
 ## API 接口参考
 
-所有业务接口均通过 `Authorization: Bearer <api_key>` 或 `x-goog-api-key: <api_key>` 鉴权（默认 `han1234`）。
+所有业务接口均通过 `Authorization: Bearer <api_key>` 或 `x-goog-api-key: <api_key>` 鉴权（默认主密钥 `han1234` 公开全部模型；亦可在后台「系统配置 → 安全配置 → 多 API Key 管理」或 `/api/admin/apikeys` 创建多个子 API Key，按 Key 精确或通配符指定公开与可调用的模型集合）。
 
 ### OpenAI 与 Gemini 生成接口
 

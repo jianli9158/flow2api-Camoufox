@@ -411,6 +411,24 @@ class UpdateAPIKeyRequest(BaseModel):
     new_api_key: str
 
 
+
+class CreateManagedAPIKeyRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    key_value: Optional[str] = Field(default=None, max_length=256)
+    is_active: bool = True
+    allow_all_models: bool = True
+    allowed_models: List[str] = Field(default_factory=list)
+    remark: str = Field(default="", max_length=500)
+
+
+class UpdateManagedAPIKeyRequest(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    key_value: Optional[str] = Field(default=None, max_length=256)
+    is_active: Optional[bool] = None
+    allow_all_models: Optional[bool] = None
+    allowed_models: Optional[List[str]] = None
+    remark: Optional[str] = Field(default=None, max_length=500)
+
 class UpdateDebugConfigRequest(BaseModel):
     enabled: bool
 
@@ -1161,6 +1179,8 @@ async def refresh_credits(token_id: int, token: str = Depends(verify_admin_token
     try:
         credits = await token_manager.refresh_credits(token_id)
         return {"success": True, "message": "余额刷新成功", "credits": credits}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=f"刷新余额失败: {str(e)}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"刷新余额失败: {str(e)}")
 
@@ -1202,10 +1222,13 @@ async def refresh_at(token_id: int, token: str = Depends(verify_admin_token)):
             debug_logger.log_error(f"[API] AT 刷新失败: token_id={token_id}")
             
             snapshot = await token_manager.get_token(token_id)
-            error_detail = _sanitize_refresh_result(
+            raw_detail = _sanitize_refresh_result(
                 snapshot.last_st_refresh_result if snapshot else None
-            ) or "Cookie 刷新失败，请重新同步完整的 Google Cookies"
-            
+            )
+            if raw_detail.strip().lower() == "success":
+                raw_detail = ""
+            error_detail = raw_detail or "Cookie 刷新失败，请重新同步完整的 Google Cookies"
+
             raise HTTPException(status_code=500, detail=error_detail)
     except HTTPException:
         raise
@@ -2146,15 +2169,183 @@ async def update_admin_password(
 async def update_api_key(
     request: UpdateAPIKeyRequest, token: str = Depends(verify_admin_token)
 ):
-    """Update API key (for external API calls, NOT for admin login)"""
-    # Update API key in database
-    await db.update_admin_config(api_key=request.new_api_key)
-
-    # 🔥 Hot reload: sync database config to memory
+    """Update Master API key (for external API calls, NOT for admin login)"""
+    new_key = str(request.new_api_key or "").strip()
+    if len(new_key) < 6:
+        raise HTTPException(status_code=400, detail="API Key 至少6个字符")
+    existing = await db.get_api_key_by_value(new_key)
+    if existing is not None:
+        raise HTTPException(status_code=400, detail="该 API Key 已被子密钥使用")
+    await db.update_admin_config(api_key=new_key)
     await db.reload_config_to_memory()
-
     return {"success": True, "message": "API Key更新成功"}
 
+
+def _serialize_managed_api_key(rec: Any) -> Dict[str, Any]:
+    def _iso(val: Any) -> Optional[str]:
+        if val is None:
+            return None
+        return val.isoformat() if hasattr(val, "isoformat") else str(val)
+
+    return {
+        "id": rec.id,
+        "name": rec.name,
+        "key_value": rec.key_value,
+        "is_active": bool(rec.is_active),
+        "allow_all_models": bool(rec.allow_all_models),
+        "allowed_models": list(rec.allowed_models or []),
+        "remark": rec.remark or "",
+        "created_at": _iso(rec.created_at),
+        "updated_at": _iso(rec.updated_at),
+        "last_used_at": _iso(rec.last_used_at),
+    }
+
+
+def _build_api_key_selectable_models() -> List[Dict[str, str]]:
+    from ..core.model_catalog import MODEL_CONFIG
+    from ..core.model_resolver import get_base_model_aliases
+
+    items: List[Dict[str, str]] = []
+    seen = set()
+    for alias_id, desc in get_base_model_aliases().items():
+        if alias_id in seen:
+            continue
+        seen.add(alias_id)
+        items.append(
+            {
+                "id": alias_id,
+                "category": "alias",
+                "label": str(desc or alias_id),
+            }
+        )
+    for model_id, cfg in MODEL_CONFIG.items():
+        if not cfg.get("listed", True) or model_id in seen:
+            continue
+        seen.add(model_id)
+        mtype = str(cfg.get("type") or "image")
+        label = str(
+            cfg.get("display_name")
+            or cfg.get("model_name")
+            or cfg.get("model_key")
+            or model_id
+        )
+        items.append({"id": model_id, "category": mtype, "label": label})
+    return items
+
+
+@router.get("/api/admin/apikeys")
+async def list_managed_api_keys(token: str = Depends(verify_admin_token)):
+    """List managed multi-API keys and selectable model catalog."""
+    admin_config = await db.get_admin_config()
+    keys = await db.list_api_keys()
+    return {
+        "success": True,
+        "master_api_key": admin_config.api_key if admin_config else config.api_key,
+        "keys": [_serialize_managed_api_key(k) for k in keys],
+        "available_models": _build_api_key_selectable_models(),
+    }
+
+
+@router.post("/api/admin/apikeys")
+async def create_managed_api_key(
+    request: CreateManagedAPIKeyRequest, token: str = Depends(verify_admin_token)
+):
+    """Create a managed API key with optional per-key model allowlist."""
+    from ..core.models import APIKeyRecord
+
+    name = str(request.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="API Key 名称不能为空")
+    key_value = str(request.key_value or "").strip()
+    if not key_value:
+        key_value = f"sk-flow-{secrets.token_urlsafe(24)}"
+    if len(key_value) < 6:
+        raise HTTPException(status_code=400, detail="API Key 至少6个字符")
+
+    admin_config = await db.get_admin_config()
+    master_key = admin_config.api_key if admin_config else config.api_key
+    if master_key and key_value == master_key:
+        raise HTTPException(status_code=400, detail="该 API Key 与主密钥重复")
+    if await db.get_api_key_by_value(key_value) is not None:
+        raise HTTPException(status_code=400, detail="该 API Key 已存在")
+
+    record = APIKeyRecord(
+        name=name,
+        key_value=key_value,
+        is_active=bool(request.is_active),
+        allow_all_models=bool(request.allow_all_models),
+        allowed_models=db._normalize_allowed_models(request.allowed_models),
+        remark=str(request.remark or "").strip(),
+    )
+    key_id = await db.create_api_key(record)
+    await db.reload_config_to_memory()
+    created = await db.get_api_key(key_id)
+    return {
+        "success": True,
+        "message": "API Key 创建成功",
+        "api_key": _serialize_managed_api_key(created),
+    }
+
+
+@router.put("/api/admin/apikeys/{key_id}")
+async def update_managed_api_key(
+    key_id: int,
+    request: UpdateManagedAPIKeyRequest,
+    token: str = Depends(verify_admin_token),
+):
+    """Update a managed API key and its allowed model list."""
+    existing = await db.get_api_key(key_id)
+    if existing is None:
+        raise HTTPException(status_code=404, detail="API Key 不存在")
+
+    updates: Dict[str, Any] = {}
+    if request.name is not None:
+        name = request.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="API Key 名称不能为空")
+        updates["name"] = name
+    if request.key_value is not None:
+        key_val = request.key_value.strip()
+        if len(key_val) < 6:
+            raise HTTPException(status_code=400, detail="API Key 至少6个字符")
+        admin_config = await db.get_admin_config()
+        master_key = admin_config.api_key if admin_config else config.api_key
+        if master_key and key_val == master_key:
+            raise HTTPException(status_code=400, detail="该 API Key 与主密钥重复")
+        dup = await db.get_api_key_by_value(key_val)
+        if dup is not None and dup.id != key_id:
+            raise HTTPException(status_code=400, detail="该 API Key 已存在")
+        updates["key_value"] = key_val
+    if request.is_active is not None:
+        updates["is_active"] = bool(request.is_active)
+    if request.allow_all_models is not None:
+        updates["allow_all_models"] = bool(request.allow_all_models)
+    if request.allowed_models is not None:
+        updates["allowed_models"] = db._normalize_allowed_models(request.allowed_models)
+    if request.remark is not None:
+        updates["remark"] = request.remark.strip()
+
+    if updates:
+        await db.update_api_key(key_id, **updates)
+        await db.reload_config_to_memory()
+    updated = await db.get_api_key(key_id)
+    return {
+        "success": True,
+        "message": "API Key 更新成功",
+        "api_key": _serialize_managed_api_key(updated),
+    }
+
+
+@router.delete("/api/admin/apikeys/{key_id}")
+async def delete_managed_api_key(
+    key_id: int, token: str = Depends(verify_admin_token)
+):
+    """Delete a managed API key."""
+    deleted = await db.delete_api_key(key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="API Key 不存在")
+    await db.reload_config_to_memory()
+    return {"success": True, "message": "API Key 删除成功"}
 
 @router.post("/api/admin/debug")
 async def update_debug_config(

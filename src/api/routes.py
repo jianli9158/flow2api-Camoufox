@@ -23,7 +23,11 @@ from fastapi import (
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..core.auth import AuthManager, verify_api_key_flexible
+from ..core.auth import (
+    AuthManager,
+    assert_api_key_model_allowed,
+    verify_api_key_flexible,
+)
 from ..core.logger import debug_logger
 from ..core.model_resolver import get_base_model_aliases, resolve_model_name
 from ..core.models import (
@@ -987,6 +991,7 @@ async def _iterate_gemini_stream(
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_flexible)):
     """List available models."""
+    policy = AuthManager.get_policy_for_verified_key(api_key)
     models = [
         {
             "id": model["id"],
@@ -995,6 +1000,7 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
             "description": model["description"],
         }
         for model in _get_openai_model_catalog()
+        if policy.allows_listed_model(model["id"])
     ]
 
     return {"object": "list", "data": models}
@@ -1003,6 +1009,7 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
 @router.get("/v1/models/aliases")
 async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
     """List simplified model aliases for generationConfig-based resolution."""
+    policy = AuthManager.get_policy_for_verified_key(api_key)
     alias_models = [
         {
             "id": alias_id,
@@ -1012,6 +1019,7 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
             "is_alias": True,
         }
         for alias_id, description in get_base_model_aliases().items()
+        if policy.allows_listed_model(alias_id)
     ]
     return {"object": "list", "data": alias_models}
 
@@ -1020,11 +1028,13 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
 @router.get("/models")
 async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
     """List available models using Gemini-compatible response shape."""
+    policy = AuthManager.get_policy_for_verified_key(api_key)
     catalog = _get_gemini_model_catalog()
     return {
         "models": [
             _build_gemini_model_resource(model_id, description)
             for model_id, description in catalog.items()
+            if policy.allows_listed_model(model_id)
         ]
     }
 
@@ -1033,9 +1043,10 @@ async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
 @router.get("/models/{model}")
 async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_flexible)):
     """Return a single model using Gemini-compatible response shape."""
+    policy = AuthManager.get_policy_for_verified_key(api_key)
     catalog = _get_gemini_model_catalog()
     description = catalog.get(model)
-    if not description:
+    if not description or not policy.allows_listed_model(model):
         return JSONResponse(
             status_code=404,
             content=_build_gemini_error_payload(404, f"Model not found: {model}"),
@@ -1053,9 +1064,14 @@ async def create_chat_completion(
     """OpenAI-compatible unified generation endpoint."""
     try:
         normalized = await _normalize_openai_request(request)
+        assert_api_key_model_allowed(
+            api_key,
+            normalized.model,
+            raw_model=request.model,
+            base_aliases=get_base_model_aliases(),
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
-
         request_base_url = _get_request_base_url(raw_request)
 
         if request.stream:
@@ -1098,6 +1114,12 @@ async def generate_content(
     """Gemini official generateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
+        assert_api_key_model_allowed(
+            api_key,
+            normalized.model,
+            raw_model=model,
+            base_aliases=get_base_model_aliases(),
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 
@@ -1146,6 +1168,12 @@ async def stream_generate_content(
     """Gemini official streamGenerateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
+        assert_api_key_model_allowed(
+            api_key,
+            normalized.model,
+            raw_model=model,
+            base_aliases=get_base_model_aliases(),
+        )
         if not normalized.prompt:
             raise HTTPException(status_code=400, detail="Prompt cannot be empty")
 

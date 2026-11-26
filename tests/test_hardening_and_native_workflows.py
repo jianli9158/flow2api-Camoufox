@@ -687,6 +687,274 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ns_blocked.json()["error"]["code"], -32030)
         self.assertEqual(ns_blocked.json()["error"]["data"]["charged"], "no")
 
+    async def test_refresh_failure_propagation_and_multi_api_key_model_scoping(self):
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.api import admin as admin_api, flow_routes, mcp_routes, routes
+        from src.core.auth import AuthManager
+        from src.core.config import config
+        from src.core.database import Database
+        from src.core.models import Token
+        from src.services.camoufox_bidi import CamoufoxWorker
+        from src.services.token_manager import TokenManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(str(Path(tmpdir) / "multi_key_test.db"))
+            await db.init_db()
+            prev_api_key = config.api_key
+            prev_keys = AuthManager._managed_api_keys
+            prev_admin_db = admin_api.db
+            prev_admin_tm = admin_api.token_manager
+            prev_routes_gh = routes.generation_handler
+            prev_flow_svc = flow_routes.flow_feature_service
+            prev_mcp_svc = mcp_routes._flow_feature_service
+            prev_mcp_gh = mcp_routes._generation_handler
+            try:
+                # 1. TokenManager.refresh_credits must raise on failure instead of returning 0
+                tid = await db.add_token(
+                    Token(
+                        st="st-fail",
+                        at="at-fail",
+                        email="fail@example.com",
+                        is_active=True,
+                        last_st_refresh_result="success",
+                    )
+                )
+                flow_mock = MagicMock()
+                flow_mock.get_credits = AsyncMock(
+                    side_effect=RuntimeError("Flow RPC 401 UNAUTHENTICATED")
+                )
+                tm = TokenManager(db, flow_mock)
+                tm.ensure_valid_token = AsyncMock(side_effect=lambda t: t)
+                with self.assertRaises(RuntimeError):
+                    await tm.refresh_credits(tid)
+                with self.assertRaises(ValueError):
+                    await tm.refresh_credits(99999)
+
+                # 2. Camoufox _sync_live_cookies_to_db must NOT forge last_st_refresh_result='success'
+                #    and _recycle_browser_locked(reason='login_expired') must skip DB cookie sync
+                await db.update_token(tid, last_st_refresh_result="Flow 登录已失效")
+                worker = CamoufoxWorker(tid, tmpdir, db=db)
+                worker._shared_bound_token_id = tid
+                worker._export_live_google_cookies = AsyncMock(
+                    return_value=[
+                        {"name": "SID", "value": "sid-1", "domain": ".google.com", "path": "/"},
+                        {"name": "OSID", "value": "osid-1", "domain": "flow.google.com", "path": "/"},
+                    ]
+                )
+                await worker._sync_live_cookies_to_db(tid, update_db=True)
+                after_sync = await db.get_token(tid)
+                self.assertEqual(after_sync.last_st_refresh_result, "Flow 登录已失效")
+
+                worker._bidi = types.SimpleNamespace(_closed=False, command=AsyncMock(), close=AsyncMock())
+                worker._sync_live_cookies_to_db = AsyncMock()
+                await worker._recycle_browser_locked(reason="login_expired", rotate_profile=False)
+                worker._sync_live_cookies_to_db.assert_not_called()
+
+                # 3. Admin /api/tokens/{id}/refresh-at never echoes stale 'success' as 500 error detail
+                await db.update_token(tid, last_st_refresh_result="success")
+                tm.refresh_cookies = AsyncMock(return_value=False)
+                admin_api.db = db
+                admin_api.token_manager = tm
+
+                app = FastAPI()
+                app.include_router(admin_api.router)
+                app.include_router(routes.router)
+                app.include_router(flow_routes.router)
+                app.include_router(mcp_routes.router)
+                app.dependency_overrides[admin_api.verify_admin_token] = lambda: "admin-ok"
+
+                master_key = "master-secret-key"
+                img_key = "sk-flow-img-only-key"
+                wild_key = "sk-flow-wildcard-key"
+                config.api_key = master_key
+                await db.update_admin_config(api_key=master_key)
+                await db.reload_config_to_memory()
+
+                gh_mock = MagicMock()
+                gh_mock.handle_generation = MagicMock()
+                routes.set_generation_handler(gh_mock)
+
+                svc_mock = MagicMock()
+                svc_mock.list_models = AsyncMock(
+                    return_value={
+                        "tokenId": tid,
+                        "email": "fail@example.com",
+                        "accountTier": "PAYGATE_TIER_ONE",
+                        "credits": 500,
+                        "imageModels": [
+                            {"id": "gemini-3.1-flash-image-landscape", "type": "image", "upstreamModel": "BELUGA", "supported": True},
+                            {"id": "gemini-3.0-pro-image-landscape", "type": "image", "upstreamModel": "GEM_PIX_2", "supported": True},
+                        ],
+                        "videoModels": [
+                            {"id": "veo_3_1_t2v_fast_landscape", "type": "video", "upstreamModel": "veo_3_1_t2v_fast", "supported": True},
+                        ],
+                        "nativeVideoModels": ["macaron_cookie_r2v_8s_relaxed", "veo_3_1_t2v_fast_landscape"],
+                    }
+                )
+                svc_mock.generate_reference_video = AsyncMock(return_value={"status": "ok"})
+                svc_mock.db = None
+                svc_mock.log_api_request = AsyncMock(return_value=None)
+                flow_routes.set_flow_feature_service(svc_mock)
+                mcp_routes.set_mcp_dependencies(svc_mock, gh_mock)
+
+                tc = TestClient(app)
+
+                refresh_fail = tc.post(f"/api/tokens/{tid}/refresh-at")
+                self.assertEqual(refresh_fail.status_code, 500)
+                self.assertNotEqual(refresh_fail.json()["detail"].strip().lower(), "success")
+
+                credits_fail = tc.post(f"/api/tokens/{tid}/refresh-credits")
+                self.assertEqual(credits_fail.status_code, 500)
+
+                # 4. Multi-API Key CRUD & per-key model isolation
+                create_img_key = tc.post(
+                    "/api/admin/apikeys",
+                    json={
+                        "name": "Image Only",
+                        "key_value": img_key,
+                        "is_active": True,
+                        "allow_all_models": False,
+                        "allowed_models": ["gemini-3.1-flash-image-landscape"],
+                        "remark": "Only 1K landscape",
+                    },
+                )
+                self.assertEqual(create_img_key.status_code, 200)
+                img_key_id = create_img_key.json()["api_key"]["id"]
+
+                create_wild_key = tc.post(
+                    "/api/admin/apikeys",
+                    json={
+                        "name": "Wildcard Flash",
+                        "key_value": wild_key,
+                        "is_active": True,
+                        "allow_all_models": False,
+                        "allowed_models": ["gemini-3.1-flash-image-*", "macaron_cookie_r2v_8s_relaxed"],
+                    },
+                )
+                self.assertEqual(create_wild_key.status_code, 200)
+
+                # Duplicate against master or existing sub-key rejected
+                dup = tc.post(
+                    "/api/admin/apikeys",
+                    json={"name": "Dup", "key_value": master_key},
+                )
+                self.assertEqual(dup.status_code, 400)
+
+                # Master key sees full catalog
+                master_models = tc.get(
+                    "/v1/models", headers={"Authorization": f"Bearer {master_key}"}
+                )
+                self.assertEqual(master_models.status_code, 200)
+                self.assertGreater(len(master_models.json()["data"]), 10)
+
+                # Restricted key A sees ONLY gemini-3.1-flash-image-landscape on OpenAI & Gemini
+                key_a_hdr = {"Authorization": f"Bearer {img_key}"}
+                a_models = tc.get("/v1/models", headers=key_a_hdr)
+                self.assertEqual(a_models.status_code, 200)
+                self.assertEqual(
+                    [m["id"] for m in a_models.json()["data"]],
+                    ["gemini-3.1-flash-image-landscape"],
+                )
+                a_gem = tc.get("/v1beta/models", headers={"x-goog-api-key": img_key})
+                self.assertEqual(a_gem.status_code, 200)
+                self.assertEqual(
+                    [m["name"] for m in a_gem.json()["models"]],
+                    ["models/gemini-3.1-flash-image-landscape"],
+                )
+                a_hidden = tc.get(
+                    "/v1beta/models/gemini-3.0-pro-image-landscape",
+                    headers={"x-goog-api-key": img_key},
+                )
+                self.assertEqual(a_hidden.status_code, 404)
+
+                # Restricted key A blocked with 403 on disallowed OpenAI / Gemini / Flow / MCP calls
+                a_chat_deny = tc.post(
+                    "/v1/chat/completions",
+                    headers=key_a_hdr,
+                    json={
+                        "model": "gemini-3.1-flash-image-landscape-4k",
+                        "messages": [{"role": "user", "content": "cat"}],
+                    },
+                )
+                self.assertEqual(a_chat_deny.status_code, 403)
+                gh_mock.handle_generation.assert_not_called()
+
+                a_gem_deny = tc.post(
+                    "/v1beta/models/gemini-3.0-pro-image-landscape:generateContent",
+                    headers={"x-goog-api-key": img_key},
+                    json={"contents": [{"parts": [{"text": "cat"}]}]},
+                )
+                self.assertEqual(a_gem_deny.status_code, 403)
+                self.assertEqual(a_gem_deny.json()["error"]["status"], "PERMISSION_DENIED")
+
+                a_flow_vid_deny = tc.post(
+                    "/v1/flow/videos",
+                    headers=key_a_hdr,
+                    json={"prompt": "cat", "model_key": "macaron_cookie_r2v_8s_relaxed"},
+                )
+                self.assertEqual(a_flow_vid_deny.status_code, 403)
+
+                a_mcp_deny = tc.post(
+                    "/mcp",
+                    headers=key_a_hdr,
+                    json={
+                        "jsonrpc": "2.0",
+                        "id": 10,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "flow_generate_image",
+                            "arguments": {
+                                "prompt": "cat",
+                                "model": "gemini-3.0-pro-image-landscape",
+                            },
+                        },
+                    },
+                )
+                self.assertEqual(a_mcp_deny.status_code, 403)
+                self.assertEqual(a_mcp_deny.json()["error"]["code"], -32031)
+
+                # Wildcard key B filters /v1/flow/models and allows matching native video model
+                key_b_hdr = {"Authorization": f"Bearer {wild_key}"}
+                b_flow_models = tc.get("/v1/flow/models", headers=key_b_hdr)
+                self.assertEqual(b_flow_models.status_code, 200)
+                self.assertEqual(
+                    [m["id"] for m in b_flow_models.json()["imageModels"]],
+                    ["gemini-3.1-flash-image-landscape"],
+                )
+                self.assertEqual(
+                    b_flow_models.json()["nativeVideoModels"],
+                    ["macaron_cookie_r2v_8s_relaxed"],
+                )
+                b_flow_vid_ok = tc.post(
+                    "/v1/flow/videos",
+                    headers=key_b_hdr,
+                    json={"prompt": "cat", "model_key": "macaron_cookie_r2v_8s_relaxed"},
+                )
+                self.assertEqual(b_flow_vid_ok.status_code, 200)
+
+                # Disabling key A immediately returns 401
+                disable_resp = tc.put(
+                    f"/api/admin/apikeys/{img_key_id}", json={"is_active": False}
+                )
+                self.assertEqual(disable_resp.status_code, 200)
+                a_revoked = tc.get("/v1/models", headers=key_a_hdr)
+                self.assertEqual(a_revoked.status_code, 401)
+
+                # Delete key A
+                del_resp = tc.delete(f"/api/admin/apikeys/{img_key_id}")
+                self.assertEqual(del_resp.status_code, 200)
+            finally:
+                config.api_key = prev_api_key
+                AuthManager._managed_api_keys = prev_keys
+                admin_api.db = prev_admin_db
+                admin_api.token_manager = prev_admin_tm
+                routes.generation_handler = prev_routes_gh
+                flow_routes.flow_feature_service = prev_flow_svc
+                mcp_routes._flow_feature_service = prev_mcp_svc
+                mcp_routes._generation_handler = prev_mcp_gh
+                await db.close()
+
 
 if __name__ == "__main__":
     unittest.main()

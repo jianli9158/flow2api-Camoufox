@@ -1288,11 +1288,26 @@ class TokenManager:
             if await self._try_refresh_st(token_id, token):
                 return True
             latest = await self.db.get_token(token_id)
-            if latest and latest.google_cookies != token.google_cookies:
-                return await self._do_refresh_at(token_id, latest.st, latest)
+            if (
+                latest
+                and latest.google_cookies != token.google_cookies
+                and str(latest.last_st_refresh_result or "").strip().lower()
+                in ("", "success", "pushed")
+            ):
+                if await self._do_refresh_at(token_id, latest.st, latest):
+                    await self.mark_cookie_validated(token_id)
+                    return True
+                fallback_err = (
+                    self._last_at_refresh_error.pop(token_id, "")
+                    or "Flow 登录态验证失败，请重新同步 Google Cookies"
+                )
+                await self._record_cookie_refresh_failure(latest, fallback_err)
+                latest = await self.db.get_token(token_id)
             if latest and (
                 "登录已失效" in str(latest.last_st_refresh_result or "")
                 or "登录态已失效" in str(latest.last_st_refresh_result or "")
+                or "identity_recheck_required"
+                in str(latest.last_st_refresh_result or "").lower()
             ):
                 await self.disable_token(token_id)
                 self._clear_at_validation_cache(token_id)
@@ -1615,19 +1630,15 @@ class TokenManager:
     # ========== 余额刷新 ==========
 
     async def refresh_credits(self, token_id: int) -> int:
-        """刷新Token余额
-
-        Returns:
-            credits
-        """
+        """刷新Token余额（失败时抛异常，避免前端误报成功）。"""
         token = await self.db.get_token(token_id)
         if not token:
-            return 0
+            raise ValueError(f"Token {token_id} 不存在")
 
         # 确保AT有效
         token = await self.ensure_valid_token(token)
         if not token:
-            return 0
+            raise RuntimeError("账号登录态无效或刷新失败，无法获取余额")
 
         try:
             result = await self.flow_client.get_credits(
@@ -1635,7 +1646,9 @@ class TokenManager:
                 google_cookies=token.google_cookies,
                 token_id=token.id,
             )
-            credits = result.get("credits", 0)
+            if not isinstance(result, dict) or result.get("credits") is None:
+                raise RuntimeError("上游未返回有效余额信息")
+            credits = int(result["credits"])
             user_paygate_tier = result.get("userPaygateTier")
 
             # 更新数据库
@@ -1650,4 +1663,4 @@ class TokenManager:
             debug_logger.log_error(
                 f"Failed to refresh credits for token {token_id}: {str(e)}"
             )
-            return 0
+            raise
