@@ -15,7 +15,12 @@ from ..core.auth import (
     assert_api_key_model_allowed,
     verify_api_key_flexible,
 )
-from ..core.model_resolver import get_base_model_aliases
+from ..core.model_catalog import MODEL_CONFIG
+from ..core.model_resolver import (
+    get_base_model_aliases,
+    get_canonical_model_name,
+    resolve_model_name,
+)
 from ..core.config import config
 from ..core.flow_errors import classify_flow_error
 from ..core.redaction import redact_sensitive_text
@@ -198,12 +203,22 @@ MCP_TOOL_DEFINITIONS: List[Dict[str, Any]] = [
     },
     {
         "name": "flow_generate_image",
-        "description": "Generate an image with Flow (e.g. gemini-3.0-pro-image-landscape or gemini-3.1-flash-image-landscape).",
+        "description": "Generate an image with Flow using a standard model ID (defaults to gemini-3.1-flash-image, 16:9, 2K).",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "prompt": {"type": "string"},
-                "model": {"type": "string", "default": "gemini-3.0-pro-image-landscape"},
+                "model": {"type": "string", "default": "gemini-3.1-flash-image"},
+                "aspect_ratio": {
+                    "type": "string",
+                    "default": "16:9",
+                    "description": "16:9, 9:16, 1:1, 4:3, or 3:4",
+                },
+                "image_size": {
+                    "type": "string",
+                    "default": "2K",
+                    "description": "1K, 2K (default), or 4K",
+                },
             },
             "required": ["prompt"],
         },
@@ -292,12 +307,22 @@ async def _dispatch_mcp_tool(
             detail=f"MCP no-spend mode blocks paid credit tool '{tool_name}'",
         )
 
+    resolved_img_model: Optional[str] = None
     if tool_name == "flow_generate_image":
-        target_img_model = str(args.get("model") or "gemini-3.0-pro-image-landscape")
+        raw_img_model = str(args.get("model") or "gemini-3.1-flash-image")
+        resolved_img_model = resolve_model_name(
+            raw_img_model,
+            request={
+                "aspect_ratio": args.get("aspect_ratio") or args.get("aspectRatio"),
+                "image_size": args.get("image_size") or args.get("imageSize"),
+            },
+            model_config=MODEL_CONFIG,
+        )
         assert_api_key_model_allowed(
             caller_key,
-            target_img_model,
-            raw_model=target_img_model,
+            resolved_img_model,
+            raw_model=raw_img_model,
+            canonical_model=get_canonical_model_name(resolved_img_model),
             base_aliases=get_base_model_aliases(),
         )
     elif tool_name == "flow_generate_video":
@@ -393,9 +418,13 @@ async def _dispatch_mcp_tool(
     if tool_name == "flow_generate_image":
         if _generation_handler is None:
             raise RuntimeError("GenerationHandler is not initialized")
+        target_model = resolved_img_model or resolve_model_name(
+            str(args.get("model") or "gemini-3.1-flash-image"),
+            model_config=MODEL_CONFIG,
+        )
         chunks: List[str] = []
         async for raw_chunk in _generation_handler.handle_generation(
-            model=str(args.get("model") or "gemini-3.0-pro-image-landscape"),
+            model=target_model,
             prompt=str(args["prompt"]),
             stream=False,
         ):

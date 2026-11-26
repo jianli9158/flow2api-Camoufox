@@ -575,7 +575,22 @@ def test_language_switch_works_when_browser_storage_is_disabled(browser_page):
 
 def test_upscaled_video_models_keep_reference_uploads(browser_page):
     page, base = browser_page
+    models = [
+        "omni-1.2-flash-i2v-8s-landscape-4k",
+        "omni-1.2-flash-i2v-8s-landscape-1080p",
+        "omni-1.2-flash-8s-landscape-4k",
+        "omni-1.2-flash-8s-landscape-1080p",
+    ]
+    page.route(
+        "**/v1/models",
+        lambda route: route.fulfill(
+            content_type="application/json",
+            body=json.dumps({"data": [{"id": m, "description": m} for m in models]}),
+        ),
+    )
     open_page(page, base + "/test")
+    page.locator("#apiKey").fill("local-test-key")
+    page.locator("#apiKey").press("Tab")
     image = base64.b64decode(
         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jNekAAAAASUVORK5CYII="
     )
@@ -596,14 +611,24 @@ def test_upscaled_video_models_keep_reference_uploads(browser_page):
 
 def test_upsample_heading_keeps_both_translations(browser_page):
     page, base = browser_page
+    page.route(
+        "**/v1/models",
+        lambda route: route.fulfill(
+            content_type="application/json",
+            body=json.dumps(
+                {"data": [{"id": "omni-1.2-flash-8s-landscape-4k", "description": "4K"}]}
+            ),
+        ),
+    )
     open_page(page, base + "/test")
+    page.locator("#apiKey").fill("local-test-key")
+    page.locator("#apiKey").press("Tab")
     heading = page.locator('.section-title[data-category="视频放大 (Upsample)"]')
     playwright_api.expect(heading).to_contain_text("Video upscaling (Upsample)")
     page.locator("[data-language-select]").select_option("zh-CN")
     playwright_api.expect(heading).to_contain_text("视频放大 (Upsample)")
     page.locator("[data-language-select]").select_option("en")
     playwright_api.expect(heading).to_contain_text("Video upscaling (Upsample)")
-
 
 def test_extend_requires_source_and_sends_backend_compatible_reference(browser_page):
     from src.api.routes import _extract_prompt_and_images_from_openai_messages

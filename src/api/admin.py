@@ -2203,21 +2203,9 @@ def _serialize_managed_api_key(rec: Any) -> Dict[str, Any]:
 
 def _build_api_key_selectable_models() -> List[Dict[str, str]]:
     from ..core.model_catalog import MODEL_CONFIG
-    from ..core.model_resolver import get_base_model_aliases
 
     items: List[Dict[str, str]] = []
     seen = set()
-    for alias_id, desc in get_base_model_aliases().items():
-        if alias_id in seen:
-            continue
-        seen.add(alias_id)
-        items.append(
-            {
-                "id": alias_id,
-                "category": "alias",
-                "label": str(desc or alias_id),
-            }
-        )
     for model_id, cfg in MODEL_CONFIG.items():
         if not cfg.get("listed", True) or model_id in seen:
             continue
@@ -2231,7 +2219,6 @@ def _build_api_key_selectable_models() -> List[Dict[str, str]]:
         )
         items.append({"id": model_id, "category": mtype, "label": label})
     return items
-
 
 @router.get("/api/admin/apikeys")
 async def list_managed_api_keys(token: str = Depends(verify_admin_token)):

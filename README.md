@@ -11,9 +11,9 @@ Flow2API 通过隔离的 Camoufox（反检测 Firefox）浏览器会话与 WebDr
 - **Camoufox + WebDriver BiDi 双 Tab 隔离与分层执行管线**：模块化浏览器运行时（`camoufox_bidi.py`、`camoufox_fingerprint.py`、`bidi_transport.py`、`camoufox_profile.py`、`camoufox_login.py`）为每个账号锁定持久化 Windows 10/11 指纹（`camoufox-fingerprint.json`）、WebGL/字体子集与独立 Firefox Profile（`browser_data_rt/token_<id>/`）：
   - **同进程双 Tab 隔离**：同一 Camoufox 进程内分离 **API Tab**（常驻 `flow.google.com`，专责 `WIZ_global_data`、同源 `batchexecute` RPC 与 `StreamChat`）与 **打码 Tab**（专责人类轨迹预热与 `grecaptcha.enterprise.execute`），共享同一份 Cookie / TLS / 代理而互不污染页面缓存；遇到 `PUBLIC_ERROR_UNUSUAL_ACTIVITY` 时独立清理 `_GRECAPTCHA` 并销毁重建打码 Tab 自动重试，不中断 API 会话且不再持久化瞬态 `_GRECAPTCHA` Cookie。
   - **控制面分层路由**：只读查询与视频状态轮询 RPC（`Zzl0ze` 20s 缓存与单飞合并、`jwpduf`、`as29s`、`nzlxg`、`wDg3C`、Agent 会话、用户/项目设置等）优先走连接池化的 `curl_cffi` HTTP 控制面（遇风控自动回退浏览器），彻底减少对打码槽位的抢占。
-- **三协议 API 兼容**：
-  - **OpenAI 兼容**：`GET /v1/models`、`GET /v1/models/aliases`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式）。
-  - **Gemini 兼容**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`（及 `/models/...` 路径），支持 `generationConfig.imageConfig` 动态分辨率与比例解析。
+- **三协议标准 API 兼容**：
+  - **OpenAI 标准接口**：`GET /v1/models`、`POST /v1/images/generations`、`POST /v1/images/edits`、`POST /v1/chat/completions`（流式 SSE 进度 + 非流式）。
+  - **Gemini / AI Studio 标准接口**：`GET /v1beta/models`、`POST /v1beta/models/{model}:generateContent`、`:streamGenerateContent`、`:predict`（及 `/models/...` 路径），直接通过 `generationConfig.imageConfig` / `videoConfig` / `parameters` 控制比例、清晰度与时长。
   - **Flow 原生特征接口 (`/v1/flow/*`)**：项目管理、资产上传/解析、TTS 语音生成与试听缓存（`json`/`wav`/`pcm`）、角色 CRUD、参考生视频 / 首帧生视频、Creation Agent 多轮对话与费用确认（SSE / JSON）、用户与项目设置。
 - **多账号调度、防误封自愈与断开取消**：
   - `LoadBalancer` 支持热槽位亲和调度（`prefer_warm_browser`）、按模型族精细冷却（如仅冷却配额耗尽的 `image:GEM_PIX_2` 而不影响 `BELUGA` / `Veo`）、等级成本感知路由（廉价生图优先 Free/Pro，保留 Ultra 给 4K/高阶任务），并通过 `fcntl.flock` / `msvcrt` 内核级目录锁（`.flow2api-profile.lock`，支持短时排队等待）实现跨进程 Profile 排他占用。
@@ -98,31 +98,32 @@ python main.py
 
 ---
 
-## 模型目录与解析规则
+## 模型目录与标准参数规则
 
-服务在 `/v1/models` 与 `/v1beta/models` 公开 **102 个**标准模型（**45 个图像模型 + 57 个视频模型**），同时在内部维护 **550 个**兼容别名与上游 usage key 映射（定义于 `src/services/generation_handler.py` 与 `src/core/model_resolver.py`）。
+服务在 `/v1/models` 与 `/v1beta/models` 仅公开 **10 个标准基础模型**（**3 个图像模型 + 7 个视频模型**），不再刷屏展示上百个比例/分辨率后缀变体；所有画面比例、清晰度、时长均按 Google AI Studio / OpenAI 标准方式通过请求参数动态控制（旧版带后缀模型名仍在内部完整兼容，无破坏性变更）。
 
-### 1. 图像生成（45 个公开变体）
+### 1. 图像生成（3 个标准模型 · 默认 `16:9` + `2K`）
 
-| 模型系列 | 公开前缀 | 简写别名（配合 `imageConfig`） | 上游引擎 | 比例与分辨率矩阵 |
-|---|---|---|---|---|
-| **Nano Banana 2.1** | `gemini-3.1-flash-image-*` | `gemini-3.1-flash-image`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
-| **Nano Banana 2 Lite** | `gemini-3.1-flash-lite-image-*` | `gemini-3.1-flash-lite-image`、`nano-banana-2-lite` | `HARBOR_SEAL` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
-| **Nano Banana Pro** | `gemini-3.0-pro-image-*` | `gemini-3.0-pro-image`、`nano-banana-pro` | `GEM_PIX_2` | 5 种比例 × 3 档清晰度（默认 1K / 2K / 4K）= 15 个 |
-
-**支持的 5 种画面比例后缀**：`-landscape`（16:9）、`-portrait`（9:16）、`-square`（1:1）、`-four-three`（4:3）、`-three-four`（3:4），各自叠加可选后缀 `-2k` 或 `-4k`。所有图像模型支持传入 `0–5` 张参考图片进行图生图或风格参考。
-
-### 2. 视频生成（57 个公开变体）
-
-| 模型族 | 公开名称模式 | 能力说明 | 账号等级 |
+| 标准模型 ID | 兼容别名 | 上游引擎 | 支持参数与默认值 |
 |---|---|---|---|
-| **Omni 1.2 Flash 默认别名** | `omni-1.2-flash`、`omni-1.2-flash-360p`、`omni-1.2-flash-{1080p,4k}` | 默认 8s 横屏，可选 0–3 张参考图（兼容 `omni` / `macaron` 别名） | Free / Pro / Ult |
-| **Omni 1.2 Flash T2V / R2V** | `omni-1.2-flash-{4,6,8,10,15}s-{landscape,portrait}`（含 `-360p` / `-1080p` / `-4k`） | 文本或 0–3 张参考图生视频；别名支持完整 `3s–15s` 时长 | Free / Pro / Ult |
-| **Omni 1.2 Flash I2V** | `omni-1.2-flash-i2v-{4,6,8,10,15}s-{landscape,portrait}`（含放大后缀） | 首帧 / 首尾帧视频（`11s–15s` 仅接受单首帧） | Free / Pro / Ult |
-| **Omni 1.2 Flash Extend** | `omni-1.2-flash-extend-8s-{landscape,portrait}`（别名支持 `3s–10s`） | 基于 `extend://<mediaGenerationId>` 续写视频 | Pro / Ult |
-| **Veo 3.1 Lite** | `veo-3.1-lite`、`veo-3.1-lite-{4,6,8}s-{landscape,portrait}`（及 `i2v` / `r2v` / `extend` / `1080p` / `4k`） | 轻量高速 Veo 3.1 模型族（R2V 最多 3 张图） | Free / Pro / Ult |
+| `gemini-3.1-flash-image` | `gemini-3.1-flash-image-preview`、`nano-banana-2.1`、`nano-banana-2` | `BELUGA` | `aspectRatio`: `16:9`（默认）、`9:16`、`1:1`、`4:3`、`3:4`<br>`imageSize`: `2K`（默认）、`1K`、`4K` |
+| `gemini-3.1-flash-lite-image` | `gemini-3.1-flash-lite-image-preview`、`nano-banana-2-lite` | `HARBOR_SEAL` | 同上（默认 `16:9` + `2K`） |
+| `gemini-3.0-pro-image` | `gemini-3-pro-image`、`gemini-3-pro-image-preview`、`nano-banana-pro` | `GEM_PIX_2` | 同上（默认 `16:9` + `2K`） |
 
-> 注：OpenAI `/v1/chat/completions` 请求可通过 `size`（如 `1024x1792`）、`quality`（`medium` -> `2k`，`high`/`hd`/`ultra` -> `4k`）自动解析；Gemini 接口可通过 `generationConfig.imageConfig.aspectRatio`（如 `"16:9"`、`"9:16"`、`"1:1"`、`"4:3"`、`"3:4"`）与 `imageSize`（`"1K"`/`"2K"`/`"4K"`/`"360p"`/`"1080p"`）自动路由。
+> - 不传任何参数时默认生成 **16:9 横屏 2K** 图片；图生图未显式传 `aspectRatio` 时自动跟随参考图比例。
+> - `aspectRatio` 还支持任意 `W:H`（如 `3:2`、`21:9`）或 OpenAI `size`（如 `1024x1024`、`1792x1024`），自动匹配最接近的 Flow 原生比例；显式传 `imageSize: "1K"` 或 `quality: "standard"` 可回落到 1K 基础图（Free 账号可用），传 `imageSize: "4K"` 或 `quality: "hd"` 可升至 4K（Ultra 账号）。
+
+### 2. 视频生成（7 个标准模型 · 默认 `16:9` + `8s` + `720p`）
+
+| 标准模型 ID | 模式 | 支持参数 |
+|---|---|---|
+| `veo-3.1-lite` | 文生视频 (T2V) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `4` / `6` / `8`；`resolution`: `720p` / `1080p` / `4K` |
+| `veo-3.1-lite-i2v` | 图生视频 (首帧/首尾帧 1–2 图) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `4` / `6` / `8`；`resolution`: `720p` / `1080p` / `4K` |
+| `veo-3.1-lite-r2v` | 多图参考视频 (1–3 图) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `8`；`resolution`: `720p` / `1080p` / `4K` |
+| `veo-3.1-lite-extend` | 视频续写 (`extend://<mediaId>`) | `aspectRatio`: `16:9` / `9:16`；`resolution`: `720p` / `1080p` / `4K` |
+| `omni-1.2-flash` | 文生 / 多图参考视频 (0–3 图) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `3`–`15`；`resolution`: `360p` / `720p` / `1080p` / `4K` |
+| `omni-1.2-flash-i2v` | 图生视频 (1–2 图，`11s–15s` 单首帧) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `3`–`15`；`resolution`: `360p` / `720p` / `1080p` / `4K` |
+| `omni-1.2-flash-extend` | 视频续写 (`extend://<mediaId>`) | `aspectRatio`: `16:9` / `9:16`；`durationSeconds`: `3`–`10`；`resolution`: `360p` / `720p` / `1080p` / `4K` |
 
 ---
 
@@ -130,16 +131,45 @@ python main.py
 
 所有业务接口均通过 `Authorization: Bearer <api_key>` 或 `x-goog-api-key: <api_key>` 鉴权（默认主密钥 `han1234` 公开全部模型；亦可在后台「系统配置 → 安全配置 → 多 API Key 管理」或 `/api/admin/apikeys` 创建多个子 API Key，按 Key 精确或通配符指定公开与可调用的模型集合）。
 
-### OpenAI 与 Gemini 生成接口
+### 标准 OpenAI 与 Gemini / AI Studio 生成接口
 
-- **`POST /v1/chat/completions`**（支持 `stream: true` 实时推流进度）
+- **OpenAI 标准生图 `POST /v1/images/generations`**（及图生图编辑 `POST /v1/images/edits`，支持 `multipart/form-data` 与 JSON；不传参数默认 `16:9` + `2K`）
+  ```bash
+  curl -X POST "http://localhost:8000/v1/images/generations" \
+    -H "Authorization: Bearer han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "gemini-3.1-flash-image",
+      "prompt": "雨夜赛博朋克街道，霓虹水面倒影，电影胶片质感",
+      "aspect_ratio": "16:9",
+      "image_size": "2K",
+      "response_format": "url"
+    }'
+  ```
+
+- **Gemini / AI Studio 标准生图 `POST /v1beta/models/{model}:generateContent`**（同时支持 `:streamGenerateContent` 与 Imagen `:predict`）
+  ```bash
+  curl -X POST "http://localhost:8000/v1beta/models/gemini-3.1-flash-image:generateContent" \
+    -H "x-goog-api-key: han1234" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "contents": [{"role": "user", "parts": [{"text": "极简建筑摄影，晨光洒在清水混凝土墙面"}]}],
+      "generationConfig": {
+        "responseModalities": ["IMAGE"],
+        "imageConfig": {"aspectRatio": "9:16", "imageSize": "2K"}
+      }
+    }'
+  ```
+
+- **OpenAI Chat 统一接口 `POST /v1/chat/completions`**（支持 `stream: true` 实时推流进度）
   ```bash
   curl -X POST "http://localhost:8000/v1/chat/completions" \
     -H "Authorization: Bearer han1234" \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "gemini-3.1-flash-image-landscape",
+      "model": "gemini-3.1-flash-image",
       "messages": [{"role": "user", "content": "雨夜赛博朋克街道，霓虹水面倒影，电影胶片质感"}],
+      "generationConfig": {"imageConfig": {"aspectRatio": "16:9", "imageSize": "2K"}},
       "stream": true
     }'
   ```

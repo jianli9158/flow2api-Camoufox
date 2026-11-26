@@ -24,16 +24,32 @@ class VeoLiteModelResolverTests(unittest.TestCase):
     def test_public_catalog_exposes_only_active_flow_families(self):
         listed = {item["id"] for item in _get_openai_model_catalog()}
 
-        self.assertIn("veo-3.1-lite", listed)
-        self.assertIn("veo-3.1-lite-4s-landscape", listed)
-        self.assertIn("veo-3.1-lite-i2v-8s-landscape", listed)
-        self.assertIn("omni-1.2-flash", listed)
-        self.assertIn("omni-1.2-flash-360p", listed)
-        self.assertIn("omni-1.2-flash-4s-landscape", listed)
-        self.assertIn("omni-1.2-flash-15s-portrait", listed)
-        self.assertNotIn("veo_3_1_t2v_lite_landscape_4s", listed)
-        self.assertIn("veo_3_1_t2v_lite_landscape_4s", MODEL_CONFIG)
-
+        self.assertEqual(
+            listed,
+            {
+                "gemini-3.1-flash-image",
+                "gemini-3.1-flash-lite-image",
+                "gemini-3.0-pro-image",
+                "veo-3.1-lite",
+                "veo-3.1-lite-i2v",
+                "veo-3.1-lite-r2v",
+                "veo-3.1-lite-extend",
+                "omni-1.2-flash",
+                "omni-1.2-flash-i2v",
+                "omni-1.2-flash-extend",
+            },
+        )
+        # Legacy suffixed variants stay hidden in MODEL_CONFIG for backward compatibility
+        for legacy in (
+            "veo-3.1-lite-4s-landscape",
+            "veo-3.1-lite-i2v-8s-landscape",
+            "omni-1.2-flash-360p",
+            "omni-1.2-flash-4s-landscape",
+            "omni-1.2-flash-15s-portrait",
+            "veo_3_1_t2v_lite_landscape_4s",
+        ):
+            self.assertNotIn(legacy, listed)
+            self.assertIn(legacy, MODEL_CONFIG)
         for retired in (
             "veo-3.1-fast",
             "veo-3.1-fast-4s-landscape",
@@ -152,8 +168,20 @@ class VeoLiteModelResolverTests(unittest.TestCase):
             images=[portrait_image],
         )
 
-        self.assertEqual(resolved, "gemini-3.0-pro-image-portrait")
+        self.assertEqual(resolved, "gemini-3.0-pro-image-portrait-2k")
 
+        req_1k = types.SimpleNamespace(
+            generationConfig=types.SimpleNamespace(imageSize="1K")
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "gemini-3.0-pro-image",
+                request=req_1k,
+                model_config=MODEL_CONFIG,
+                images=[portrait_image],
+            ),
+            "gemini-3.0-pro-image-portrait",
+        )
 
 class VeoLiteGenerationHandlerTests(unittest.TestCase):
     def test_tier_two_does_not_upgrade_lite_model_to_fake_ultra(self):
@@ -379,7 +407,7 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
         ):
             normalized = await _normalize_openai_request(request)
 
-        self.assertEqual(normalized.model, "gemini-3.0-pro-image-portrait")
+        self.assertEqual(normalized.model, "gemini-3.0-pro-image-portrait-2k")
         self.assertEqual(len(normalized.images), 1)
 
     async def test_check_video_status_uses_media_payload_and_normalizes_response(self):
@@ -495,25 +523,22 @@ class RouteNormalizationTests(unittest.IsolatedAsyncioTestCase):
         listed = {item["id"] for item in _get_openai_model_catalog()}
         for expected in (
             "omni-1.2-flash",
-            "omni-1.2-flash-360p",
-            "omni-1.2-flash-4s-landscape",
-            "omni-1.2-flash-4s-landscape-360p",
-            "omni-1.2-flash-15s-portrait",
-            "omni-1.2-flash-15s-portrait-360p",
-            "omni-1.2-flash-i2v-8s-landscape",
-            "omni-1.2-flash-extend-8s-portrait",
+            "omni-1.2-flash-i2v",
+            "omni-1.2-flash-extend",
             "veo-3.1-lite",
-            "veo-3.1-lite-8s-landscape",
-            "veo-3.1-lite-i2v-8s-landscape",
-            "veo-3.1-lite-i2v-8s-portrait",
-            "veo-3.1-lite-r2v-8s-landscape",
-            "veo-3.1-lite-extend-8s-portrait",
+            "veo-3.1-lite-i2v",
+            "veo-3.1-lite-r2v",
+            "veo-3.1-lite-extend",
         ):
             self.assertIn(expected, listed)
 
         for hidden in (
+            "omni-1.2-flash-360p",
+            "omni-1.2-flash-4s-landscape",
             "omni-1.2-flash-5s-landscape",
             "omni-1.2-flash-11s-landscape",
+            "omni-1.2-flash-15s-portrait-360p",
+            "veo-3.1-lite-8s-landscape",
             "macaron_cookie_t2v_8s",
             "macaron_cookie_t2v_8s_360p",
         ):

@@ -140,7 +140,11 @@
     "外貌特征、服装、口音、性格描述...": "外貌特征、服装、口音、性格描述...",
     "创建角色": "创建角色",
     "暂无自定义角色": "暂无自定义角色",
-    "OpenAI / Gemini / Flow 原生接口实时测试": "OpenAI / Gemini / Flow 原生接口实时测试"
+    "OpenAI / Gemini / Flow 原生接口实时测试": "OpenAI / Gemini / Flow 原生接口实时测试",
+    "画面比例 (Aspect Ratio)": "画面比例 (Aspect Ratio)",
+    "清晰度 (Image Size)": "清晰度 (Image Size)",
+    "视频时长 (Duration)": "视频时长 (Duration)",
+    "视频分辨率 (Resolution)": "视频分辨率 (Resolution)"
   },
   "en": {
     "Flow2API 模型测试": "Flow2API Model Tester",
@@ -283,6 +287,10 @@
     "外貌特征、服装、口音、性格描述...": "Appearance, outfit, accent, personality notes...",
     "创建角色": "Create character",
     "暂无自定义角色": "No custom characters",
-    "OpenAI / Gemini / Flow 原生接口实时测试": "OpenAI, Gemini & native /v1/flow/* workbench"
+    "OpenAI / Gemini / Flow 原生接口实时测试": "OpenAI, Gemini & native /v1/flow/* workbench",
+    "画面比例 (Aspect Ratio)": "Aspect Ratio",
+    "清晰度 (Image Size)": "Image Size",
+    "视频时长 (Duration)": "Duration",
+    "视频分辨率 (Resolution)": "Resolution"
   }
 }

@@ -1,7 +1,7 @@
 """Data models for Flow2API"""
 
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Optional, List, Union, Any, Literal
+from typing import Any, Dict, List, Literal, Optional, Union
 from datetime import datetime
 
 
@@ -248,9 +248,19 @@ class ImageConfig(BaseModel):
     """Gemini imageConfig parameters"""
 
     aspectRatio: Optional[str] = None  # "16:9", "9:16", "1:1", "4:3", "3:4"
-    imageSize: Optional[str] = None  # "2k", "4k"
+    imageSize: Optional[str] = None  # "1K", "2K", "4K" (default "2K")
 
     # 兼容 OpenAI/NewAPI 等上游可能透传的 size/quality 或 snake_case 字段
+    model_config = ConfigDict(extra="allow")
+
+
+class VideoConfig(BaseModel):
+    """Gemini/AI Studio videoConfig parameters"""
+
+    aspectRatio: Optional[str] = None  # "16:9", "9:16"
+    durationSeconds: Optional[int] = None  # 4, 6, 8, ... 15
+    resolution: Optional[str] = None  # "360p", "720p", "1080p", "4K"
+
     model_config = ConfigDict(extra="allow")
 
 
@@ -259,10 +269,10 @@ class GenerationConfigParam(BaseModel):
 
     responseModalities: Optional[List[str]] = None  # ["IMAGE", "TEXT"]
     imageConfig: Optional[ImageConfig] = None
+    videoConfig: Optional[VideoConfig] = None
+    responseFormat: Optional[Any] = None
 
     model_config = ConfigDict(extra="allow")
-
-
 class GeminiInlineData(BaseModel):
     """Gemini inline binary data."""
 
@@ -322,3 +332,31 @@ class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(
         extra="allow"
     )  # Allow extra fields like extra_body passthrough
+
+
+class OpenAIImageGenerationRequest(BaseModel):
+    """Standard OpenAI /v1/images/generations request with AI Studio parameter extensions."""
+
+    model: str = "gemini-3.1-flash-image"
+    prompt: str
+    n: int = 1
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    response_format: Optional[str] = None  # "url" | "b64_json"
+    aspect_ratio: Optional[str] = None
+    aspectRatio: Optional[str] = None
+    image_size: Optional[str] = None
+    imageSize: Optional[str] = None
+    resolution: Optional[str] = None
+    generationConfig: Optional[GenerationConfigParam] = None
+
+    model_config = ConfigDict(extra="allow")
+
+
+class GeminiPredictRequest(BaseModel):
+    """Standard Google AI Studio / Vertex Imagen :predict request."""
+
+    instances: List[Dict[str, Any]]
+    parameters: Optional[Dict[str, Any]] = None
+
+    model_config = ConfigDict(extra="allow")

@@ -9,6 +9,8 @@ import json
 import mimetypes
 import re
 import socket
+import time
+from types import SimpleNamespace
 from urllib.parse import unquote, urljoin, urlparse
 
 from curl_cffi.requests import AsyncSession
@@ -29,15 +31,20 @@ from ..core.auth import (
     verify_api_key_flexible,
 )
 from ..core.logger import debug_logger
-from ..core.model_resolver import get_base_model_aliases, resolve_model_name
+from ..core.model_resolver import (
+    get_base_model_aliases,
+    get_canonical_model_name,
+    resolve_model_name,
+)
 from ..core.models import (
     ChatCompletionRequest,
     ChatMessage,
     GeminiContent,
     GeminiGenerateContentRequest,
+    GeminiPredictRequest,
+    OpenAIImageGenerationRequest,
 )
 from ..services.generation_handler import MODEL_CONFIG, GenerationHandler
-
 router = APIRouter()
 
 MARKDOWN_IMAGE_RE = re.compile(r"!\[.*?\]\((.*?)\)")
@@ -126,12 +133,54 @@ def _build_model_description(model_config: Dict[str, Any]) -> str:
     return description
 
 
-def _get_openai_model_catalog() -> List[Dict[str, str]]:
-    """Collect OpenAI-compatible model list entries."""
+def _build_model_parameters_metadata(model_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Build standard AI Studio / OpenAI parameter metadata for a model entry."""
+    mtype = str(model_config.get("type") or "image")
+    if mtype == "image":
+        return {
+            "type": "image",
+            "default_parameters": {
+                "aspectRatio": model_config.get("default_aspect_ratio", "16:9"),
+                "imageSize": model_config.get("default_image_size", "2K"),
+            },
+            "supported_parameters": {
+                "aspectRatio": list(
+                    model_config.get(
+                        "supported_aspect_ratios",
+                        ["16:9", "9:16", "1:1", "4:3", "3:4"],
+                    )
+                ),
+                "imageSize": list(
+                    model_config.get("supported_image_sizes", ["1K", "2K", "4K"])
+                ),
+            },
+        }
+    return {
+        "type": "video",
+        "default_parameters": {
+            "aspectRatio": model_config.get("default_aspect_ratio", "16:9"),
+            "durationSeconds": model_config.get("default_duration", 8),
+            "resolution": model_config.get("default_resolution", "720p"),
+        },
+        "supported_parameters": {
+            "aspectRatio": list(
+                model_config.get("supported_aspect_ratios", ["16:9", "9:16"])
+            ),
+            "durationSeconds": list(model_config.get("supported_durations", [8])),
+            "resolution": list(
+                model_config.get("supported_resolutions", ["720p", "1080p", "4K"])
+            ),
+        },
+    }
+
+
+def _get_openai_model_catalog() -> List[Dict[str, Any]]:
+    """Collect OpenAI-compatible canonical model list entries."""
     return [
         {
             "id": model_id,
             "description": _build_model_description(model_config),
+            **_build_model_parameters_metadata(model_config),
         }
         for model_id, model_config in MODEL_CONFIG.items()
         if model_config.get("listed", True)
@@ -139,7 +188,7 @@ def _get_openai_model_catalog() -> List[Dict[str, str]]:
 
 
 def _get_gemini_model_catalog() -> Dict[str, str]:
-    """Collect Gemini-compatible model metadata for /models endpoints."""
+    """Collect Gemini-compatible canonical model metadata for /models endpoints."""
     catalog: Dict[str, str] = {}
 
     for model_id, model_config in MODEL_CONFIG.items():
@@ -152,20 +201,25 @@ def _get_gemini_model_catalog() -> Dict[str, str]:
 
 def _build_gemini_model_resource(model_id: str, description: str) -> Dict[str, Any]:
     """Build a Gemini-compatible model resource payload."""
-    return {
+    cfg = MODEL_CONFIG.get(model_id) or {}
+    mtype = str(cfg.get("type") or "image")
+    methods = ["generateContent", "streamGenerateContent"]
+    if mtype == "image":
+        methods.append("predict")
+    resource: Dict[str, Any] = {
         "name": f"models/{model_id}",
         "displayName": model_id,
         "description": description,
         "version": "flow2api",
         "inputTokenLimit": 0,
         "outputTokenLimit": 0,
-        "supportedGenerationMethods": [
-            "generateContent",
-            "streamGenerateContent",
-        ],
+        "supportedGenerationMethods": methods,
     }
-
-
+    if cfg:
+        meta = _build_model_parameters_metadata(cfg)
+        resource["defaultParameters"] = meta["default_parameters"]
+        resource["supportedParameters"] = meta["supported_parameters"]
+    return resource
 def _decode_data_url(data_url: str) -> tuple[str, bytes]:
     match = DATA_URL_RE.match(data_url)
     if not match:
@@ -990,7 +1044,7 @@ async def _iterate_gemini_stream(
 
 @router.get("/v1/models")
 async def list_models(api_key: str = Depends(verify_api_key_flexible)):
-    """List available models."""
+    """List available canonical models."""
     policy = AuthManager.get_policy_for_verified_key(api_key)
     models = [
         {
@@ -998,6 +1052,9 @@ async def list_models(api_key: str = Depends(verify_api_key_flexible)):
             "object": "model",
             "owned_by": "flow2api",
             "description": model["description"],
+            "type": model["type"],
+            "default_parameters": model["default_parameters"],
+            "supported_parameters": model["supported_parameters"],
         }
         for model in _get_openai_model_catalog()
         if policy.allows_listed_model(model["id"])
@@ -1027,7 +1084,7 @@ async def list_model_aliases(api_key: str = Depends(verify_api_key_flexible)):
 @router.get("/v1beta/models")
 @router.get("/models")
 async def list_gemini_models(api_key: str = Depends(verify_api_key_flexible)):
-    """List available models using Gemini-compatible response shape."""
+    """List available canonical models using Gemini-compatible response shape."""
     policy = AuthManager.get_policy_for_verified_key(api_key)
     catalog = _get_gemini_model_catalog()
     return {
@@ -1045,14 +1102,238 @@ async def get_gemini_model(model: str, api_key: str = Depends(verify_api_key_fle
     """Return a single model using Gemini-compatible response shape."""
     policy = AuthManager.get_policy_for_verified_key(api_key)
     catalog = _get_gemini_model_catalog()
-    description = catalog.get(model)
-    if not description or not policy.allows_listed_model(model):
+    canonical = get_canonical_model_name(model)
+    target_id = model if model in catalog else (canonical if canonical in catalog else None)
+    description = catalog.get(target_id) if target_id else None
+    if not description or not target_id:
+        cfg = MODEL_CONFIG.get(model)
+        if cfg:
+            target_id = model
+            description = _build_model_description(cfg)
+    if not description or not target_id or not policy.allows_execution(
+        target_id,
+        raw_model=model,
+        canonical_model=canonical,
+        base_aliases=get_base_model_aliases(),
+    ):
         return JSONResponse(
             status_code=404,
             content=_build_gemini_error_payload(404, f"Model not found: {model}"),
         )
 
-    return _build_gemini_model_resource(model, description)
+    return _build_gemini_model_resource(target_id, description)
+
+
+async def _materialize_openai_image_item(
+    payload: Dict[str, Any],
+    *,
+    prompt: str,
+    response_format: str,
+) -> Dict[str, Any]:
+    """Build one OpenAI `data[]` entry from a GenerationHandler completion payload."""
+    url = _extract_url_from_openai_payload(payload)
+    if not url:
+        raise HTTPException(
+            status_code=502,
+            detail="Image generation returned no image URL",
+        )
+    fmt = str(response_format or "url").strip().lower()
+    if fmt == "b64_json":
+        if url.startswith("data:image"):
+            match = DATA_URL_RE.match(url)
+            if match:
+                return {"b64_json": match.group("data"), "revised_prompt": prompt}
+        img_bytes = await retrieve_image_data(url)
+        if img_bytes:
+            return {
+                "b64_json": base64.b64encode(img_bytes).decode("ascii"),
+                "revised_prompt": prompt,
+            }
+        raise HTTPException(
+            status_code=502,
+            detail="Failed to encode generated image as b64_json",
+        )
+    return {"url": url, "revised_prompt": prompt}
+
+
+async def _decode_any_image_input(value: Any) -> bytes:
+    """Decode an uploaded UploadFile, data URL, HTTP(S) URL, or raw base64 string into bytes."""
+    if hasattr(value, "read") and callable(value.read):
+        data = await value.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="Uploaded image file is empty")
+        return data
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Image input cannot be empty")
+    if text.startswith(("data:image", "http://", "https://")) or "/tmp/" in text:
+        return await _load_image_bytes_from_uri(text)
+    try:
+        return base64.b64decode(text)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 image input: {exc}")
+
+
+async def _run_openai_images_request(
+    *,
+    raw_model: str,
+    prompt: str,
+    n: int,
+    response_format: str,
+    param_carrier: Any,
+    images: List[bytes],
+    raw_request: Request,
+    api_key: str,
+) -> JSONResponse:
+    prompt_clean = str(prompt or "").strip()
+    if not prompt_clean:
+        raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+    count = int(n or 1)
+    if count < 1 or count > 4:
+        raise HTTPException(status_code=400, detail="n must be between 1 and 4")
+
+    resolved_model = _resolve_request_model(raw_model, param_carrier, images=images)
+    canonical_model = get_canonical_model_name(resolved_model)
+    assert_api_key_model_allowed(
+        api_key,
+        resolved_model,
+        raw_model=raw_model,
+        canonical_model=canonical_model,
+        base_aliases=get_base_model_aliases(),
+    )
+    model_cfg = MODEL_CONFIG.get(resolved_model)
+    if not model_cfg or model_cfg.get("type") != "image":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{raw_model}' is not an image generation model",
+        )
+
+    request_base_url = _get_request_base_url(raw_request)
+    items: List[Dict[str, Any]] = []
+    for _ in range(count):
+        payload = _enrich_payload_with_direct_url(
+            _parse_handler_result(
+                await _collect_non_stream_result(
+                    resolved_model,
+                    prompt_clean,
+                    images,
+                    base_url_override=request_base_url,
+                    raw_request=raw_request,
+                )
+            )
+        )
+        if "error" in payload:
+            return _build_openai_json_response(payload)
+        items.append(
+            await _materialize_openai_image_item(
+                payload,
+                prompt=prompt_clean,
+                response_format=response_format,
+            )
+        )
+
+    return JSONResponse(
+        content={
+            "created": int(time.time()),
+            "model": canonical_model,
+            "data": items,
+        }
+    )
+
+
+@router.post("/v1/images/generations")
+async def create_image_generation(
+    request: OpenAIImageGenerationRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Standard OpenAI image generation endpoint (defaults to 16:9 + 2K)."""
+    try:
+        return await _run_openai_images_request(
+            raw_model=request.model or "gemini-3.1-flash-image",
+            prompt=request.prompt,
+            n=request.n,
+            response_format=request.response_format or "url",
+            param_carrier=request,
+            images=[],
+            raw_request=raw_request,
+            api_key=api_key,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/v1/images/edits")
+async def create_image_edit(
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Standard OpenAI image edit endpoint (supports multipart/form-data and JSON)."""
+    try:
+        content_type = (raw_request.headers.get("content-type") or "").lower()
+        images: List[bytes] = []
+        if "multipart/form-data" in content_type:
+            form = await raw_request.form()
+            raw_model = str(form.get("model") or "gemini-3.1-flash-image").strip()
+            prompt = str(form.get("prompt") or "")
+            n_raw = form.get("n")
+            try:
+                n_val = int(n_raw) if n_raw not in (None, "") else 1
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid n parameter")
+            response_format = str(form.get("response_format") or "url")
+            for field_name in ("image", "image[]", "images"):
+                for entry in form.getlist(field_name):
+                    if entry is not None and entry != "":
+                        images.append(await _decode_any_image_input(entry))
+            param_carrier = SimpleNamespace(
+                size=form.get("size"),
+                quality=form.get("quality"),
+                aspect_ratio=form.get("aspect_ratio") or form.get("aspectRatio"),
+                image_size=form.get("image_size")
+                or form.get("imageSize")
+                or form.get("resolution"),
+            )
+        else:
+            body = await raw_request.json()
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+            raw_model = str(body.get("model") or "gemini-3.1-flash-image").strip()
+            prompt = str(body.get("prompt") or "")
+            try:
+                n_val = int(body.get("n") or 1)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid n parameter")
+            response_format = str(body.get("response_format") or "url")
+            raw_imgs = body.get("images")
+            if isinstance(raw_imgs, list):
+                for item in raw_imgs:
+                    images.append(await _decode_any_image_input(item))
+            elif body.get("image"):
+                images.append(await _decode_any_image_input(body.get("image")))
+            param_carrier = body
+
+        if not images:
+            raise HTTPException(status_code=400, detail="At least one reference image is required")
+
+        return await _run_openai_images_request(
+            raw_model=raw_model,
+            prompt=prompt,
+            n=n_val,
+            response_format=response_format,
+            param_carrier=param_carrier,
+            images=images,
+            raw_request=raw_request,
+            api_key=api_key,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/v1/chat/completions")
@@ -1068,6 +1349,7 @@ async def create_chat_completion(
             api_key,
             normalized.model,
             raw_model=request.model,
+            canonical_model=get_canonical_model_name(normalized.model),
             base_aliases=get_base_model_aliases(),
         )
         if not normalized.prompt:
@@ -1114,10 +1396,12 @@ async def generate_content(
     """Gemini official generateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
+        canonical_model = get_canonical_model_name(normalized.model)
         assert_api_key_model_allowed(
             api_key,
             normalized.model,
             raw_model=model,
+            canonical_model=canonical_model,
             base_aliases=get_base_model_aliases(),
         )
         if not normalized.prompt:
@@ -1141,7 +1425,7 @@ async def generate_content(
             return _build_gemini_error_response_from_handler(payload)
 
         return JSONResponse(
-            content=await _build_gemini_success_payload(payload, normalized.model)
+            content=await _build_gemini_success_payload(payload, canonical_model)
         )
 
     except HTTPException as exc:
@@ -1168,10 +1452,12 @@ async def stream_generate_content(
     """Gemini official streamGenerateContent endpoint."""
     try:
         normalized = await _normalize_gemini_request(model, request)
+        canonical_model = get_canonical_model_name(normalized.model)
         assert_api_key_model_allowed(
             api_key,
             normalized.model,
             raw_model=model,
+            canonical_model=canonical_model,
             base_aliases=get_base_model_aliases(),
         )
         if not normalized.prompt:
@@ -1181,7 +1467,7 @@ async def stream_generate_content(
 
         return StreamingResponse(
             _iterate_gemini_stream(
-                normalized, normalized.model, request_base_url, raw_request=raw_request
+                normalized, canonical_model, request_base_url, raw_request=raw_request
             ),
             media_type="text/event-stream",
             headers={
@@ -1202,3 +1488,119 @@ async def stream_generate_content(
         )
 
 
+@router.post("/v1beta/models/{model}:predict")
+@router.post("/models/{model}:predict")
+async def predict_images(
+    model: str,
+    request: GeminiPredictRequest,
+    raw_request: Request,
+    api_key: str = Depends(verify_api_key_flexible),
+):
+    """Standard Google AI Studio / Vertex Imagen :predict endpoint."""
+    try:
+        if not request.instances:
+            raise HTTPException(status_code=400, detail="instances cannot be empty")
+        first = request.instances[0] if isinstance(request.instances[0], dict) else {}
+        prompt = str(first.get("prompt") or "").strip()
+        if not prompt:
+            raise HTTPException(status_code=400, detail="Prompt cannot be empty")
+
+        images: List[bytes] = []
+        img_field = first.get("image")
+        if isinstance(img_field, dict):
+            b64_val = img_field.get("bytesBase64Encoded") or img_field.get("bytes_base64_encoded")
+            if b64_val:
+                images.append(await _decode_any_image_input(b64_val))
+        elif isinstance(img_field, str) and img_field.strip():
+            images.append(await _decode_any_image_input(img_field))
+
+        params = request.parameters if isinstance(request.parameters, dict) else {}
+        raw_count = params.get("sampleCount") or params.get("sample_count") or 1
+        try:
+            sample_count = int(raw_count)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Invalid sampleCount parameter")
+        if sample_count < 1 or sample_count > 4:
+            raise HTTPException(status_code=400, detail="sampleCount must be between 1 and 4")
+
+        resolved_model = _resolve_request_model(model, request, images=images)
+        canonical_model = get_canonical_model_name(resolved_model)
+        assert_api_key_model_allowed(
+            api_key,
+            resolved_model,
+            raw_model=model,
+            canonical_model=canonical_model,
+            base_aliases=get_base_model_aliases(),
+        )
+        model_cfg = MODEL_CONFIG.get(resolved_model)
+        if not model_cfg or model_cfg.get("type") != "image":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model}' is not an image generation model",
+            )
+
+        request_base_url = _get_request_base_url(raw_request)
+        predictions: List[Dict[str, Any]] = []
+        for _ in range(sample_count):
+            payload = _enrich_payload_with_direct_url(
+                _parse_handler_result(
+                    await _collect_non_stream_result(
+                        resolved_model,
+                        prompt,
+                        images,
+                        base_url_override=request_base_url,
+                        raw_request=raw_request,
+                    )
+                )
+            )
+            if "error" in payload:
+                return _build_gemini_error_response_from_handler(payload)
+            url = _extract_url_from_openai_payload(payload)
+            if not url:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Image generation returned no image URL",
+                )
+            if url.startswith("data:image"):
+                mime_type, _ = _decode_data_url(url)
+                match = DATA_URL_RE.match(url)
+                if match:
+                    predictions.append(
+                        {
+                            "bytesBase64Encoded": match.group("data"),
+                            "mimeType": mime_type,
+                        }
+                    )
+                    continue
+            img_bytes = await retrieve_image_data(url)
+            if img_bytes:
+                mime_type = _detect_image_mime_type(
+                    img_bytes,
+                    fallback=_guess_mime_type(url, "image/png"),
+                )
+                predictions.append(
+                    {
+                        "bytesBase64Encoded": base64.b64encode(img_bytes).decode("ascii"),
+                        "mimeType": mime_type,
+                    }
+                )
+            else:
+                predictions.append(
+                    {
+                        "imageUri": url,
+                        "mimeType": _guess_mime_type(url, "image/png"),
+                    }
+                )
+
+        return JSONResponse(content={"predictions": predictions})
+
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=_build_gemini_error_payload(exc.status_code, str(exc.detail)),
+        )
+    except Exception as exc:
+        return JSONResponse(
+            status_code=500,
+            content=_build_gemini_error_payload(500, str(exc)),
+        )

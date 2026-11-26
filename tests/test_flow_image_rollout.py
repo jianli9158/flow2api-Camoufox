@@ -116,12 +116,23 @@ class ImageModelCatalogTests(unittest.TestCase):
             self.assertEqual(counterpart["model_name"], "HARBOR_SEAL")
             self.assertEqual(entry["aspect_ratio"], counterpart["aspect_ratio"])
             self.assertEqual(entry.get("upsample"), counterpart.get("upsample"))
-            self.assertTrue(entry["listed"])
-            self.assertTrue(counterpart["listed"])
+            self.assertFalse(entry["listed"])
+            self.assertFalse(counterpart["listed"])
         openai = {entry["id"] for entry in _get_openai_model_catalog()}
         gemini = _get_gemini_model_catalog()
-        self.assertTrue(set(primary) | set(lite) <= openai)
-        self.assertTrue(set(primary) | set(lite) <= set(gemini))
+        canonical_images = {
+            "gemini-3.1-flash-image",
+            "gemini-3.1-flash-lite-image",
+            "gemini-3.0-pro-image",
+        }
+        self.assertTrue(canonical_images <= openai)
+        self.assertTrue(canonical_images <= set(gemini))
+        self.assertTrue(set(primary).isdisjoint(openai))
+        self.assertTrue(set(lite).isdisjoint(openai))
+        self.assertEqual(
+            MODEL_CONFIG["gemini-3.0-pro-image"]["upsample"],
+            "UPSAMPLE_IMAGE_RESOLUTION_2K",
+        )
         self.assertEqual(
             MODEL_CONFIG["gemini-3.0-pro-image-landscape"]["model_name"], "GEM_PIX_2"
         )
@@ -134,24 +145,36 @@ class ImageModelCatalogTests(unittest.TestCase):
         for name, entry in pro.items():
             self.assertEqual(entry["model_name"], "GEM_PIX_2")
             self.assertEqual(entry["display_name"], "Nano Banana Pro")
-            self.assertTrue(entry["listed"])
-        self.assertTrue(set(pro) <= openai)
-        self.assertTrue(set(pro) <= set(gemini))
+            self.assertFalse(entry["listed"])
+        self.assertTrue(set(pro).isdisjoint(openai))
+        self.assertTrue(set(pro).isdisjoint(set(gemini)))
 
     def test_nano_banana_friendly_aliases_resolve_to_current_catalog(self):
+        # Default omits params -> 16:9 (landscape) + 2K
         self.assertEqual(
             resolve_model_name("nano-banana-2.1", model_config=MODEL_CONFIG),
-            "gemini-3.1-flash-image-landscape",
+            "gemini-3.1-flash-image-landscape-2k",
         )
         self.assertEqual(
             resolve_model_name("nano-banana-2-lite", model_config=MODEL_CONFIG),
-            "gemini-3.1-flash-lite-image-landscape",
+            "gemini-3.1-flash-lite-image-landscape-2k",
         )
         self.assertEqual(
             resolve_model_name("nano-banana-pro", model_config=MODEL_CONFIG),
-            "gemini-3.0-pro-image-landscape",
+            "gemini-3.0-pro-image-landscape-2k",
         )
-
+        self.assertEqual(
+            resolve_model_name("gemini-3-pro-image", model_config=MODEL_CONFIG),
+            "gemini-3.0-pro-image-landscape-2k",
+        )
+        # Explicit 1K opts down to standard non-upsampled variant
+        req_1k = types.SimpleNamespace(
+            generationConfig=types.SimpleNamespace(imageSize="1K")
+        )
+        self.assertEqual(
+            resolve_model_name("gemini-3.1-flash-image", request=req_1k, model_config=MODEL_CONFIG),
+            "gemini-3.1-flash-image-landscape",
+        )
     def test_catalog_only_references_current_image_fields(self):
         self.assertEqual(
             {

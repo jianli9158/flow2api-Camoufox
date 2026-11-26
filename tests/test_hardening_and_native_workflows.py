@@ -815,8 +815,8 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         "key_value": img_key,
                         "is_active": True,
                         "allow_all_models": False,
-                        "allowed_models": ["gemini-3.1-flash-image-landscape"],
-                        "remark": "Only 1K landscape",
+                        "allowed_models": ["gemini-3.1-flash-image"],
+                        "remark": "Only Flash Image",
                     },
                 )
                 self.assertEqual(create_img_key.status_code, 200)
@@ -829,7 +829,7 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                         "key_value": wild_key,
                         "is_active": True,
                         "allow_all_models": False,
-                        "allowed_models": ["gemini-3.1-flash-image-*", "macaron_cookie_r2v_8s_relaxed"],
+                        "allowed_models": ["gemini-3.1-flash-image*", "macaron_cookie_r2v_8s_relaxed"],
                     },
                 )
                 self.assertEqual(create_wild_key.status_code, 200)
@@ -841,29 +841,29 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(dup.status_code, 400)
 
-                # Master key sees full catalog
+                # Master key sees full 10-model canonical catalog
                 master_models = tc.get(
                     "/v1/models", headers={"Authorization": f"Bearer {master_key}"}
                 )
                 self.assertEqual(master_models.status_code, 200)
-                self.assertGreater(len(master_models.json()["data"]), 10)
+                self.assertEqual(len(master_models.json()["data"]), 10)
 
-                # Restricted key A sees ONLY gemini-3.1-flash-image-landscape on OpenAI & Gemini
+                # Restricted key A sees ONLY gemini-3.1-flash-image on OpenAI & Gemini
                 key_a_hdr = {"Authorization": f"Bearer {img_key}"}
                 a_models = tc.get("/v1/models", headers=key_a_hdr)
                 self.assertEqual(a_models.status_code, 200)
                 self.assertEqual(
                     [m["id"] for m in a_models.json()["data"]],
-                    ["gemini-3.1-flash-image-landscape"],
+                    ["gemini-3.1-flash-image"],
                 )
                 a_gem = tc.get("/v1beta/models", headers={"x-goog-api-key": img_key})
                 self.assertEqual(a_gem.status_code, 200)
                 self.assertEqual(
                     [m["name"] for m in a_gem.json()["models"]],
-                    ["models/gemini-3.1-flash-image-landscape"],
+                    ["models/gemini-3.1-flash-image"],
                 )
                 a_hidden = tc.get(
-                    "/v1beta/models/gemini-3.0-pro-image-landscape",
+                    "/v1beta/models/gemini-3.0-pro-image",
                     headers={"x-goog-api-key": img_key},
                 )
                 self.assertEqual(a_hidden.status_code, 404)
@@ -873,7 +873,7 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                     "/v1/chat/completions",
                     headers=key_a_hdr,
                     json={
-                        "model": "gemini-3.1-flash-image-landscape-4k",
+                        "model": "gemini-3.0-pro-image",
                         "messages": [{"role": "user", "content": "cat"}],
                     },
                 )
@@ -881,13 +881,12 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 gh_mock.handle_generation.assert_not_called()
 
                 a_gem_deny = tc.post(
-                    "/v1beta/models/gemini-3.0-pro-image-landscape:generateContent",
+                    "/v1beta/models/gemini-3.0-pro-image:generateContent",
                     headers={"x-goog-api-key": img_key},
                     json={"contents": [{"parts": [{"text": "cat"}]}]},
                 )
                 self.assertEqual(a_gem_deny.status_code, 403)
                 self.assertEqual(a_gem_deny.json()["error"]["status"], "PERMISSION_DENIED")
-
                 a_flow_vid_deny = tc.post(
                     "/v1/flow/videos",
                     headers=key_a_hdr,
@@ -954,6 +953,230 @@ class HardeningAndWorkflowTests(unittest.IsolatedAsyncioTestCase):
                 mcp_routes._flow_feature_service = prev_mcp_svc
                 mcp_routes._generation_handler = prev_mcp_gh
                 await db.close()
+
+    async def test_canonical_catalog_default_16_9_2k_and_standard_openai_gemini_endpoints(self):
+        import base64
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from src.api import routes
+        from src.core.auth import AuthManager
+        from src.core.config import config
+        from src.core.model_catalog import MODEL_CONFIG
+        from src.core.model_resolver import resolve_model_name
+        from src.core.models import APIKeyRecord
+
+        # 1. Pure resolver contract: defaults (16:9 + 2K), explicit 1K/4K, AI Studio ratio snapping, video duration/resolution
+        self.assertEqual(
+            resolve_model_name("gemini-3.1-flash-image", model_config=MODEL_CONFIG),
+            "gemini-3.1-flash-image-landscape-2k",
+        )
+        self.assertEqual(
+            resolve_model_name("gemini-3-pro-image", model_config=MODEL_CONFIG),
+            "gemini-3.0-pro-image-landscape-2k",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "gemini-3.1-flash-image",
+                request={"generationConfig": {"imageConfig": {"aspectRatio": "9:16"}}},
+                model_config=MODEL_CONFIG,
+            ),
+            "gemini-3.1-flash-image-portrait-2k",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "gemini-3.1-flash-image",
+                request={"generationConfig": {"imageConfig": {"aspectRatio": "1:1", "imageSize": "1K"}}},
+                model_config=MODEL_CONFIG,
+            ),
+            "gemini-3.1-flash-image-square",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "gemini-3.1-flash-image",
+                request={"generationConfig": {"imageConfig": {"aspectRatio": "3:2", "imageSize": "4K"}}},
+                model_config=MODEL_CONFIG,
+            ),
+            "gemini-3.1-flash-image-four-three-4k",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "gemini-3.1-flash-image",
+                request={"size": "1024x1792", "quality": "standard"},
+                model_config=MODEL_CONFIG,
+            ),
+            "gemini-3.1-flash-image-portrait",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "veo-3.1-lite",
+                request={"generationConfig": {"videoConfig": {"aspectRatio": "9:16", "durationSeconds": 4, "resolution": "1080p"}}},
+                model_config=MODEL_CONFIG,
+            ),
+            "veo-3.1-lite-4s-portrait-1080p",
+        )
+        self.assertEqual(
+            resolve_model_name(
+                "omni-1.2-flash",
+                request={"duration": "15s", "resolution": "360p", "aspectRatio": "16:9"},
+                model_config=MODEL_CONFIG,
+            ),
+            "omni-1.2-flash-15s-landscape-360p",
+        )
+
+        # 2. HTTP integration: /v1/models, /v1beta/models, /v1/images/generations, /v1/images/edits, :generateContent, :predict
+        prev_api_key = config.api_key
+        prev_keys = AuthManager._managed_api_keys
+        prev_gh = routes.generation_handler
+        captured_calls = []
+        png_1x1 = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jNekAAAAASUVORK5CYII="
+        )
+        data_url_png = "data:image/png;base64," + base64.b64encode(png_1x1).decode("ascii")
+
+        async def _fake_handle_generation(**kwargs):
+            captured_calls.append(kwargs)
+            yield json.dumps(
+                {
+                    "id": "gen-1",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": f"![Generated Image]({data_url_png})",
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            )
+
+        try:
+            master_key = "master-std-api"
+            scoped_key = "sk-scoped-flash-only"
+            config.api_key = master_key
+            AuthManager.set_api_keys(
+                [
+                    APIKeyRecord(
+                        id=1,
+                        name="Flash Only",
+                        key_value=scoped_key,
+                        is_active=True,
+                        allow_all_models=False,
+                        allowed_models=["gemini-3.1-flash-image"],
+                    )
+                ]
+            )
+            gh = MagicMock()
+            gh.handle_generation = _fake_handle_generation
+            routes.set_generation_handler(gh)
+
+            app = FastAPI()
+            app.include_router(routes.router)
+            tc = TestClient(app)
+
+            # /v1/models returns 10 canonical models with default_parameters & supported_parameters
+            r_models = tc.get("/v1/models", headers={"Authorization": f"Bearer {master_key}"})
+            self.assertEqual(r_models.status_code, 200)
+            data = r_models.json()["data"]
+            self.assertEqual(len(data), 10)
+            flash_entry = next(m for m in data if m["id"] == "gemini-3.1-flash-image")
+            self.assertEqual(
+                flash_entry["default_parameters"],
+                {"aspectRatio": "16:9", "imageSize": "2K"},
+            )
+            self.assertEqual(
+                flash_entry["supported_parameters"]["aspectRatio"],
+                ["16:9", "9:16", "1:1", "4:3", "3:4"],
+            )
+
+            # GET /v1beta/models/gemini-3-pro-image resolves AI Studio alias cleanly
+            r_gem_one = tc.get(
+                "/v1beta/models/gemini-3-pro-image",
+                headers={"x-goog-api-key": master_key},
+            )
+            self.assertEqual(r_gem_one.status_code, 200)
+            self.assertEqual(r_gem_one.json()["name"], "models/gemini-3.0-pro-image")
+            self.assertIn("predict", r_gem_one.json()["supportedGenerationMethods"])
+
+            # POST /v1/images/generations (omitting ratio & size -> default 16:9 + 2K)
+            r_img_def = tc.post(
+                "/v1/images/generations",
+                headers={"Authorization": f"Bearer {scoped_key}"},
+                json={"model": "gemini-3.1-flash-image", "prompt": "a sunset"},
+            )
+            self.assertEqual(r_img_def.status_code, 200)
+            self.assertEqual(r_img_def.json()["model"], "gemini-3.1-flash-image")
+            self.assertEqual(captured_calls[-1]["model"], "gemini-3.1-flash-image-landscape-2k")
+
+            # POST /v1/images/generations with aspect_ratio=9:16, image_size=4K, response_format=b64_json
+            r_img_b64 = tc.post(
+                "/v1/images/generations",
+                headers={"Authorization": f"Bearer {scoped_key}"},
+                json={
+                    "model": "gemini-3.1-flash-image-preview",
+                    "prompt": "vertical neon city",
+                    "aspect_ratio": "9:16",
+                    "image_size": "4K",
+                    "response_format": "b64_json",
+                },
+            )
+            self.assertEqual(r_img_b64.status_code, 200)
+            self.assertEqual(captured_calls[-1]["model"], "gemini-3.1-flash-image-portrait-4k")
+            self.assertTrue(r_img_b64.json()["data"][0]["b64_json"])
+
+            # Scoped key blocked from calling gemini-3.0-pro-image on /v1/images/generations
+            r_img_deny = tc.post(
+                "/v1/images/generations",
+                headers={"Authorization": f"Bearer {scoped_key}"},
+                json={"model": "gemini-3.0-pro-image", "prompt": "blocked"},
+            )
+            self.assertEqual(r_img_deny.status_code, 403)
+
+            # POST /v1/images/edits (multipart upload)
+            r_edit = tc.post(
+                "/v1/images/edits",
+                headers={"Authorization": f"Bearer {scoped_key}"},
+                data={"model": "gemini-3.1-flash-image", "prompt": "add rain", "aspect_ratio": "1:1", "image_size": "1K"},
+                files={"image": ("ref.png", png_1x1, "image/png")},
+            )
+            self.assertEqual(r_edit.status_code, 200)
+            self.assertEqual(captured_calls[-1]["model"], "gemini-3.1-flash-image-square")
+            self.assertEqual(captured_calls[-1]["images"], [png_1x1])
+
+            # POST /v1beta/models/gemini-3.1-flash-image:generateContent returns clean modelVersion
+            r_gem_gen = tc.post(
+                "/v1beta/models/gemini-3.1-flash-image:generateContent",
+                headers={"x-goog-api-key": scoped_key},
+                json={
+                    "contents": [{"role": "user", "parts": [{"text": "minimalist chair"}]}],
+                    "generationConfig": {"imageConfig": {"aspectRatio": "4:3"}},
+                },
+            )
+            self.assertEqual(r_gem_gen.status_code, 200)
+            self.assertEqual(r_gem_gen.json()["modelVersion"], "gemini-3.1-flash-image")
+            self.assertEqual(captured_calls[-1]["model"], "gemini-3.1-flash-image-four-three-2k")
+
+            # POST /v1beta/models/gemini-3.1-flash-image:predict (standard Imagen REST format)
+            r_pred = tc.post(
+                "/v1beta/models/gemini-3.1-flash-image:predict",
+                headers={"x-goog-api-key": scoped_key},
+                json={
+                    "instances": [{"prompt": "aurora borealis"}],
+                    "parameters": {"aspectRatio": "3:4", "imageSize": "2K", "sampleCount": 2},
+                },
+            )
+            self.assertEqual(r_pred.status_code, 200)
+            preds = r_pred.json()["predictions"]
+            self.assertEqual(len(preds), 2)
+            self.assertEqual(preds[0]["mimeType"], "image/png")
+            self.assertTrue(preds[0]["bytesBase64Encoded"])
+            self.assertEqual(captured_calls[-1]["model"], "gemini-3.1-flash-image-three-four-2k")
+        finally:
+            config.api_key = prev_api_key
+            AuthManager._managed_api_keys = prev_keys
+            routes.generation_handler = prev_gh
 
 
 if __name__ == "__main__":

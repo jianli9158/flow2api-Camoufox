@@ -171,23 +171,41 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
             cfg["upsample"] = upsample
         return cfg
 
-    # 1. Public image families (45 listed variants)
+    # 1. Canonical public image models (default 16:9 + 2K; controlled via aspectRatio & imageSize)
+    #    All 45 legacy ratio/resolution suffixed variants stay registered as hidden aliases.
+    image_default_params: Dict[str, Any] = {
+        "default_aspect_ratio": "16:9",
+        "supported_aspect_ratios": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+        "default_image_size": "2K",
+        "supported_image_sizes": ["1K", "2K", "4K"],
+    }
     for prefix, upstream_name, display_name in (
-        ("gemini-3.0-pro-image", "GEM_PIX_2", "Nano Banana Pro"),
         ("gemini-3.1-flash-image", "BELUGA", "Nano Banana 2.1"),
         ("gemini-3.1-flash-lite-image", "HARBOR_SEAL", "Nano Banana 2 Lite"),
+        ("gemini-3.0-pro-image", "GEM_PIX_2", "Nano Banana Pro"),
     ):
+        register(
+            prefix,
+            {
+                "type": "image",
+                "model_name": upstream_name,
+                "aspect_ratio": "IMAGE_ASPECT_RATIO_LANDSCAPE",
+                "upsample": "UPSAMPLE_IMAGE_RESOLUTION_2K",
+                **image_default_params,
+            },
+            f"{display_name} · 16:9 / 9:16 / 1:1 / 4:3 / 3:4 · 1K / 2K / 4K",
+        )
         for suffix, upsample_enum in IMAGE_UPSAMPLE_TIERS:
             for ratio_slug, ratio_enum in IMAGE_ASPECT_RATIOS:
                 entry: Dict[str, Any] = {
                     "type": "image",
                     "model_name": upstream_name,
                     "aspect_ratio": ratio_enum,
+                    "display_name": display_name,
                 }
                 if upsample_enum:
                     entry["upsample"] = upsample_enum
-                register(f"{prefix}-{ratio_slug}{suffix}", entry, display_name)
-
+                register_hidden(f"{prefix}-{ratio_slug}{suffix}", entry)
     # 2. Hidden legacy Veo 3.1 Lite & Omni shorthand aliases
     for orientation, ratio in (("portrait", VIDEO_PORTRAIT), ("landscape", VIDEO_LANDSCAPE)):
         register_hidden(f"veo_3_1_t2v_lite_{orientation}", t2v("veo_3_1_t2v_lite", ratio))
@@ -257,7 +275,7 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
         omni_cfg("macaron_cookie", 8, VIDEO_PORTRAIT, display_label="Omni 1.2 Flash"),
     )
 
-    # 3. Public Veo 3.1 Lite T2V
+    # 3. Legacy Veo 3.1 Lite T2V suffixed variants (hidden; canonical `veo-3.1-lite` listed below)
     for seconds, key in (
         (4, "veo_3_1_t2v_lite_4s"),
         (6, "veo_3_1_t2v_lite_6s"),
@@ -266,11 +284,10 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
         for orientation, ratio in (("landscape", VIDEO_LANDSCAPE), ("portrait", VIDEO_PORTRAIT)):
             model_id = f"veo-3.1-lite-{seconds}s-{orientation}"
             cfg = t2v(key, ratio)
-            register(model_id, cfg, f"Veo 3.1 - Lite · {seconds}s · {orientation}")
+            register_hidden(model_id, {**cfg, "display_name": f"Veo 3.1 - Lite · {seconds}s · {orientation}"})
             register_hidden_upsamples(model_id, cfg)
 
-    # 4. Omni 1.2 Flash (macaron_cookie) 3s-15s
-    omni_12_public_durations = {4, 6, 8, 10, 15}
+    # 4. Legacy Omni 1.2 Flash (macaron_cookie) 3s-15s suffixed variants (hidden; canonical models listed below)
     for seconds in range(3, 16):
         for orientation, ratio in (("landscape", VIDEO_LANDSCAPE), ("portrait", VIDEO_PORTRAIT)):
             cfg_720 = omni_cfg("macaron_cookie", seconds, ratio, display_label="Omni 1.2 Flash")
@@ -279,16 +296,11 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
             )
             model_id = f"omni-1.2-flash-{seconds}s-{orientation}"
             model_id_360 = f"{model_id}-360p"
-            if seconds in omni_12_public_durations:
-                register(model_id, cfg_720, f"Omni 1.2 Flash · {seconds}s · {orientation}")
-                register(
-                    model_id_360,
-                    cfg_360,
-                    f"Omni 1.2 Flash · {seconds}s · {orientation} · 360p",
-                )
-            else:
-                register_hidden(model_id, cfg_720)
-                register_hidden(model_id_360, cfg_360)
+            register_hidden(model_id, {**cfg_720, "display_name": f"Omni 1.2 Flash · {seconds}s · {orientation}"})
+            register_hidden(
+                model_id_360,
+                {**cfg_360, "display_name": f"Omni 1.2 Flash · {seconds}s · {orientation} · 360p"},
+            )
             register_hidden_upsamples(model_id, cfg_720)
 
             if seconds <= 10:
@@ -308,10 +320,7 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
                     "video_resolution": "360p",
                 }
             i2v_id = f"omni-1.2-flash-i2v-{seconds}s-{orientation}"
-            if seconds in omni_12_public_durations:
-                register(i2v_id, i2v_720, f"Omni 1.2 Flash I2V · {seconds}s · {orientation}")
-            else:
-                register_hidden(i2v_id, i2v_720)
+            register_hidden(i2v_id, {**i2v_720, "display_name": f"Omni 1.2 Flash I2V · {seconds}s · {orientation}"})
             register_hidden(f"{i2v_id}-360p", i2v_360)
             register_hidden_upsamples(i2v_id, i2v_720)
 
@@ -322,15 +331,12 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
                     "video_resolution": "360p",
                 }
                 ext_id = f"omni-1.2-flash-extend-{seconds}s-{orientation}"
-                if seconds in (4, 6, 8, 10):
-                    register(
-                        ext_id, ext_720, f"Omni 1.2 Flash Extend · {seconds}s · {orientation}"
-                    )
-                else:
-                    register_hidden(ext_id, ext_720)
+                register_hidden(
+                    ext_id,
+                    {**ext_720, "display_name": f"Omni 1.2 Flash Extend · {seconds}s · {orientation}"},
+                )
                 register_hidden(f"{ext_id}-360p", ext_360)
                 register_hidden_upsamples(ext_id, ext_720)
-
         # Hidden raw upstream usage key aliases
         register_hidden(
             f"macaron_cookie_t2v_{seconds}s",
@@ -433,7 +439,7 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
         )
         register_hidden_upsamples(f"omni-1.2-flash-extend-{orientation}", ext_8)
 
-    # 5. Public Veo 3.1 Lite I2V, R2V, Extend & defaults
+    # 5. Legacy Veo 3.1 Lite I2V, R2V, Extend suffixed variants (hidden)
     for seconds, start_key, fl_key in (
         (4, "veo_3_1_i2v_s_lite_4s", "veo_3_1_i2v_s_lite_4s_fl"),
         (6, "veo_3_1_i2v_s_lite_6s", "veo_3_1_i2v_s_lite_6s_fl"),
@@ -442,36 +448,105 @@ def _build_model_catalog() -> Dict[str, Dict[str, Any]]:
         for orientation, ratio in (("landscape", VIDEO_LANDSCAPE), ("portrait", VIDEO_PORTRAIT)):
             i2v_id = f"veo-3.1-lite-i2v-{seconds}s-{orientation}"
             i2v_cfg = {**i2v(fl_key, ratio), "start_frame_model_key": start_key}
-            register(i2v_id, i2v_cfg, f"Veo 3.1 - Lite I2V · {seconds}s · {orientation}")
+            register_hidden(i2v_id, {**i2v_cfg, "display_name": f"Veo 3.1 - Lite I2V · {seconds}s · {orientation}"})
             register_hidden_upsamples(i2v_id, i2v_cfg)
 
     for orientation, ratio in (("landscape", VIDEO_LANDSCAPE), ("portrait", VIDEO_PORTRAIT)):
         r2v_id = f"veo-3.1-lite-r2v-8s-{orientation}"
         r2v_cfg = r2v("veo_3_1_r2v_lite", ratio)
-        register(r2v_id, r2v_cfg, f"Veo 3.1 - Lite R2V · 8s · {orientation}")
+        register_hidden(r2v_id, {**r2v_cfg, "display_name": f"Veo 3.1 - Lite R2V · 8s · {orientation}"})
         register_hidden_upsamples(r2v_id, r2v_cfg)
         ext_id = f"veo-3.1-lite-extend-8s-{orientation}"
         ext_cfg = extend("veo_3_1_extension_lite", ratio)
-        register(ext_id, ext_cfg, f"Veo 3.1 - Lite Extend · {orientation}")
+        register_hidden(ext_id, {**ext_cfg, "display_name": f"Veo 3.1 - Lite Extend · {orientation}"})
         register_hidden_upsamples(ext_id, ext_cfg)
 
-    lite_default_cfg = t2v("veo_3_1_t2v_lite", VIDEO_LANDSCAPE)
-    register("veo-3.1-lite", lite_default_cfg, "Veo 3.1 - Lite · 8s · landscape")
-    register_hidden_upsamples("veo-3.1-lite", lite_default_cfg)
+    # 6. Canonical public video models (7 models; controlled via aspectRatio, durationSeconds, resolution)
+    veo_common_params: Dict[str, Any] = {
+        "default_aspect_ratio": "16:9",
+        "supported_aspect_ratios": ["16:9", "9:16"],
+        "default_duration": 8,
+        "default_resolution": "720p",
+        "supported_resolutions": ["720p", "1080p", "4K"],
+    }
+    omni_common_params: Dict[str, Any] = {
+        "default_aspect_ratio": "16:9",
+        "supported_aspect_ratios": ["16:9", "9:16"],
+        "default_duration": 8,
+        "default_resolution": "720p",
+        "supported_resolutions": ["360p", "720p", "1080p", "4K"],
+    }
 
-    omni_12_default_cfg = omni_cfg(
-        "macaron_cookie", 8, VIDEO_LANDSCAPE, display_label="Omni 1.2 Flash"
+    lite_default_cfg = {
+        **t2v("veo_3_1_t2v_lite", VIDEO_LANDSCAPE),
+        **veo_common_params,
+        "supported_durations": [4, 6, 8],
+    }
+    register("veo-3.1-lite", lite_default_cfg, "Veo 3.1 Lite · 16:9 / 9:16 · 4s / 6s / 8s · 720p / 1080p / 4K")
+    register_hidden_upsamples("veo-3.1-lite", t2v("veo_3_1_t2v_lite", VIDEO_LANDSCAPE))
+
+    lite_i2v_default_cfg = {
+        **i2v("veo_3_1_interpolation_lite", VIDEO_LANDSCAPE),
+        "start_frame_model_key": "veo_3_1_i2v_lite",
+        **veo_common_params,
+        "supported_durations": [4, 6, 8],
+    }
+    register("veo-3.1-lite-i2v", lite_i2v_default_cfg, "Veo 3.1 Lite I2V · 16:9 / 9:16 · 4s / 6s / 8s · 720p / 1080p / 4K")
+    register_hidden_upsamples("veo-3.1-lite-i2v", {**i2v("veo_3_1_interpolation_lite", VIDEO_LANDSCAPE), "start_frame_model_key": "veo_3_1_i2v_lite"})
+
+    lite_r2v_default_cfg = {
+        **r2v("veo_3_1_r2v_lite", VIDEO_LANDSCAPE),
+        **veo_common_params,
+        "supported_durations": [8],
+    }
+    register("veo-3.1-lite-r2v", lite_r2v_default_cfg, "Veo 3.1 Lite R2V · 16:9 / 9:16 · 8s · 720p / 1080p / 4K")
+    register_hidden_upsamples("veo-3.1-lite-r2v", r2v("veo_3_1_r2v_lite", VIDEO_LANDSCAPE))
+
+    lite_ext_default_cfg = {
+        **extend("veo_3_1_extension_lite", VIDEO_LANDSCAPE),
+        **veo_common_params,
+        "supported_durations": [8],
+    }
+    register("veo-3.1-lite-extend", lite_ext_default_cfg, "Veo 3.1 Lite Extend · 16:9 / 9:16 · 8s · 720p / 1080p / 4K")
+    register_hidden_upsamples("veo-3.1-lite-extend", extend("veo_3_1_extension_lite", VIDEO_LANDSCAPE))
+
+    omni_12_default_cfg = {
+        **omni_cfg("macaron_cookie", 8, VIDEO_LANDSCAPE, display_label="Omni 1.2 Flash"),
+        **omni_common_params,
+        "supported_durations": list(range(3, 16)),
+    }
+    register("omni-1.2-flash", omni_12_default_cfg, "Omni 1.2 Flash · 16:9 / 9:16 · 3s-15s · 360p / 720p / 1080p / 4K")
+    register_hidden_upsamples(
+        "omni-1.2-flash",
+        omni_cfg("macaron_cookie", 8, VIDEO_LANDSCAPE, display_label="Omni 1.2 Flash"),
     )
-    register("omni-1.2-flash", omni_12_default_cfg, "Omni 1.2 Flash · 8s · landscape")
-    register_hidden_upsamples("omni-1.2-flash", omni_12_default_cfg)
-    register(
+    register_hidden(
         "omni-1.2-flash-360p",
-        omni_cfg(
-            "macaron_cookie", 8, VIDEO_LANDSCAPE, display_label="Omni 1.2 Flash", resolution="360p"
-        ),
-        "Omni 1.2 Flash · 8s · landscape · 360p",
+        {
+            **omni_cfg("macaron_cookie", 8, VIDEO_LANDSCAPE, display_label="Omni 1.2 Flash", resolution="360p"),
+            "display_name": "Omni 1.2 Flash · 8s · landscape · 360p",
+        },
     )
 
+    omni_i2v_default_cfg = {
+        **i2v("macaron_cookie_i2v_fl_8s", VIDEO_LANDSCAPE, max_images=2),
+        "start_frame_model_key": "macaron_cookie_i2v_8s",
+        **omni_common_params,
+        "supported_durations": list(range(3, 16)),
+    }
+    register("omni-1.2-flash-i2v", omni_i2v_default_cfg, "Omni 1.2 Flash I2V · 16:9 / 9:16 · 3s-15s · 360p / 720p / 1080p / 4K")
+    register_hidden_upsamples(
+        "omni-1.2-flash-i2v",
+        {**i2v("macaron_cookie_i2v_fl_8s", VIDEO_LANDSCAPE, max_images=2), "start_frame_model_key": "macaron_cookie_i2v_8s"},
+    )
+
+    omni_ext_default_cfg = {
+        **extend("macaron_cookie_extend_8s", VIDEO_LANDSCAPE),
+        **omni_common_params,
+        "supported_durations": list(range(3, 11)),
+    }
+    register("omni-1.2-flash-extend", omni_ext_default_cfg, "Omni 1.2 Flash Extend · 16:9 / 9:16 · 3s-10s · 360p / 720p / 1080p / 4K")
+    register_hidden_upsamples("omni-1.2-flash-extend", extend("macaron_cookie_extend_8s", VIDEO_LANDSCAPE))
     return catalog
 
 

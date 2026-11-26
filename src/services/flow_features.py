@@ -1477,25 +1477,36 @@ class FlowFeatureService:
         image_models: List[Dict[str, Any]] = []
         video_models: List[Dict[str, Any]] = []
         for alias, cfg in MODEL_CONFIG.items():
+            if not cfg.get("listed", True):
+                continue
             supported = supports_model_for_tier(alias, tier)
-            item = {
+            item: Dict[str, Any] = {
                 "id": alias,
+                "displayName": cfg.get("display_name") or alias,
                 "type": cfg.get("type"),
-                "aspectRatio": cfg.get("aspect_ratio"),
+                "defaultAspectRatio": cfg.get("default_aspect_ratio", "16:9"),
+                "supportedAspectRatios": list(
+                    cfg.get("supported_aspect_ratios") or ["16:9", "9:16"]
+                ),
                 "supported": supported,
             }
             if cfg.get("type") == "image":
                 item["upstreamModel"] = cfg.get("model_name")
-                if cfg.get("upsample"):
-                    item["upsample"] = cfg.get("upsample")
+                item["defaultImageSize"] = cfg.get("default_image_size", "2K")
+                item["supportedImageSizes"] = list(
+                    cfg.get("supported_image_sizes") or ["1K", "2K", "4K"]
+                )
                 image_models.append(item)
             else:
                 item["upstreamModel"] = cfg.get("model_key")
                 item["videoType"] = cfg.get("video_type")
-                if cfg.get("video_resolution"):
-                    item["resolution"] = cfg.get("video_resolution")
+                item["defaultDurationSeconds"] = cfg.get("default_duration", 8)
+                item["supportedDurations"] = list(cfg.get("supported_durations") or [8])
+                item["defaultResolution"] = cfg.get("default_resolution", "720p")
+                item["supportedResolutions"] = list(
+                    cfg.get("supported_resolutions") or ["720p", "1080p", "4K"]
+                )
                 video_models.append(item)
-
         return {
             "tokenId": token.id,
             "email": token.email,

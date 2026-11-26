@@ -162,6 +162,51 @@
                                 <textarea id="promptInput" rows="4" class="input" placeholder="描述你想生成的内容..." data-i18n-placeholder="描述你想生成的内容...">一只可爱的橘猫趴在窗台上晒太阳，窗外是樱花盛开的春天</textarea>
                             </div>
 
+                            <div id="imageParamsGroup" class="field-grid-2" style="display:none;">
+                                <div class="field">
+                                    <label for="paramAspectRatio"><span data-i18n="画面比例 (Aspect Ratio)">画面比例 (Aspect Ratio)</span></label>
+                                    <select id="paramAspectRatio" class="input">
+                                        <option value="16:9" selected>16:9 (Landscape)</option>
+                                        <option value="9:16">9:16 (Portrait)</option>
+                                        <option value="1:1">1:1 (Square)</option>
+                                        <option value="4:3">4:3</option>
+                                        <option value="3:4">3:4</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label for="paramImageSize"><span data-i18n="清晰度 (Image Size)">清晰度 (Image Size)</span></label>
+                                    <select id="paramImageSize" class="input">
+                                        <option value="2K" selected>2K</option>
+                                        <option value="1K">1K</option>
+                                        <option value="4K">4K</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <div id="videoParamsGroup" class="field-grid-3" style="display:none;">
+                                <div class="field">
+                                    <label for="paramVideoAspectRatio"><span data-i18n="画面比例 (Aspect Ratio)">画面比例 (Aspect Ratio)</span></label>
+                                    <select id="paramVideoAspectRatio" class="input">
+                                        <option value="16:9" selected>16:9 (Landscape)</option>
+                                        <option value="9:16">9:16 (Portrait)</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label for="paramVideoDuration"><span data-i18n="视频时长 (Duration)">视频时长 (Duration)</span></label>
+                                    <select id="paramVideoDuration" class="input">
+                                        <option value="8" selected>8s</option>
+                                    </select>
+                                </div>
+                                <div class="field">
+                                    <label for="paramVideoResolution"><span data-i18n="视频分辨率 (Resolution)">视频分辨率 (Resolution)</span></label>
+                                    <select id="paramVideoResolution" class="input">
+                                        <option value="720p" selected>720p</option>
+                                        <option value="1080p">1080p</option>
+                                        <option value="4K">4K</option>
+                                    </select>
+                                </div>
+                            </div>
+
                             <div class="field" id="videoSourceGroup" style="display:none;">
                                 <label for="videoMediaId"><span data-i18n="源视频媒体 ID">源视频媒体 ID</span></label>
                                 <input type="text" id="videoMediaId" class="input mono-id" placeholder="输入源视频的 mediaGenerationId" data-i18n-placeholder="输入源视频的 mediaGenerationId" autocomplete="off">
@@ -462,37 +507,25 @@ const MODEL_CATEGORIES = {
 };
 
 const FALLBACK_MODELS = {
-  "gemini-3.1-flash-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "gemini-3.1-flash-lite-image": "Nano Banana 2 Lite - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "gemini-3.0-pro-image": "Image generation (alias) - aspects: landscape, portrait, square, four-three, three-four; sizes: 2k, 4k",
-  "omni-1.2-flash": "Video generation - Omni 1.2 Flash 8s landscape, optional reference images",
-  "omni-1.2-flash-360p": "Video generation - Omni 1.2 Flash 8s landscape 360p, optional reference images",
-  "omni-1.2-flash-4s-landscape": "Video generation - Omni 1.2 Flash 4s landscape",
-  "omni-1.2-flash-4s-portrait": "Video generation - Omni 1.2 Flash 4s portrait",
-  "omni-1.2-flash-8s-landscape": "Video generation - Omni 1.2 Flash 8s landscape",
-  "omni-1.2-flash-8s-portrait": "Video generation - Omni 1.2 Flash 8s portrait",
-  "omni-1.2-flash-15s-landscape": "Video generation - Omni 1.2 Flash 15s landscape",
-  "omni-1.2-flash-i2v-8s-landscape": "Video generation - Omni 1.2 Flash I2V 8s landscape",
-  "omni-1.2-flash-extend-8s-landscape": "Video generation - Omni 1.2 Flash Extend 8s landscape",
-  "omni-1.2-flash-8s-landscape-1080p": "Video upsample alias - generate 8s landscape then upscale to 1080P",
-  "omni-1.2-flash-8s-landscape-4k": "Video upsample alias - generate 8s landscape then upscale to 4K",
-  "omni-1.2-flash-i2v-8s-landscape-1080p": "Video upsample alias - generate I2V 8s landscape then upscale to 1080P",
-  "omni-1.2-flash-i2v-8s-landscape-4k": "Video upsample alias - generate I2V 8s landscape then upscale to 4K",
-  "veo-3.1-lite": "Video generation - Veo 3.1 Lite 8s landscape",
-  "veo-3.1-lite-4s-landscape": "Video generation - Veo 3.1 Lite 4s landscape",
-  "veo-3.1-lite-8s-landscape": "Video generation - Veo 3.1 Lite 8s landscape",
-  "veo-3.1-lite-i2v-8s-landscape": "Video generation - Veo 3.1 Lite I2V 8s landscape",
-  "veo-3.1-lite-r2v-8s-landscape": "Video generation - Veo 3.1 Lite R2V 8s landscape",
-  "veo-3.1-lite-extend-8s-landscape": "Video generation - Veo 3.1 Lite Extend 8s landscape",
-  "veo-3.1-lite-8s-landscape-1080p": "Video upsample alias - generate Veo 3.1 Lite 8s landscape then upscale to 1080P",
-  "veo-3.1-lite-8s-landscape-4k": "Video upsample alias - generate Veo 3.1 Lite 8s landscape then upscale to 4K",
+  "gemini-3.1-flash-image": "Nano Banana 2.1 · 16:9 / 9:16 / 1:1 / 4:3 / 3:4 · 1K / 2K / 4K",
+  "gemini-3.1-flash-lite-image": "Nano Banana 2 Lite · 16:9 / 9:16 / 1:1 / 4:3 / 3:4 · 1K / 2K / 4K",
+  "gemini-3.0-pro-image": "Nano Banana Pro · 16:9 / 9:16 / 1:1 / 4:3 / 3:4 · 1K / 2K / 4K",
+  "veo-3.1-lite": "Veo 3.1 Lite · 16:9 / 9:16 · 4s / 6s / 8s · 720p / 1080p / 4K",
+  "veo-3.1-lite-i2v": "Veo 3.1 Lite I2V · 16:9 / 9:16 · 4s / 6s / 8s · 720p / 1080p / 4K",
+  "veo-3.1-lite-r2v": "Veo 3.1 Lite R2V · 16:9 / 9:16 · 8s · 720p / 1080p / 4K",
+  "veo-3.1-lite-extend": "Veo 3.1 Lite Extend · 16:9 / 9:16 · 8s · 720p / 1080p / 4K",
+  "omni-1.2-flash": "Omni 1.2 Flash · 16:9 / 9:16 · 3s-15s · 360p / 720p / 1080p / 4K",
+  "omni-1.2-flash-i2v": "Omni 1.2 Flash I2V · 16:9 / 9:16 · 3s-15s · 360p / 720p / 1080p / 4K",
+  "omni-1.2-flash-extend": "Omni 1.2 Flash Extend · 16:9 / 9:16 · 3s-10s · 360p / 720p / 1080p / 4K",
 };
 
 let ALL_MODELS = {};
+let ALL_MODEL_META = {};
 
 function applyFallbackModels(reason) {
   console.warn(I18n.t("使用内置候选模型列表:"), reason);
   ALL_MODELS = { ...FALLBACK_MODELS };
+  ALL_MODEL_META = {};
   renderSidebar();
 }
 
@@ -517,14 +550,17 @@ async function loadModels() {
       return;
     }
     ALL_MODELS = {};
-    items.forEach(m => { ALL_MODELS[m.id] = m.description; });
+    ALL_MODEL_META = {};
+    items.forEach(m => {
+      ALL_MODELS[m.id] = m.description;
+      ALL_MODEL_META[m.id] = m;
+    });
     renderSidebar();
   } catch (e) {
     console.error(I18n.t("加载模型失败:"), e);
     applyFallbackModels(e.message || "load_failed");
   }
 }
-
 function renderSidebarFallback() {
   applyFallbackModels("legacy_fallback");
 }
@@ -658,12 +694,47 @@ function selectModel(modelId) {
     uploadGroup.style.display = "none";
   }
 
+  const imgParamsEl = document.getElementById("imageParamsGroup");
+  const vidParamsEl = document.getElementById("videoParamsGroup");
+  const apiMeta = ALL_MODEL_META[modelId] || {};
+  const supParams = apiMeta.supported_parameters || {};
+  const defParams = apiMeta.default_parameters || {};
+  if (meta.type === "image") {
+    if (imgParamsEl) imgParamsEl.style.display = "grid";
+    if (vidParamsEl) vidParamsEl.style.display = "none";
+    const arEl = document.getElementById("paramAspectRatio");
+    const szEl = document.getElementById("paramImageSize");
+    if (arEl && defParams.aspectRatio) arEl.value = defParams.aspectRatio;
+    if (szEl && defParams.imageSize) szEl.value = defParams.imageSize;
+  } else {
+    if (imgParamsEl) imgParamsEl.style.display = "none";
+    if (vidParamsEl) vidParamsEl.style.display = "grid";
+    const norm = normalizeModelId(modelId);
+    const durEl = document.getElementById("paramVideoDuration");
+    const resEl = document.getElementById("paramVideoResolution");
+    const durations = Array.isArray(supParams.durationSeconds) && supParams.durationSeconds.length
+      ? supParams.durationSeconds
+      : (norm.includes("omni")
+          ? (norm.includes("extend") ? [3,4,5,6,7,8,9,10] : [3,4,5,6,7,8,9,10,11,12,13,14,15])
+          : (norm.includes("r2v") || norm.includes("extend") ? [8] : [4,6,8]));
+    if (durEl) {
+      const defaultDur = defParams.durationSeconds || 8;
+      durEl.innerHTML = durations.map(d => `<option value="${d}"${d === defaultDur ? " selected" : ""}>${d}s</option>`).join("");
+    }
+    const resolutions = Array.isArray(supParams.resolution) && supParams.resolution.length
+      ? supParams.resolution
+      : (norm.includes("omni") ? ["360p", "720p", "1080p", "4K"] : ["720p", "1080p", "4K"]);
+    if (resEl) {
+      const defaultRes = defParams.resolution || "720p";
+      resEl.innerHTML = resolutions.map(r => `<option value="${r}"${r === defaultRes ? " selected" : ""}>${r}</option>`).join("");
+    }
+  }
+
   document.getElementById("videoSourceGroup").style.display = meta.requiresVideoSource ? "flex" : "none";
   document.getElementById("videoMediaId").value = "";
 
   document.getElementById("imagePreviewList").innerHTML = "";
   document.getElementById("imageHint").style.display = "block";
-
   const btn = document.getElementById("btnGenerate");
   btn.disabled = false;
   I18n.setMessage(btn, meta.type === "image" ? I18n.t("🎨 生成图片") : I18n.t("🎬 生成视频")); // taste-skill-ignore: test.json key
@@ -764,7 +835,16 @@ async function generate() {
 
   const messages = [{ role: "user", content: content.length === 1 ? prompt : content }];
   const body = { model: STATE.selectedModel, messages, stream: true };
-
+  if (STATE.modelConfig.type === "image") {
+    const aspectRatio = document.getElementById("paramAspectRatio")?.value || "16:9";
+    const imageSize = document.getElementById("paramImageSize")?.value || "2K";
+    body.generationConfig = { imageConfig: { aspectRatio, imageSize } };
+  } else {
+    const aspectRatio = document.getElementById("paramVideoAspectRatio")?.value || "16:9";
+    const durationSeconds = parseInt(document.getElementById("paramVideoDuration")?.value || "8", 10) || 8;
+    const resolution = document.getElementById("paramVideoResolution")?.value || "720p";
+    body.generationConfig = { videoConfig: { aspectRatio, durationSeconds, resolution } };
+  }
   const startTime = Date.now();
   appendLog(I18n.t("[{0}] 模型: {1}\n", {"0": (new Date().toLocaleTimeString(I18n.locale)), "1": (STATE.selectedModel)}));
   appendLog(I18n.t("[{0}] 提示词: {1}{2}\n", {"0": (new Date().toLocaleTimeString(I18n.locale)), "1": (prompt.substring(0, 100)), "2": (prompt.length > 100 ? '...' : '')}));

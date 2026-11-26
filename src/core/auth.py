@@ -48,6 +48,7 @@ class ApiKeyPolicy:
         resolved_model: str,
         *,
         raw_model: Optional[str] = None,
+        canonical_model: Optional[str] = None,
         upstream_model: Optional[str] = None,
         base_aliases: Optional[Iterable[str]] = None,
     ) -> bool:
@@ -56,6 +57,8 @@ class ApiKeyPolicy:
         if self._matches(resolved_model):
             return True
         if upstream_model and self._matches(upstream_model):
+            return True
+        if canonical_model and self._matches(canonical_model):
             return True
         raw_clean = str(raw_model or "").strip()
         if (
@@ -66,7 +69,6 @@ class ApiKeyPolicy:
         ):
             return True
         return False
-
 
 _UNRESTRICTED_POLICY = ApiKeyPolicy(
     key_id=None,
@@ -246,6 +248,7 @@ def assert_api_key_model_allowed(
     resolved_model: str,
     *,
     raw_model: Optional[str] = None,
+    canonical_model: Optional[str] = None,
     upstream_model: Optional[str] = None,
     base_aliases: Optional[Iterable[str]] = None,
 ) -> ApiKeyPolicy:
@@ -254,6 +257,7 @@ def assert_api_key_model_allowed(
     if not policy.allows_execution(
         resolved_model,
         raw_model=raw_model,
+        canonical_model=canonical_model,
         upstream_model=upstream_model,
         base_aliases=base_aliases,
     ):
