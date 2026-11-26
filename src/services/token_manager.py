@@ -1682,7 +1682,7 @@ class TokenManager:
     # ========== 余额刷新 ==========
 
     async def refresh_credits(self, token_id: int) -> int:
-        """刷新Token余额（失败时抛异常，避免前端误报成功）。"""
+        """刷新Token余额（遇到401/失效Cookie时自动刷新一次Cookie后重试，避免误报失败）。"""
         token = await self.db.get_token(token_id)
         if not token:
             raise ValueError(f"Token {token_id} 不存在")
@@ -1692,12 +1692,36 @@ class TokenManager:
         if not token:
             raise RuntimeError("账号登录态无效或刷新失败，无法获取余额")
 
-        try:
-            result = await self.flow_client.get_credits(
-                token.at,
-                google_cookies=token.google_cookies,
-                token_id=token.id,
+        async def _fetch_credits(current_token: Token) -> Dict[str, Any]:
+            return await self.flow_client.get_credits(
+                current_token.at,
+                google_cookies=current_token.google_cookies,
+                token_id=current_token.id,
             )
+
+        try:
+            try:
+                result = await _fetch_credits(token)
+            except Exception as first_err:
+                err_text = str(first_err)
+                if not (
+                    self._is_expired_session_error(err_text)
+                    or "code=401" in err_text
+                    or "登录认证失败" in err_text
+                ):
+                    raise
+                debug_logger.log_warning(
+                    f"[TokenManager] Token {token_id} 查询余额遇到认证失效，尝试自动刷新 Cookie 后重试: {err_text}"
+                )
+                refreshed = await self.refresh_cookies(token_id)
+                if not refreshed:
+                    raise first_err
+                refreshed_token = await self.db.get_token(token_id)
+                if not refreshed_token:
+                    raise first_err
+                token = refreshed_token
+                result = await _fetch_credits(token)
+
             if not isinstance(result, dict) or result.get("credits") is None:
                 raise RuntimeError("上游未返回有效余额信息")
             credits = int(result["credits"])

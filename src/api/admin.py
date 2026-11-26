@@ -383,12 +383,20 @@ class ProxyTestRequest(BaseModel):
     timeout_seconds: Optional[int] = 15
 
 
+DEFAULT_SCORE_TEST_URL = "https://recaptcha-demo.appspot.com/recaptcha-v3-request-scores.php"
+DEFAULT_SCORE_TEST_KEY = "6LdKlZEpAAAAAAOQjzC2v_d36tWxCl6dWsozdSy9"
+DEFAULT_SCORE_TEST_ACTION = "examples/v3scores"
+DEFAULT_SCORE_TEST_VERIFY_URL = "https://recaptcha-demo.appspot.com/recaptcha-v3-verify.php"
+
+
 class CaptchaScoreTestRequest(BaseModel):
-    website_url: Optional[str] = "https://flow.google.com/"
-    website_key: Optional[str] = "6LdsFiUsAAAAAIjVDZcuLhaHiDn5nnHVXVRQGeMV"
-    action: Optional[str] = "homepage"
-    verify_url: Optional[str] = "https://antcpt.com/score_detector/verify.php"
-    enterprise: Optional[bool] = False
+    website_url: Optional[str] = None
+    website_key: Optional[str] = None
+    action: Optional[str] = None
+    verify_url: Optional[str] = None
+    enterprise: Optional[bool] = None
+    token_id: Optional[int] = None
+    proxy_url: Optional[str] = None
 
 
 class GenerationConfigRequest(BaseModel):
@@ -2628,19 +2636,46 @@ async def test_captcha_score(
 ):
     """使用 Camoufox 浏览器执行 reCAPTCHA 分数检测。"""
     req = _request or CaptchaScoreTestRequest()
-    website_url = (req.website_url or "https://antcpt.com/score_detector/").strip()
-    website_key = (
-        req.website_key or "6LcR_okUAAAAAPYrPe-HK_0RULO1aZM15ENyM-Mf"
-    ).strip()
-    action = (req.action or "homepage").strip()
+    website_url = (req.website_url or DEFAULT_SCORE_TEST_URL).strip()
+    website_key = (req.website_key or DEFAULT_SCORE_TEST_KEY).strip()
+    action = (req.action or DEFAULT_SCORE_TEST_ACTION).strip()
     verify_url = (
-        req.verify_url or "https://antcpt.com/score_detector/verify.php"
+        req.verify_url
+        if req.verify_url is not None
+        else DEFAULT_SCORE_TEST_VERIFY_URL
     ).strip()
-    enterprise = bool(req.enterprise)
+    if req.enterprise is None:
+        enterprise = "flow.google.com" in website_url.lower()
+    else:
+        enterprise = bool(req.enterprise)
     started_at = time.time()
     captcha_config = await db.get_captcha_config()
     browser_proxy_enabled = bool(captcha_config.browser_proxy_enabled)
-    browser_proxy_url = captcha_config.browser_proxy_url or ""
+    browser_proxy_url = (captcha_config.browser_proxy_url or "").strip()
+
+    effective_token_id: Optional[int] = req.token_id
+    effective_proxy_url: Optional[str] = (req.proxy_url or "").strip() or None
+    if not effective_proxy_url:
+        if effective_token_id is not None:
+            tok = await db.get_token(effective_token_id)
+            if tok:
+                effective_proxy_url = (
+                    (tok.captcha_proxy_url or tok.proxy_url or "").strip() or None
+                )
+        elif browser_proxy_enabled and browser_proxy_url:
+            effective_proxy_url = browser_proxy_url
+        else:
+            proxy_cfg = await db.get_proxy_config()
+            if proxy_cfg and proxy_cfg.enabled and (proxy_cfg.proxy_url or "").strip():
+                effective_proxy_url = proxy_cfg.proxy_url.strip()
+            else:
+                active_tokens = await db.get_active_tokens()
+                for tok in active_tokens:
+                    cand_proxy = (tok.captcha_proxy_url or tok.proxy_url or "").strip()
+                    if cand_proxy:
+                        effective_token_id = tok.id
+                        effective_proxy_url = cand_proxy
+                        break
 
     try:
         from ..services.browser_captcha import BrowserCaptchaService
@@ -2652,6 +2687,8 @@ async def test_captcha_score(
             verify_url=verify_url,
             action=action,
             enterprise=enterprise,
+            token_id=effective_token_id,
+            token_proxy_url=effective_proxy_url,
         )
         token_value = score_payload.get("token") if isinstance(score_payload, dict) else None
         verify_result = (
@@ -2671,6 +2708,7 @@ async def test_captcha_score(
             "action": action,
             "verify_url": verify_url,
             "enterprise": enterprise,
+            "token_id": effective_token_id,
             "token_acquired": bool(token_value),
             "token_preview": _mask_token(token_value),
             "token_elapsed_ms": int((score_payload or {}).get("token_elapsed_ms") or 0),
@@ -2678,8 +2716,8 @@ async def test_captcha_score(
             "verify_http_status": (score_payload or {}).get("verify_http_status"),
             "score": verify_result.get("score"),
             "verify_result": verify_result,
-            "browser_proxy_enabled": browser_proxy_enabled,
-            "browser_proxy_url": browser_proxy_url if browser_proxy_enabled else "",
+            "browser_proxy_enabled": bool(effective_proxy_url),
+            "browser_proxy_url": effective_proxy_url or "",
             "fingerprint": fingerprint,
             "elapsed_ms": int((time.time() - started_at) * 1000),
         }
@@ -2693,7 +2731,10 @@ async def test_captcha_score(
             "action": action,
             "verify_url": verify_url,
             "enterprise": enterprise,
+            "token_id": effective_token_id,
             "token_acquired": False,
+            "browser_proxy_enabled": bool(effective_proxy_url),
+            "browser_proxy_url": effective_proxy_url or "",
             "elapsed_ms": int((time.time() - started_at) * 1000),
         }
 

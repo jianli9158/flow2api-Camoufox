@@ -912,8 +912,13 @@ class BrowserCaptchaService:
         verify_url: str,
         action: str = "homepage",
         enterprise: bool = False,
+        token_id: Optional[int] = None,
+        token_proxy_url: Optional[str] = None,
     ) -> tuple[Dict[str, Any], int]:
-        async with self._borrow_browser() as request:
+        resolved_proxy_url = token_proxy_url
+        if not resolved_proxy_url and token_id is not None:
+            resolved_proxy_url = await self._resolve_token_proxy_url(token_id)
+        async with self._borrow_browser(token_id=token_id) as request:
             payload = await asyncio.wait_for(
                 request.browser.get_custom_score(
                     website_url=website_url,
@@ -921,6 +926,8 @@ class BrowserCaptchaService:
                     verify_url=verify_url,
                     action=action,
                     enterprise=enterprise,
+                    token_id=token_id,
+                    token_proxy_url=resolved_proxy_url,
                 ),
                 timeout=max(1, float(config.flow_timeout)),
             )

@@ -3389,14 +3389,28 @@ class CamoufoxWorker:
         verify_url: str,
         action: str = "homepage",
         enterprise: bool = False,
+        token_id: Optional[int] = None,
+        token_proxy_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Run score detector or custom reCAPTCHA verification inside Camoufox."""
         async with self._semaphore:
             self._solve_inflight += 1
+            temp_context_id: Optional[str] = None
+            bidi = None
             try:
                 started_at = time.time()
-                _, bidi, _api_ctx = await self._get_or_create_shared_browser()
-                context_id = await self._ensure_captcha_context_id()
+                _, bidi, _api_ctx = await self._get_or_create_shared_browser(
+                    token_proxy_url=token_proxy_url,
+                    token_id=token_id,
+                )
+                try:
+                    created = await bidi.command(
+                        "browsingContext.create", {"type": "tab"}, timeout=15.0
+                    )
+                    temp_context_id = str((created or {}).get("context") or "").strip() or None
+                except Exception:
+                    temp_context_id = None
+                context_id = temp_context_id or await self._ensure_captcha_context_id()
                 async with self._boost_frames():
                     await bidi.command(
                         "browsingContext.navigate",
@@ -3408,31 +3422,35 @@ class CamoufoxWorker:
                         timeout=35.0,
                     )
                     await self._send_trusted_gesture(context_id)
-                    await asyncio.sleep(2.0)
+                    await asyncio.sleep(1.5)
 
-                    execute_target = (
-                        "grecaptcha.enterprise.execute"
-                        if enterprise
-                        else "grecaptcha.execute"
-                    )
-                    ready_target = (
-                        "grecaptcha.enterprise.ready"
-                        if enterprise
-                        else "grecaptcha.ready"
-                    )
                     token_expr = f"""
                     new Promise((resolve, reject) => {{
-                        const timer = setTimeout(() => reject(new Error('timeout')), 25000);
-                        try {{
-                            {ready_target}(() => {{
-                                {execute_target}({json.dumps(website_key)}, {{ action: {json.dumps(action)} }})
-                                    .then(t => {{ clearTimeout(timer); resolve(t); }})
-                                    .catch(e => {{ clearTimeout(timer); reject(e); }});
-                            }});
-                        }} catch (e) {{
-                            clearTimeout(timer);
-                            reject(e);
-                        }}
+                        const deadline = Date.now() + 25000;
+                        const useEnterprise = {json.dumps(bool(enterprise))};
+                        const siteKey = {json.dumps(website_key)};
+                        const actionName = {json.dumps(action)};
+                        const tick = () => {{
+                            const api = window.grecaptcha && (useEnterprise ? window.grecaptcha.enterprise : window.grecaptcha);
+                            if (api && typeof api.ready === 'function' && typeof api.execute === 'function') {{
+                                try {{
+                                    api.ready(() => {{
+                                        Promise.resolve(api.execute(siteKey, {{ action: actionName }}))
+                                            .then(t => resolve(t))
+                                            .catch(e => reject(e));
+                                    }});
+                                }} catch (e) {{
+                                    reject(e);
+                                }}
+                                return;
+                            }}
+                            if (Date.now() >= deadline) {{
+                                reject(new Error(useEnterprise ? 'grecaptcha.enterprise not loaded' : 'grecaptcha not loaded'));
+                                return;
+                            }}
+                            setTimeout(tick, 200);
+                        }};
+                        tick();
                     }})
                     """
                     token = await bidi.evaluate(
@@ -3446,47 +3464,123 @@ class CamoufoxWorker:
 
                     verify_result: Dict[str, Any] = {}
                     verify_elapsed_ms = 0
+                    verify_http_status: Optional[int] = None
+                    verify_mode = "browser_page_dom"
                     if verify_url:
                         v_start = time.time()
-                        for _ in range(20):
-                            dom_info = await bidi.evaluate(
-                                context_id,
-                                r"""
-                                (() => {
-                                    const bodyText = (document.body && document.body.innerText) || '';
-                                    const match = bodyText.match(/Your score is\s*:\s*([0-9.]+)/i) || bodyText.match(/score\s*[:=]\s*([0-9.]+)/i);
-                                    return {
-                                        score: match ? parseFloat(match[1]) : null,
-                                        raw_text: bodyText.slice(0, 2000),
-                                        url: location.href,
-                                        title: document.title
-                                    };
-                                })()
-                                """,
-                                await_promise=False,
+                        # 1) Direct same-origin verify fetch inside the browser tab when applicable
+                        try:
+                            w_parsed = urlparse(website_url)
+                            v_parsed = urlparse(verify_url)
+                            same_origin = (
+                                w_parsed.scheme == v_parsed.scheme
+                                and w_parsed.netloc == v_parsed.netloc
                             )
-                            if isinstance(dom_info, dict) and isinstance(
-                                dom_info.get("score"), (int, float)
-                            ):
-                                verify_elapsed_ms = int(
-                                    (time.time() - v_start) * 1000
+                        except Exception:
+                            same_origin = False
+                        if same_origin and token:
+                            sep = "&" if "?" in verify_url else "?"
+                            fetch_expr = f"""
+                            (async () => {{
+                                const u = {json.dumps(verify_url)} + {json.dumps(sep)}
+                                    + 'action=' + encodeURIComponent({json.dumps(action)})
+                                    + '&token=' + encodeURIComponent({json.dumps(str(token))});
+                                const resp = await fetch(u, {{ credentials: 'same-origin' }});
+                                const text = await resp.text();
+                                let parsed = null;
+                                try {{ parsed = JSON.parse(text); }} catch (_) {{}}
+                                return {{ status: resp.status, ok: resp.ok, parsed, text: text.slice(0, 2000) }};
+                            }})()
+                            """
+                            try:
+                                fetch_res = await bidi.evaluate(
+                                    context_id,
+                                    fetch_expr,
+                                    await_promise=True,
+                                    timeout=20.0,
                                 )
-                                verify_result = {
-                                    "success": True,
-                                    "score": dom_info["score"],
-                                    "source": "camoufox_dom",
-                                    "raw_text": dom_info.get("raw_text") or "",
-                                    "page_url": dom_info.get("url") or "",
-                                    "page_title": dom_info.get("title") or "",
-                                }
-                                break
-                            await asyncio.sleep(0.5)
+                                if isinstance(fetch_res, dict):
+                                    verify_http_status = int(fetch_res.get("status") or 0) or None
+                                    parsed = fetch_res.get("parsed")
+                                    if isinstance(parsed, dict) and (
+                                        isinstance(parsed.get("score"), (int, float))
+                                        or "success" in parsed
+                                    ):
+                                        verify_elapsed_ms = int((time.time() - v_start) * 1000)
+                                        verify_mode = "browser_same_origin_fetch"
+                                        verify_result = {
+                                            **parsed,
+                                            "success": bool(
+                                                parsed.get("success", isinstance(parsed.get("score"), (int, float)))
+                                            ),
+                                            "source": verify_mode,
+                                        }
+                            except Exception as fetch_exc:
+                                debug_logger.log_warning(
+                                    f"[Camoufox] score verify fetch fallback to DOM: {fetch_exc}"
+                                )
+
+                        # 2) Fallback: parse JSON/score text rendered in DOM
+                        if not verify_result.get("success"):
+                            for _ in range(20):
+                                dom_info = await bidi.evaluate(
+                                    context_id,
+                                    r"""
+                                    (() => {
+                                        const bodyText = (document.body && document.body.innerText) || '';
+                                        const respEl = document.querySelector('pre.response');
+                                        let jsonScore = null;
+                                        let jsonSuccess = null;
+                                        if (respEl && respEl.textContent) {
+                                            try {
+                                                const j = JSON.parse(respEl.textContent);
+                                                if (typeof j.score === 'number') jsonScore = j.score;
+                                                if (typeof j.success === 'boolean') jsonSuccess = j.success;
+                                            } catch (_) {}
+                                        }
+                                        const match = bodyText.match(/Your score is\s*:\s*([0-9.]+)/i)
+                                            || bodyText.match(/"score"\s*:\s*([0-9.]+)/i)
+                                            || bodyText.match(/score\s*[:=]\s*([0-9.]+)/i);
+                                        const score = jsonScore !== null ? jsonScore : (match ? parseFloat(match[1]) : null);
+                                        return {
+                                            score,
+                                            json_success: jsonSuccess,
+                                            raw_text: bodyText.slice(0, 2000),
+                                            url: location.href,
+                                            title: document.title
+                                        };
+                                    })()
+                                    """,
+                                    await_promise=False,
+                                )
+                                if isinstance(dom_info, dict) and isinstance(
+                                    dom_info.get("score"), (int, float)
+                                ):
+                                    verify_elapsed_ms = int(
+                                        (time.time() - v_start) * 1000
+                                    )
+                                    verify_result = {
+                                        "success": bool(
+                                            True if dom_info.get("json_success") is None else dom_info.get("json_success")
+                                        ),
+                                        "score": dom_info["score"],
+                                        "source": "camoufox_dom",
+                                        "raw_text": dom_info.get("raw_text") or "",
+                                        "page_url": dom_info.get("url") or "",
+                                        "page_title": dom_info.get("title") or "",
+                                    }
+                                    if verify_http_status is None:
+                                        verify_http_status = 200
+                                    break
+                                await asyncio.sleep(0.5)
                 return {
                     "token": str(token or "") or None,
                     "token_elapsed_ms": token_elapsed_ms,
-                    "verify_mode": "browser_page_dom",
+                    "verify_mode": verify_mode,
                     "verify_elapsed_ms": verify_elapsed_ms,
-                    "verify_http_status": 200 if verify_result.get("success") else None,
+                    "verify_http_status": verify_http_status
+                    if verify_http_status is not None
+                    else (200 if verify_result.get("success") else None),
                     "verify_result": verify_result,
                 }
             except Exception as exc:
@@ -3501,6 +3595,15 @@ class CamoufoxWorker:
                     "verify_result": {"success": False, "error": str(exc)},
                 }
             finally:
+                if temp_context_id and bidi is not None:
+                    try:
+                        await bidi.command(
+                            "browsingContext.close",
+                            {"context": temp_context_id},
+                            timeout=8.0,
+                        )
+                    except Exception:
+                        pass
                 self._solve_inflight = max(0, self._solve_inflight - 1)
                 self.note_idle()
 

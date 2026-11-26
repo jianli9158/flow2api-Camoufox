@@ -292,6 +292,103 @@ class AuditRemediationRegressionTests(unittest.IsolatedAsyncioTestCase):
         picked_ids = {tok.id for tok in picked if tok is not None}
         self.assertEqual(picked_ids, {1, 2})
 
+    async def test_score_test_uses_google_v3_demo_defaults_and_active_token_proxy_fallback(self):
+        from unittest.mock import patch
+        from src.api import admin as admin_mod
+
+        req_obj = admin_mod.CaptchaScoreTestRequest()
+        self.assertIsNone(req_obj.website_url)
+        self.assertIsNone(req_obj.website_key)
+        self.assertIsNone(req_obj.verify_url)
+
+        from src.core.models import CaptchaConfig, ProxyConfig
+
+        fake_db = MagicMock()
+        fake_db.get_captcha_config = AsyncMock(
+            return_value=CaptchaConfig(browser_proxy_enabled=False, browser_proxy_url="")
+        )
+        fake_db.get_proxy_config = AsyncMock(
+            return_value=ProxyConfig(enabled=False, proxy_url="")
+        )
+        fake_db.get_active_tokens = AsyncMock(
+            return_value=[
+                Token(
+                    id=10,
+                    st="st10",
+                    at="at10",
+                    email="t10@example.com",
+                    is_active=True,
+                    proxy_url="http://127.0.0.1:21021",
+                )
+            ]
+        )
+        fake_service = MagicMock()
+        fake_service.get_custom_score = AsyncMock(
+            return_value=(
+                {
+                    "token": "tok_abc1234567890",
+                    "token_elapsed_ms": 1200,
+                    "verify_elapsed_ms": 400,
+                    "verify_http_status": 200,
+                    "verify_result": {"success": True, "score": 0.9},
+                },
+                0,
+            )
+        )
+        fake_service.get_fingerprint = AsyncMock(return_value={"os": "windows"})
+
+        with patch.object(admin_mod, "db", fake_db), patch(
+            "src.services.browser_captcha.BrowserCaptchaService.get_instance",
+            new=AsyncMock(return_value=fake_service),
+        ):
+            resp = await admin_mod.test_captcha_score(req_obj, _token="admin")
+
+        self.assertTrue(resp["success"])
+        self.assertEqual(resp["score"], 0.9)
+        self.assertEqual(resp["website_url"], admin_mod.DEFAULT_SCORE_TEST_URL)
+        self.assertEqual(resp["browser_proxy_url"], "http://127.0.0.1:21021")
+        self.assertEqual(resp["token_id"], 10)
+        fake_service.get_custom_score.assert_awaited_once_with(
+            website_url=admin_mod.DEFAULT_SCORE_TEST_URL,
+            website_key=admin_mod.DEFAULT_SCORE_TEST_KEY,
+            verify_url=admin_mod.DEFAULT_SCORE_TEST_VERIFY_URL,
+            action=admin_mod.DEFAULT_SCORE_TEST_ACTION,
+            enterprise=False,
+            token_id=10,
+            token_proxy_url="http://127.0.0.1:21021",
+        )
+
+    async def test_refresh_credits_auto_refreshes_cookies_on_401_and_retries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(db_path=str(Path(tmpdir) / "rc.db"))
+            await db.init_db()
+            tok_id = await db.add_token(
+                Token(
+                    st="st-rc",
+                    at="at-rc",
+                    email="rc@example.com",
+                    is_active=True,
+                    google_cookies='[{"name":"SID","value":"old"}]',
+                )
+            )
+            flow_client = MagicMock()
+            flow_client.get_credits = AsyncMock(
+                side_effect=[
+                    RuntimeError("Flow 登录认证失败：Google Cookie 已失效 (rpc=nzlxg, code=401)"),
+                    {"credits": 888, "userPaygateTier": "PAYGATE_TIER_ONE"},
+                ]
+            )
+            tm = TokenManager(db, flow_client)
+            tm.ensure_valid_token = AsyncMock(side_effect=lambda t: t)
+            tm.refresh_cookies = AsyncMock(return_value=True)
+
+            credits = await tm.refresh_credits(tok_id)
+            self.assertEqual(credits, 888)
+            tm.refresh_cookies.assert_awaited_once_with(tok_id)
+            self.assertEqual(flow_client.get_credits.await_count, 2)
+            updated = await db.get_token(tok_id)
+            self.assertEqual(updated.credits, 888)
+
 
 if __name__ == "__main__":
     unittest.main()
