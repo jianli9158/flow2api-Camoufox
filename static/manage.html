@@ -432,28 +432,30 @@
                                 </div>
 
                                 <div class="settings-subblock">
-                                    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
-                                        <div>
+                                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:10px;">
+                                        <div style="flex:1 1 320px;min-width:0;">
                                             <strong data-i18n="多 API Key 管理">多 API Key 管理</strong>
                                             <div class="hint" data-i18n="主密钥默认公开全部模型；可创建多个子 API Key，分别指定各自公开的模型或通配符规则。">主密钥默认公开全部模型；可创建多个子 API Key，分别指定各自公开的模型或通配符规则。</div>
                                         </div>
-                                        <button type="button" onclick="openApiKeyModal()" class="btn primary sm" data-i18n="新建 API Key">新建 API Key</button>
+                                        <button type="button" onclick="openApiKeyModal()" class="btn primary sm" style="flex-shrink:0;" data-i18n="新建 API Key">新建 API Key</button>
                                     </div>
-                                    <div class="table-wrap">
-                                        <table>
-                                            <thead>
-                                                <tr>
-                                                    <th data-i18n="名称">名称</th>
-                                                    <th>API Key</th>
-                                                    <th data-i18n="公开模型">公开模型</th>
-                                                    <th data-i18n="状态">状态</th>
-                                                    <th class="num" data-i18n="操作">操作</th>
-                                                </tr>
-                                            </thead>
-                                            <tbody id="apiKeysTableBody">
-                                                <tr><td colspan="5" style="text-align:center;padding:20px;color:var(--faint);" data-i18n="暂无自定义 API Key">暂无自定义 API Key</td></tr>
-                                            </tbody>
-                                        </table>
+                                    <div class="table-panel">
+                                        <div class="table-wrap">
+                                            <table class="data-table">
+                                                <thead>
+                                                    <tr>
+                                                        <th><span data-i18n="名称">名称</span></th>
+                                                        <th><span>API Key</span></th>
+                                                        <th><span data-i18n="公开模型">公开模型</span></th>
+                                                        <th><span data-i18n="状态">状态</span></th>
+                                                        <th class="num"><span data-i18n="操作">操作</span></th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody id="apiKeysTableBody">
+                                                    <tr><td colspan="5" style="text-align:center;padding:20px;color:var(--faint);" data-i18n="暂无自定义 API Key">暂无自定义 API Key</td></tr>
+                                                </tbody>
+                                            </table>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
